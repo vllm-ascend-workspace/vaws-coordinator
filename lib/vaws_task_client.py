@@ -10,14 +10,13 @@ import contextlib
 import json
 import os
 import subprocess
-import sys
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from vaws_agent_session import AgentSessions, load_context
-from vaws_local_state import ROOT
 from vaws_build_inputs import BUILD_INPUT_ENV_KEYS
+from vaws_parity import materialize_command
 
 DONE = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
 
@@ -152,14 +151,9 @@ class TaskClient:
         endpoint = binding["endpoint"]
         directory = self.store.state_dir / "runs" / row["id"]
         directory.mkdir(parents=True, exist_ok=True)
-        args = [sys.executable, str(ROOT / ".agents/skills/remote-code-parity/scripts/remote_code_parity.py"),
-                "sync", "--workspace-root", str(ROOT), "--workspace-id", self.context["session"]["id"],
-                "--server-name", binding["runtime_id"], "--runtime-root", endpoint["root"],
-                "--container-identity", binding["runtime_id"], "--container-host", endpoint["host"],
-                "--container-port", str(endpoint["port"]), "--container-user", endpoint["user"],
-                "--apply-mode", "materialize"]
-        for name in ("vllm", "vllm-ascend"):
-            args.extend(["--source", name + "=" + row["sources"][name]])
+        args = materialize_command(workspace_id=self.context["session"]["id"],
+                                   runtime_id=binding["runtime_id"], endpoint=endpoint,
+                                   sources={name: row["sources"][name] for name in ("vllm", "vllm-ascend")})
         environment = {key: value for key, value in os.environ.items() if key not in BUILD_INPUT_ENV_KEYS}
         environment.update(binding.get("build_env", {}))
         environment.update(binding["environment"])

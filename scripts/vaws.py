@@ -7,11 +7,15 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / ".agents/lib"), str(ROOT / ".remote-dev")]
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
 from vaws_agent_session import AgentSessions, CLIENTS, load_context
-from core.result import make_result
-from core.vaws_ops import vaws_call
+from vaws_ops import vaws_call
+from vaws_remote_dev import RemoteDevShell
+
+# Prefer remote-dev's own envelope when a checkout is configured, so one
+# deployment emits one result implementation; otherwise use the local mirror.
+make_result = RemoteDevShell().result_factory()
 
 
 def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
@@ -69,7 +73,7 @@ def main():
     # Unset argparse defaults (None) must not silently override --json keys:
     # `--json '{"action":"stop"}'` degraded to a status query otherwise.
     merged = {**extra, **{key: value for key, value in args.items() if value is not None}}
-    result = vaws_call("vaws." + operation, merged)
+    result = vaws_call("vaws." + operation, merged, make_result=make_result)
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["result"]["outcome"] == "success" else 1
 
