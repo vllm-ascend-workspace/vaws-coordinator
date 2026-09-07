@@ -42,6 +42,16 @@ class AccessFileTests(unittest.TestCase):
             with self.subTest(mode=oct(mode)), self.assertRaisesRegex(PermissionError, "chmod 600"):
                 load_access(self.path)
 
+    def test_a_malformed_digest_is_rejected_at_startup_not_at_comparison(self):
+        # A 64-character non-hex digest used to start a manager whose
+        # principal could never authenticate: the failure surfaced as a 401
+        # from `hmac.compare_digest`, indistinguishable from a wrong token.
+        pool = mock.Mock()
+        for digest in ("z" * 64, self.digest.upper(), " " + self.digest[1:], self.digest[:63], self.digest + "0"):
+            with self.subTest(digest=repr(digest[:8])), self.assertRaisesRegex(ValueError, "SHA256"):
+                create_app(pool, {"principals": {"alice": {"sha256": digest}}})
+        self.assertTrue(create_app(pool, {"principals": {"alice": {"sha256": self.digest}}}))
+
 
 class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_stdlib_task_client_initializes_and_calls_the_actual_mcp_server(self):

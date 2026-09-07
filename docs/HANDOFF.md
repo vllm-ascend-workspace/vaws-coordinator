@@ -194,9 +194,16 @@ verified before it was acted on.
    configuration changes. The check moved out of `main()` into `load_access`
    so a test can reach it, and that function now also turns a missing or
    malformed access file into an argument error instead of a traceback.
-3. **Digest validation.** `create_app` checks that each principal's `sha256`
-   is 64 characters, not that it is hexadecimal. A malformed digest fails
-   closed at comparison time rather than at startup.
+3. **Digest validation.** *Confirmed; resolved at startup.* `create_app`
+   checked that each principal's `sha256` was 64 characters, not that it was
+   lowercase hexadecimal, so `"z" * 64` started a manager whose principal
+   could never authenticate. It did fail closed — but at
+   `hmac.compare_digest` against a `hashlib.sha256().hexdigest()`, as a 401
+   indistinguishable from a wrong token, for every request from that
+   principal forever. Startup is the earliest point that can detect it, which
+   is the whole reason the validation exists, so the digest is now matched
+   against `[0-9a-f]{64}`. Uppercase hex is rejected for the same reason it
+   never worked: `hexdigest()` is lowercase.
 4. **`--state-dir` default.** It used to default to the scaffold's primary
    worktree. That derivation is gone, so the flag is now required. This is a
    deliberate fail-closed change: guessing a directory would silently fork one

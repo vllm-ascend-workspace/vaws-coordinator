@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -25,6 +26,10 @@ from vaws_ready_runtime import RuntimePool, safe_id
 
 PRINCIPAL = contextvars.ContextVar("vaws_coordinator_principal")
 ACCESS_FILE_MODE = 0o600
+# Digests are compared against `hashlib.sha256(token).hexdigest()`, which is
+# lowercase hex. Anything else can never match, so it is a configuration
+# error to be reported at startup, not a permanent 401 to be discovered.
+TOKEN_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 def load_access(path):
@@ -51,8 +56,8 @@ def create_app(pool, access, *, interval=2.0, allowed_hosts=None):
         raise ValueError("configure at least one bearer-token principal")
     for owner, config in principals.items():
         safe_id(owner)
-        if len(config["sha256"]) != 64:
-            raise ValueError("access config stores SHA256 digests, never plaintext tokens")
+        if not TOKEN_DIGEST.fullmatch(config["sha256"]):
+            raise ValueError("access config stores lowercase hex SHA256 digests, never plaintext tokens")
 
     @contextlib.asynccontextmanager
     async def lifespan(server):

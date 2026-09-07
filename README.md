@@ -252,7 +252,9 @@ directory you pass to `--state-dir`:
 ```
 
 Generate at least 32 random bytes for each token. Store the tokens only in
-client secret configuration, never in tracked files. Set access-file mode
+client secret configuration, never in tracked files. Each `sha256` must be 64
+lowercase hex characters; the manager rejects anything else at startup instead
+of letting that principal fail authentication forever. Set access-file mode
 `0600`: exactly that mode is required, and the manager refuses to start on any
 other, including `0700`. Start one process:
 
