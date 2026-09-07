@@ -215,7 +215,7 @@ def main():
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--remote-dev-root", type=Path, default=None,
                         help="remote-dev checkout providing explicit-endpoint shell access "
-                             "and the job supervisor (default: $VAWS_REMOTE_DEV_ROOT)")
+                             "(default: $VAWS_REMOTE_DEV_ROOT)")
     parser.add_argument("--host-queue-module", type=Path, default=None,
                         help="Host NPU coordination module; the sole device-allocation "
                              "authority (default: $VAWS_HOST_QUEUE_MODULE)")
@@ -225,17 +225,19 @@ def main():
     args = parser.parse_args()
     if args.access_file.stat().st_mode & 0o077:
         parser.error("access file must be private (chmod 600)")
-    from backend import RemoteBackend
+    from backend import RemoteBackend, worker_source
     from vaws_host_queue import host_queue_module_path
     from vaws_machine_directory import MachineDirectory
     from vaws_remote_dev import RemoteDevShell
     import uvicorn
     shell = RemoteDevShell(args.remote_dev_root)
     try:
-        # Preflight both mandatory dependencies before accepting requests: a
-        # manager that cannot reach the supervisor or the device authority must
-        # refuse to start instead of failing halfway through a first execution.
-        shell.worker_source("managed_jobs")
+        # Preflight every mandatory input before accepting requests: a manager
+        # that cannot reach the shell transport or the device authority, or
+        # whose own checkout is missing the execution supervisor, must refuse
+        # to start instead of failing halfway through a first execution.
+        shell.verify()
+        worker_source("managed_jobs")
         host_queue_module_path(args.host_queue_module)
     except (RuntimeError, KeyError) as exc:
         parser.error(str(exc))

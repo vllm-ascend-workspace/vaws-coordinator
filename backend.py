@@ -1,10 +1,14 @@
 """Adapters to the remote-dev substrate and host NPU device authority.
 
 Both dependencies live in other repositories and are injected, never
-vendored: remote-dev provides explicit-endpoint shell access and the
-child-subreaper job supervisor, and the host queue remains the single
-device-allocation authority. See `lib/vaws_remote_dev.py` and
-`lib/vaws_host_queue.py` for the exact required interfaces.
+vendored: remote-dev provides explicit-endpoint shell access, and the host
+queue remains the single device-allocation authority. See
+`lib/vaws_remote_dev.py` and `lib/vaws_host_queue.py` for the exact required
+interfaces.
+
+The child-subreaper execution supervisor is *not* one of those dependencies.
+It is owned here, in `workers/`, and read as source text — see
+`worker_source` below.
 """
 from __future__ import annotations
 
@@ -14,11 +18,27 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+WORKERS = ROOT / "workers"
 sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
 from vaws_host_queue import HostQueue
 from vaws_machine_directory import MachineDirectory
 from vaws_remote_dev import RemoteDevShell
 from vaws_runtime_profile import launch_preamble
+
+
+def worker_source(name="managed_jobs"):
+    """Read a supervisor this manager ships into a runtime container.
+
+    `workers/` holds Linux process-management code that this manager never
+    imports: it is shipped as text and executed inside the container. Keeping
+    it out of `lib/` keeps `/proc`-, `prctl`- and `fcntl`-dependent code off
+    this manager's `sys.path`, where a stray import would fail on a
+    non-Linux manager host and could shadow a same-named module.
+    """
+    path = WORKERS / (name + ".py")
+    if not path.is_file():
+        raise RuntimeError(f"this checkout is missing workers/{name}.py")
+    return path.read_text(encoding="utf-8")
 
 
 class RemoteBackend:
@@ -30,7 +50,7 @@ class RemoteBackend:
         self.host_queue = host_queue or HostQueue(self.bash, module_path=host_queue_module)
 
     def job(self, runtime, job_id, action, **parameters):
-        source = self.shell.worker_source("managed_jobs")
+        source = worker_source("managed_jobs")
         request = {"root": runtime["endpoint"]["root"], "job_id": job_id, "action": action, **parameters}
         command = ("python3 - " + shlex.quote(json.dumps(request)) + " <<'VAWS_MANAGED_JOB'\n"
                    + "WORKER_SOURCE = " + repr(source)
