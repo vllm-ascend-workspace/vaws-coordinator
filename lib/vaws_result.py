@@ -1,11 +1,11 @@
 """Result envelope compatible with remote-dev's `remote-dev.result.v1`.
 
-The envelope contract is remote-dev's, not this repository's. An MCP host that
-registers the task tools should inject its own factory
-(`core.result.make_result`) so one process emits exactly one implementation.
-This mirror exists only so local, offline task operations keep working in a
-deployment that has no remote-dev checkout; it must stay field-compatible and
-must never be treated as the schema authority.
+The envelope contract is remote-dev's, not this repository's. This mirror is
+what `task_server.py` emits, so the task tools work in a deployment that has
+no remote-dev checkout and the task server never imports one; a foreign MCP
+host that registers the task tools should inject its own factory instead so
+one process emits exactly one implementation. The mirror must stay
+field-compatible and must never be treated as the schema authority.
 """
 from __future__ import annotations
 

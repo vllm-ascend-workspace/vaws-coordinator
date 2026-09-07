@@ -4,9 +4,11 @@ These four names (`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`)
 are coordinator semantics, not remote-development semantics: they create and
 resume VAWS tasks, bind actual worktrees, and drive pooled executions. They
 used to be registered inside the remote-dev MCP server, which owned neither
-the task registry nor the runtime pool. They now live here, and any MCP host
-can register them by importing this module and injecting its own result
-factory so one process emits exactly one result implementation.
+the task registry nor the runtime pool. They now live here and are served by
+this repository's `task_server.py` over stdio (and by `scripts/vaws.py` as a
+CLI). Any other MCP host can still register them by importing this module and
+injecting its own result factory so one process emits exactly one result
+implementation.
 """
 from __future__ import annotations
 
