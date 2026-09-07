@@ -1,0 +1,15 @@
+.DS_Store
+._*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.log
+
+# Untracked local and manager state. Access files hold bearer-token digests,
+# manager databases hold live bindings and leases: never track either.
+.vaws-local/
+.vaws-runtime/
