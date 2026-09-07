@@ -1,0 +1,9 @@
+{
+  "file": "vaws_run_manifest.py",
+  "owner": "vllm-ascend-workspace scaffold",
+  "sha256": "cf0a3199a8b1497ed162fc22928ba055143e62ada7921e8897b31dacfb4f104b",
+  "upstream_path": ".agents/lib/vaws_run_manifest.py",
+  "upstream_ref": "161fed1",
+  "upstream_repo": "https://github.com/maoxx241/vllm-ascend-workspace",
+  "why": "Run Manifest v1 is the scaffold's cross-skill evidence schema with many readers. This coordinator is one producer, so it carries a byte-pinned copy instead of becoming the schema authority. Change both repositories together."
+}

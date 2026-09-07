@@ -10,9 +10,26 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path[:0] = [str(ROOT / ".agents/lib"), str(ROOT / ".agents/coordinator")]
-from vaws_npu_coordination import handle_request, _confirmed_free_probe, CoordinationError
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
+from vaws_host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
+
+try:
+    # The host device authority is not owned by this repository and is
+    # deliberately not vendored: one host must have exactly one allocator
+    # implementation. The control-plane suite therefore runs against the
+    # actual module, loaded from the path this deployment configures.
+    host_protocol = load_host_protocol()
+except HostQueueUnavailable as exc:  # pragma: no cover - configuration guard
+    raise unittest.SkipTest(
+        f"{exc}. Point {HOST_QUEUE_MODULE_ENV} at the scaffold's "
+        "vaws_npu_coordination.py to run the control-plane suite."
+    ) from exc
+
+sys.modules.setdefault("vaws_npu_coordination", host_protocol)
+handle_request = host_protocol.handle_request
+_confirmed_free_probe = host_protocol._confirmed_free_probe
+CoordinationError = host_protocol.CoordinationError
 from vaws_ready_runtime import RuntimePool
 from vaws_runtime_profile import capture, digest, verify, publish, restore
 
@@ -77,6 +94,18 @@ def runtime_spec(number):
             "host_endpoint": {"host": "192.0.2.1", "port": 22}, "container_name": "prepared-" + str(number), "service_ports": [48000 + number]}
 
 
+class FakeShell:
+    """Stand-in for the injected remote-dev shell adapter."""
+
+    def __init__(self, result=None):
+        self.result = result or {}
+        self.calls = []
+
+    def run(self, target, command, *, timeout_ms=45000):
+        self.calls.append((target, command, timeout_ms))
+        return self.result
+
+
 class BackendTests(unittest.TestCase):
     def test_docker_idle_probe_keeps_pid_column_and_rejects_workers(self):
         from backend import RemoteBackend
@@ -111,7 +140,6 @@ class BackendTests(unittest.TestCase):
     def test_bash_failure_carries_outcome_and_bounded_stderr_without_command(self):
         from backend import RemoteBackend
 
-        backend = RemoteBackend()
         target = {"host": "192.0.2.1", "port": 22, "user": "root"}
         with tempfile.TemporaryDirectory() as tmp:
             stdout = Path(tmp) / "stdout.log"
@@ -120,10 +148,9 @@ class BackendTests(unittest.TestCase):
             stderr.write_text("padding line\n" * 100 + "final: device probe permission denied")
             result = {"outcome": "failed", "status": "nonzero_exit", "exit_code": 17,
                       "refs": {"stdout": str(stdout), "stderr": str(stderr)}}
-            with mock.patch("backend.resolve_endpoint", side_effect=lambda value: value), \
-                    mock.patch("backend.remote_bash", return_value={"result": result}):
-                with self.assertRaises(RuntimeError) as caught:
-                    backend.bash(target, "echo SECRET-TOKEN-VALUE")
+            backend = RemoteBackend(shell=FakeShell(result))
+            with self.assertRaises(RuntimeError) as caught:
+                backend.bash(target, "echo SECRET-TOKEN-VALUE")
             message = str(caught.exception)
             self.assertIn("failed/nonzero_exit", message)
             self.assertIn("exit 17", message)
@@ -131,10 +158,8 @@ class BackendTests(unittest.TestCase):
             self.assertNotIn("SECRET-TOKEN-VALUE", message)
             self.assertLessEqual(len(message), 400)  # bounded tail only
             blocked = {"outcome": "blocked", "status": "cwd_outside_root"}
-            with mock.patch("backend.resolve_endpoint", side_effect=lambda value: value), \
-                    mock.patch("backend.remote_bash", return_value={"result": blocked}):
-                with self.assertRaisesRegex(RuntimeError, "blocked/cwd_outside_root"):
-                    backend.bash(target, "true")
+            with self.assertRaisesRegex(RuntimeError, "blocked/cwd_outside_root"):
+                RemoteBackend(shell=FakeShell(blocked)).bash(target, "true")
 
 
 class PoolTests(unittest.TestCase):

@@ -45,7 +45,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_backend_import_does_not_shadow_the_official_mcp_sdk(self):
         result = await asyncio.to_thread(subprocess.run, [sys.executable, "-c",
-            "import sys; sys.path.insert(0, " + repr(str(ROOT / ".agents/coordinator")) + "); import backend; from mcp.server import MCPServer"],
+            "import sys; sys.path.insert(0, " + repr(str(ROOT)) + "); import backend; from mcp.server import MCPServer"],
             capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
