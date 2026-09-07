@@ -166,14 +166,24 @@ it is the one behavioural difference introduced by the move.
 
 ## 4. Discrepancies found between the documented guarantees and the code
 
-1. **Python floor.** The README says "Requires Python 3.10+ on the manager".
-   `server.py` catches the builtin `TimeoutError` around
-   `asyncio.wait_for(stop.wait(), ...)`; `asyncio.TimeoutError` only became an
-   alias of the builtin in Python 3.11. On 3.10 the reconciliation task would
-   raise out of its loop after the first interval and stop reconciling until
-   shutdown re-raised it. The real floor is 3.11 —
-   `scripts/vaws_client_setup.py` already needs 3.11 for `tomllib`. Recorded
-   in the README, deliberately **not** fixed in a move commit.
+The move deliberately carried all four over unfixed, because a behaviour
+change does not belong in a move commit. They are resolved below, each
+verified before it was acted on.
+
+1. **Python floor.** *Confirmed; resolved in the documentation.* The README
+   said "Requires Python 3.10+ on the manager". `server.py` catches the
+   builtin `TimeoutError` around `asyncio.wait_for(stop.wait(), ...)`, and
+   `asyncio.TimeoutError` only became an alias of that builtin in 3.11.
+   Reproduced on CPython 3.10.20: `asyncio.TimeoutError is TimeoutError` is
+   `False`, its MRO is `TimeoutError -> Exception`, and a loop of
+   `asyncio.wait_for` guarded by `except TimeoutError` dies on the first
+   interval with `asyncio.exceptions.TimeoutError`. The same script survives
+   three intervals on 3.11.13. `import tomllib` also fails on 3.10, so
+   `scripts/vaws_client_setup.py` needs 3.11 independently. The real floor is
+   3.11 and the README now states it with the reason, instead of promising
+   3.10 and shipping a warning about it. No code changed: a 3.10 manager was
+   already broken, and is now honestly out of support rather than nominally
+   supported.
 2. **Access-file mode.** The README asks for mode `0600`; `server.py` rejects
    only group/other bits (`st_mode & 0o077`), so `0700` also passes. Narrower
    than documented in the direction that matters (no shared read), but not

@@ -226,18 +226,18 @@ every development execution starts a new service process.
 
 ## Start the shared manager
 
-Requires Python 3.10+ on the manager (CI uses 3.12), not torch/torch_npu.
+Requires Python 3.11+ on the manager (CI uses 3.12), not torch/torch_npu.
 Install `requirements.txt` in a dedicated virtualenv. The official MCP Python
 SDK is pinned to 2.1.1; the existing remote-dev MCP server and tool names are
 unchanged.
 
-> **Known discrepancy, carried over unfixed.** The reconciliation loop in
-> `server.py` catches the builtin `TimeoutError` around `asyncio.wait_for`,
-> which only aliases `asyncio.TimeoutError` from Python 3.11. On 3.10 the
-> bounded reconciliation task would die after its first interval. The 3.10+
-> claim above is therefore wrong for the manager process; the real floor is
-> 3.11 (and `scripts/vaws_client_setup.py` needs 3.11 for `tomllib` anyway).
-> Fixing that is a behaviour change and deliberately not part of the move.
+3.11 is a hard floor, not a preference. The reconciliation loop in `server.py`
+catches the builtin `TimeoutError` around `asyncio.wait_for`, and
+`asyncio.TimeoutError` only became an alias of that builtin in 3.11. On 3.10
+`asyncio.TimeoutError` derives from `Exception`, not `OSError`, so the first
+reconciliation interval raises straight out of the task and the manager stops
+reconciling until shutdown re-raises it — no error, no reconciliation.
+`scripts/vaws_client_setup.py` additionally imports `tomllib`, which is 3.11+.
 
 Create a private, **untracked** access file, conventionally under the state
 directory you pass to `--state-dir`:
