@@ -24,6 +24,25 @@ sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
 from vaws_ready_runtime import RuntimePool, safe_id
 
 PRINCIPAL = contextvars.ContextVar("vaws_coordinator_principal")
+ACCESS_FILE_MODE = 0o600
+
+
+def load_access(path):
+    """Read the bearer-token access file, refusing any mode but 0600.
+
+    The documented requirement is exactly `0600`, and this enforces exactly
+    that. Rejecting only group and other bits let `0700` through: an
+    owner-executable secrets file is not what the operator was told to
+    create, and "close enough to the document" is not a property a
+    fail-closed check should have.
+    """
+    mode = path.stat().st_mode & 0o777
+    if mode != ACCESS_FILE_MODE:
+        raise PermissionError(
+            f"access file must be private with mode {ACCESS_FILE_MODE:04o} "
+            f"(chmod 600); {path} has mode {mode:04o}"
+        )
+    return json.loads(path.read_text())
 
 
 def create_app(pool, access, *, interval=2.0, allowed_hosts=None):
@@ -223,8 +242,10 @@ def main():
                         help="Optional shared machine directory for alias registration "
                              "(default: $VAWS_MACHINE_INVENTORY)")
     args = parser.parse_args()
-    if args.access_file.stat().st_mode & 0o077:
-        parser.error("access file must be private (chmod 600)")
+    try:
+        access = load_access(args.access_file)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     from backend import RemoteBackend, worker_source
     from vaws_host_queue import host_queue_module_path
     from vaws_machine_directory import MachineDirectory
@@ -243,7 +264,7 @@ def main():
         parser.error(str(exc))
     backend = RemoteBackend(shell=shell, machines=MachineDirectory(args.machine_inventory),
                             host_queue_module=args.host_queue_module)
-    app = create_app(RuntimePool(args.state_dir, backend), json.loads(args.access_file.read_text()))
+    app = create_app(RuntimePool(args.state_dir, backend), access)
     uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
 
 

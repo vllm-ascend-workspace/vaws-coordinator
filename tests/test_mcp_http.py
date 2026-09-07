@@ -19,7 +19,28 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from test_coordinator import Backend, RuntimePool, runtime_spec, ROOT
-from server import create_app
+from server import ACCESS_FILE_MODE, create_app, load_access
+
+
+class AccessFileTests(unittest.TestCase):
+    """Startup validation of the bearer-token access file."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "access.json"
+        self.digest = hashlib.sha256(b"alice-secret-test").hexdigest()
+        self.path.write_text(json.dumps({"principals": {"alice": {"sha256": self.digest}}}))
+
+    def test_only_the_documented_private_mode_is_accepted(self):
+        self.path.chmod(ACCESS_FILE_MODE)
+        self.assertEqual(load_access(self.path)["principals"]["alice"]["sha256"], self.digest)
+        # 0700 has no group/other bits and used to pass; it is still not the
+        # mode the operator was told to create, so it fails closed now.
+        for mode in (0o700, 0o640, 0o604, 0o666, 0o400):
+            self.path.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaisesRegex(PermissionError, "chmod 600"):
+                load_access(self.path)
 
 
 class HttpTests(unittest.IsolatedAsyncioTestCase):

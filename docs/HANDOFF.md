@@ -184,10 +184,16 @@ verified before it was acted on.
    3.10 and shipping a warning about it. No code changed: a 3.10 manager was
    already broken, and is now honestly out of support rather than nominally
    supported.
-2. **Access-file mode.** The README asks for mode `0600`; `server.py` rejects
-   only group/other bits (`st_mode & 0o077`), so `0700` also passes. Narrower
-   than documented in the direction that matters (no shared read), but not
-   literally what the document says.
+2. **Access-file mode.** *Confirmed; resolved fail-closed in the code.* The
+   README asks for mode `0600`; `server.py` rejected only group and other bits
+   (`st_mode & 0o077`), so `0700` — owner-executable — passed. Resolved
+   towards the stricter documented requirement: `load_access` now requires
+   exactly `0600`. **Consequence:** a manager whose access file is currently
+   `0700` stops starting, and reports both the mode it found and the mode it
+   needs; `chmod 600` is the entire fix and no token, digest or client
+   configuration changes. The check moved out of `main()` into `load_access`
+   so a test can reach it, and that function now also turns a missing or
+   malformed access file into an argument error instead of a traceback.
 3. **Digest validation.** `create_app` checks that each principal's `sha256`
    is 64 characters, not that it is hexadecimal. A malformed digest fails
    closed at comparison time rather than at startup.
