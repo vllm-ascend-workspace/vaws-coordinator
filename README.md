@@ -19,13 +19,17 @@ elsewhere](#dependencies-owned-elsewhere) and [`docs/HANDOFF.md`](docs/HANDOFF.m
 | Remote task references, exclusive runtime bindings, reserved service ports, managed jobs, messages | One shared coordinator database |
 | NPU tasks, queue, fences, activation and release | The scaffold's `vaws_npu_coordination.py`, executed on each physical host |
 | Source edits and execution outputs | The actual business worktree and its local state |
-| Remote shell transport and the job supervisor | The separate remote-dev substrate |
+| Remote shell transport | The separate remote-dev substrate |
+| The child-subreaper execution supervisor | This repository, `workers/managed_jobs.py` |
 
 All participating clients, including independent clones, must connect to the
-**same manager**. Linked worktrees share its default state directory via Git
-common-dir; unrelated clones do not discover each other automatically. One
-process holds `manager.lock`; do not deploy separate databases for the same
-runtime pool. Use canonical host addresses and only register containers
+**same manager**. The manager has no default state directory: `--state-dir` is
+required, because one shared runtime pool must be exactly one database and
+this repository cannot derive a scaffold worktree to put it in. (The local
+task registry is separate and does still have a default: linked worktrees
+share it via Git common-dir, while unrelated clones resolve to themselves and
+never discover each other automatically.) One process holds `manager.lock`; do
+not deploy separate databases for the same runtime pool. Use canonical host addresses and only register containers
 dedicated to this pool, after resolving any old managed-session claims.
 
 Legacy session-local `leases.json` remains a compatibility mechanism, not a
@@ -43,7 +47,7 @@ state.
 
 | Dependency | Configuration | Required interface |
 | --- | --- | --- |
-| remote-dev substrate | `--remote-dev-root` / `VAWS_REMOTE_DEV_ROOT` | `core.endpoint.direct_endpoint` (or `resolve_endpoint`) building an endpoint from an explicit `host/port/user/root/cwd` mapping; `core.shell_ops.remote_bash(endpoint, command=…, timeout_ms=…, runtime_env=False)`; `core/managed_jobs.py` as source text |
+| remote-dev substrate | `--remote-dev-root` / `VAWS_REMOTE_DEV_ROOT` | `core.endpoint.direct_endpoint` (or `resolve_endpoint`) building an endpoint from an explicit `host/port/user/root/cwd` mapping; `core.shell_ops.remote_bash(endpoint, command=…, timeout_ms=…, runtime_env=False)` |
 | Host NPU queue | `--host-queue-module` / `VAWS_HOST_QUEUE_MODULE` | a stdlib-only module exposing `handle_request(request)` and `CoordinationError` |
 | Machine directory (optional) | `--machine-inventory` / `VAWS_MACHINE_INVENTORY` | the scaffold's machine inventory JSON |
 | Source materialization | `VAWS_PARITY_SCRIPT`, optional `VAWS_PARITY_WORKSPACE_ROOT` | the scaffold's `remote_code_parity.py sync --apply-mode materialize`, reporting `snapshot_commits` |
@@ -67,6 +71,7 @@ needs no knowledge of this repository and no resolver plugin on its behalf.
 | `lib/vaws_agent_session.py`, `hooks/vaws_session.py`, `scripts/vaws_client_setup.py` | Local task identity and native attachment surface |
 | `lib/vaws_task_client.py`, `lib/vaws_ops.py`, `scripts/vaws.py` | Task facade and the four task-facing tools |
 | `lib/vaws_remote_dev.py`, `lib/vaws_host_queue.py`, `lib/vaws_machine_directory.py`, `lib/vaws_parity.py` | Narrow adapters to components owned elsewhere |
+| `workers/managed_jobs.py` | The Linux child-subreaper execution supervisor, shipped into a container as source text and never imported here |
 | `lib/vendor/` | Byte-pinned copies of schemas owned elsewhere, with their upstream record |
 
 Run the suites with the pinned SDK and a configured host protocol:
@@ -224,18 +229,18 @@ every development execution starts a new service process.
 
 ## Start the shared manager
 
-Requires Python 3.10+ on the manager (CI uses 3.12), not torch/torch_npu.
+Requires Python 3.11+ on the manager (CI uses 3.12), not torch/torch_npu.
 Install `requirements.txt` in a dedicated virtualenv. The official MCP Python
 SDK is pinned to 2.1.1; the existing remote-dev MCP server and tool names are
 unchanged.
 
-> **Known discrepancy, carried over unfixed.** The reconciliation loop in
-> `server.py` catches the builtin `TimeoutError` around `asyncio.wait_for`,
-> which only aliases `asyncio.TimeoutError` from Python 3.11. On 3.10 the
-> bounded reconciliation task would die after its first interval. The 3.10+
-> claim above is therefore wrong for the manager process; the real floor is
-> 3.11 (and `scripts/vaws_client_setup.py` needs 3.11 for `tomllib` anyway).
-> Fixing that is a behaviour change and deliberately not part of the move.
+3.11 is a hard floor, not a preference. The reconciliation loop in `server.py`
+catches the builtin `TimeoutError` around `asyncio.wait_for`, and
+`asyncio.TimeoutError` only became an alias of that builtin in 3.11. On 3.10
+`asyncio.TimeoutError` derives from `Exception`, not `OSError`, so the first
+reconciliation interval raises straight out of the task and the manager stops
+reconciling until shutdown re-raises it — no error, no reconciliation.
+`scripts/vaws_client_setup.py` additionally imports `tomllib`, which is 3.11+.
 
 Create a private, **untracked** access file, conventionally under the state
 directory you pass to `--state-dir`:
@@ -250,8 +255,11 @@ directory you pass to `--state-dir`:
 ```
 
 Generate at least 32 random bytes for each token. Store the tokens only in
-client secret configuration, never in tracked files. Set access-file mode
-`0600`. Start one process:
+client secret configuration, never in tracked files. Each `sha256` must be 64
+lowercase hex characters; the manager rejects anything else at startup instead
+of letting that principal fail authentication forever. Set access-file mode
+`0600`: exactly that mode is required, and the manager refuses to start on any
+other, including `0700`. Start one process:
 
 ```bash
 python server.py \
@@ -264,8 +272,9 @@ python server.py \
 `--state-dir` is required: one shared runtime pool must be exactly one
 database, and this repository can no longer derive the scaffold's primary
 worktree. Naming two directories would silently fork the pool. The manager
-refuses to start when the job supervisor or the device authority cannot be
-resolved, rather than failing halfway through a first execution.
+refuses to start when the shell transport, its own execution supervisor, or
+the device authority cannot be resolved, rather than failing halfway through
+a first execution.
 
 It binds `127.0.0.1:8766/mcp`. Configure each MCP client with that HTTP endpoint
 and `Authorization: Bearer <its token>`. Other machines can use authenticated

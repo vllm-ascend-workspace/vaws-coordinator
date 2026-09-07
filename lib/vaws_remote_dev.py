@@ -13,11 +13,11 @@ behalf. The exact surface required from a remote-dev checkout is:
   returning ``{"result": {...}}`` where the result carries ``outcome``,
   ``status``, ``exit_code`` and ``refs.stdout`` / ``refs.stderr`` as paths to
   local log files.
-* ``core/managed_jobs.py`` as readable source text: the child-subreaper
-  execution supervisor that this component ships into a runtime container and
-  drives with ``{"root", "job_id", "action", ...}`` requests
-  (``prepare``/``go``/``status``/``tail``/``stop``) answered as one JSON object
-  on stdout.
+The child-subreaper execution supervisor is deliberately **not** part of this
+interface. It is owned by this repository (``workers/managed_jobs.py``, read
+through ``backend.worker_source``), because this component is the only thing
+that drives its ``{"root", "job_id", "action", ...}`` protocol and because the
+guarantees it implements are this component's guarantees.
 
 Nothing here is vendored. A missing or misconfigured checkout is a
 fail-closed configuration error, never a silent local fallback.
@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any
 
 REMOTE_DEV_ROOT_ENV = "VAWS_REMOTE_DEV_ROOT"
-WORKER_MODULES = {"managed_jobs": "core/managed_jobs.py"}
 
 
 class RemoteDevUnavailable(RuntimeError):
@@ -38,7 +37,7 @@ class RemoteDevUnavailable(RuntimeError):
 
 
 class RemoteDevShell:
-    """Explicit-endpoint shell access plus supervisor worker sources."""
+    """Explicit-endpoint shell access to a configured remote-dev checkout."""
 
     def __init__(self, root: Path | str | None = None):
         self._root = Path(root).expanduser() if root else None
@@ -95,12 +94,14 @@ class RemoteDevShell:
             self.endpoint(target), command=command, timeout_ms=timeout_ms, runtime_env=False
         )["result"]
 
-    def worker_source(self, name: str) -> str:
-        relative = WORKER_MODULES[name]
-        path = self._load()["root"] / relative
-        if not path.is_file():
-            raise RemoteDevUnavailable(f"remote-dev checkout is missing {relative}")
-        return path.read_text()
+    def verify(self) -> Path:
+        """Resolve the checkout and its required API, or fail closed.
+
+        The manager calls this at startup so a missing or wrong
+        `VAWS_REMOTE_DEV_ROOT` is a refusal to start, not a failure halfway
+        through a first execution.
+        """
+        return self._load()["root"]
 
     def result_factory(self):
         """Prefer remote-dev's own result envelope when it is available."""

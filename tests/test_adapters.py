@@ -13,6 +13,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
 
+from backend import WORKERS, worker_source
 from vaws_git_sources import discover_repo_tree, iter_postorder
 from vaws_host_queue import HostQueue, HostQueueUnavailable, load_host_protocol
 from vaws_machine_directory import MachineDirectory, MachineDirectoryUnavailable
@@ -44,7 +45,6 @@ def write_remote_dev(root: Path, *, endpoint_symbol="direct_endpoint") -> Path:
         "    CALLS.append((endpoint, command, timeout_ms, runtime_env))\n"
         "    return {'result': {'outcome': 'success', 'refs': {'stdout': ''}}}\n"
     )
-    (core / "managed_jobs.py").write_text("# vaws managed job supervisor\n")
     return root
 
 
@@ -56,10 +56,10 @@ class RemoteDevAdapterTests(unittest.TestCase):
     def test_missing_configuration_fails_closed_without_a_local_fallback(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             with self.assertRaisesRegex(RemoteDevUnavailable, "VAWS_REMOTE_DEV_ROOT"):
-                RemoteDevShell().worker_source("managed_jobs")
+                RemoteDevShell().verify()
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RemoteDevUnavailable, "does not look like"):
-                RemoteDevShell(tmp).worker_source("managed_jobs")
+                RemoteDevShell(tmp).verify()
 
     def test_calls_are_endpoint_explicit_and_never_alias_resolved(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -74,14 +74,13 @@ class RemoteDevAdapterTests(unittest.TestCase):
             self.assertEqual(calls[0][0]["host"], "runtime.invalid")
             self.assertEqual((calls[0][2], calls[0][3]), (45000, False))
 
-    def test_supervisor_source_comes_from_the_remote_dev_checkout(self):
+    def test_the_adapter_no_longer_offers_a_supervisor_source(self):
+        # The supervisor is owned here, so remote-dev is not asked for it and
+        # a remote-dev checkout without it is still a usable transport.
+        self.assertFalse(hasattr(RemoteDevShell, "worker_source"))
         with tempfile.TemporaryDirectory() as tmp:
             shell = RemoteDevShell(write_remote_dev(Path(tmp)))
-            self.assertIn("managed job supervisor", shell.worker_source("managed_jobs"))
-            (Path(tmp) / "core/managed_jobs.py").unlink()
-            RemoteDevShell(Path(tmp)).worker_source  # unresolved until called
-            with self.assertRaisesRegex(RemoteDevUnavailable, "missing core/managed_jobs.py"):
-                RemoteDevShell(Path(tmp)).worker_source("managed_jobs")
+            self.assertFalse((shell.verify() / "core/managed_jobs.py").exists())
 
     def test_legacy_resolve_endpoint_name_is_still_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,6 +95,27 @@ class RemoteDevAdapterTests(unittest.TestCase):
             (root / "core/result.py").write_text(
                 "def make_result(**kwargs):\n    return {'schema_version': 'remote-dev.result.v1', **kwargs}\n")
             self.assertIsNot(RemoteDevShell(root).result_factory(), make_result)
+
+
+class SupervisorSourceTests(unittest.TestCase):
+    """The execution supervisor is this repository's own source text."""
+
+    def test_supervisor_source_is_read_from_this_checkout_without_configuration(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            source = worker_source("managed_jobs")
+        self.assertEqual(source, (WORKERS / "managed_jobs.py").read_text(encoding="utf-8"))
+        self.assertIn("Linux remote job receipt protocol", source)
+        self.assertIn("PR_SET_CHILD_SUBREAPER", source)
+
+    def test_the_supervisor_is_shipped_as_text_and_never_on_this_sys_path(self):
+        # `workers/` deliberately stays off sys.path: it is Linux-only
+        # /proc/prctl code that this manager executes remotely, not locally.
+        self.assertNotIn(str(WORKERS), sys.path)
+        self.assertIsNone(sys.modules.get("managed_jobs"))
+
+    def test_a_checkout_without_the_supervisor_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "missing workers/absent_worker.py"):
+            worker_source("absent_worker")
 
 
 class HostQueueAdapterTests(unittest.TestCase):

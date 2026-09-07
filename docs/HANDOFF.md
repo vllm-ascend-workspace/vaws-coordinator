@@ -29,6 +29,8 @@ can be pinned; state authorities cannot.
 | `.agents/scripts/vaws.py` | `scripts/vaws.py` | The attach adapter and CLI form of the same four operations; it writes the task registry. |
 | `.agents/scripts/vaws_client_setup.py` | `scripts/vaws_client_setup.py` | Configures the hooks that create task attachments. Keeping it next to the registry keeps one writer of that state. |
 | `.agents/hooks/vaws_session.py` | `hooks/vaws_session.py` | Same reason: it is the process that actually creates and resumes attachments. |
+| `.remote-dev/core/managed_jobs.py` | `workers/managed_jobs.py` | The child-subreaper execution supervisor. Nothing in remote-dev imports it; `backend.py` is its only consumer and the guarantees it implements are this component's guarantees. It lives in `workers/`, not `lib/`, because it is source text shipped into a container and never imported here — see §3. |
+| `.remote-dev/tests/test_managed_jobs.py` | `tests/test_managed_jobs.py` | Moves with its subject. |
 
 ### Stayed in the scaffold (consumed through a narrow interface)
 
@@ -102,16 +104,22 @@ is "before attestation" instead of "before remote-code-parity".
    match `session-management/scripts/npu_coordination.py:build_remote_command`.
    Changing the framing or the request/reply contract is a cross-repository
    change.
+10. **If the scaffold's history is ever cleaned of internal addresses, this
+    repository must be cleaned in the same operation.** One retained upstream
+    commit message exists as a second public copy here. Cleaning only the
+    scaffold leaves this repository as the surviving public copy, so the
+    cleanup would look complete and not be. See §6 for the exact commit, the
+    scan that established it, and why no tracked file is involved.
 
 ## 3. Interface required from remote-dev
 
 The sibling extraction of remote-dev is in flight and its final API is not
 published yet, so this is stated as an **assumption**, not a fact:
 
-> This repository assumes remote-dev keeps an explicit-endpoint shell API and
-> continues to ship its job supervisor as importable source text. It does not
-> assume anything about the resolver plugin interface, because it never asks
-> remote-dev to resolve an alias, session or machine.
+> This repository assumes remote-dev keeps an explicit-endpoint shell API. It
+> does not assume anything about the resolver plugin interface, because it
+> never asks remote-dev to resolve an alias, session or machine, and it no
+> longer assumes anything about the job supervisor, because it owns it.
 
 Concretely, from `$VAWS_REMOTE_DEV_ROOT`:
 
@@ -125,18 +133,32 @@ Concretely, from `$VAWS_REMOTE_DEV_ROOT`:
    returning `{"result": {...}}`, where the result carries `outcome`,
    `status`, `exit_code` and `refs.stdout` / `refs.stderr` as paths to local
    log files. Timeout stays 45 s; `runtime_env=False`.
-3. `core/managed_jobs.py` readable as source text. This repository ships it
-   into the container and drives it with `{"root", "job_id", "action", ...}`
-   requests (`prepare`, `go`, `status`, `tail`, `stop`) answered as one JSON
-   object on stdout, including the `receipt` (`pid`, `start_ticks`, `boot_id`,
-   `marker`, `process_guard`) and the `quiet` drain flag.
-4. Optional: `core.result.make_result` for the `remote-dev.result.v1`
+3. Optional: `core.result.make_result` for the `remote-dev.result.v1`
    envelope. When it is unavailable, `lib/vaws_result.py` emits a
    field-compatible mirror so offline local task operations keep working. The
    envelope contract stays remote-dev's; the mirror is not the authority.
 
 If remote-dev's shell API changes shape, `lib/vaws_remote_dev.py` is the only
 file to update.
+
+### No supervisor requirement — corrected
+
+A previous revision of this section listed a third requirement:
+`core/managed_jobs.py` readable as source text from the remote-dev checkout.
+**That requirement was wrong and must not be reintroduced.** remote-dev
+removed the supervisor in its commit `900ad15` on the reasoning that nothing
+there imports it and its only consumer is this repository, and that commit
+says the file moves here. Recording it as an external dependency at the same
+time left it in neither repository while `backend.py` still read it.
+
+It now lives at `workers/managed_jobs.py`, recovered byte-for-byte from
+remote-dev's history, and is read through `backend.worker_source`. The
+`{"root", "job_id", "action", ...}` protocol (`prepare`, `go`, `status`,
+`tail`, `stop`, answered as one JSON object on stdout with the `receipt` —
+`pid`, `start_ticks`, `boot_id`, `marker`, `process_guard` — and the `quiet`
+drain flag) is now an internal contract between `backend.py` and that file,
+not a cross-repository one. remote-dev supplies the shell transport it rides
+on and nothing more; `RemoteDevShell` has no `worker_source` method.
 
 ### Host transport change, stated explicitly
 
@@ -150,25 +172,59 @@ it is the one behavioural difference introduced by the move.
 
 ## 4. Discrepancies found between the documented guarantees and the code
 
-1. **Python floor.** The README says "Requires Python 3.10+ on the manager".
-   `server.py` catches the builtin `TimeoutError` around
-   `asyncio.wait_for(stop.wait(), ...)`; `asyncio.TimeoutError` only became an
-   alias of the builtin in Python 3.11. On 3.10 the reconciliation task would
-   raise out of its loop after the first interval and stop reconciling until
-   shutdown re-raised it. The real floor is 3.11 —
-   `scripts/vaws_client_setup.py` already needs 3.11 for `tomllib`. Recorded
-   in the README, deliberately **not** fixed in a move commit.
-2. **Access-file mode.** The README asks for mode `0600`; `server.py` rejects
-   only group/other bits (`st_mode & 0o077`), so `0700` also passes. Narrower
-   than documented in the direction that matters (no shared read), but not
-   literally what the document says.
-3. **Digest validation.** `create_app` checks that each principal's `sha256`
-   is 64 characters, not that it is hexadecimal. A malformed digest fails
-   closed at comparison time rather than at startup.
-4. **`--state-dir` default.** It used to default to the scaffold's primary
-   worktree. That derivation is gone, so the flag is now required. This is a
-   deliberate fail-closed change: guessing a directory would silently fork one
-   runtime pool into two databases, which the README forbids.
+The move deliberately carried all four over unfixed, because a behaviour
+change does not belong in a move commit. They are resolved below, each
+verified before it was acted on.
+
+1. **Python floor.** *Confirmed; resolved in the documentation.* The README
+   said "Requires Python 3.10+ on the manager". `server.py` catches the
+   builtin `TimeoutError` around `asyncio.wait_for(stop.wait(), ...)`, and
+   `asyncio.TimeoutError` only became an alias of that builtin in 3.11.
+   Reproduced on CPython 3.10.20: `asyncio.TimeoutError is TimeoutError` is
+   `False`, its MRO is `TimeoutError -> Exception`, and a loop of
+   `asyncio.wait_for` guarded by `except TimeoutError` dies on the first
+   interval with `asyncio.exceptions.TimeoutError`. The same script survives
+   three intervals on 3.11.13. `import tomllib` also fails on 3.10, so
+   `scripts/vaws_client_setup.py` needs 3.11 independently. The real floor is
+   3.11 and the README now states it with the reason, instead of promising
+   3.10 and shipping a warning about it. No code changed: a 3.10 manager was
+   already broken, and is now honestly out of support rather than nominally
+   supported.
+2. **Access-file mode.** *Confirmed; resolved fail-closed in the code.* The
+   README asks for mode `0600`; `server.py` rejected only group and other bits
+   (`st_mode & 0o077`), so `0700` — owner-executable — passed. Resolved
+   towards the stricter documented requirement: `load_access` now requires
+   exactly `0600`. **Consequence:** a manager whose access file is currently
+   `0700` stops starting, and reports both the mode it found and the mode it
+   needs; `chmod 600` is the entire fix and no token, digest or client
+   configuration changes. The check moved out of `main()` into `load_access`
+   so a test can reach it, and that function now also turns a missing or
+   malformed access file into an argument error instead of a traceback.
+3. **Digest validation.** *Confirmed; resolved at startup.* `create_app`
+   checked that each principal's `sha256` was 64 characters, not that it was
+   lowercase hexadecimal, so `"z" * 64` started a manager whose principal
+   could never authenticate. It did fail closed — but at
+   `hmac.compare_digest` against a `hashlib.sha256().hexdigest()`, as a 401
+   indistinguishable from a wrong token, for every request from that
+   principal forever. Startup is the earliest point that can detect it, which
+   is the whole reason the validation exists, so the digest is now matched
+   against `[0-9a-f]{64}`. Uppercase hex is rejected for the same reason it
+   never worked: `hexdigest()` is lowercase.
+4. **`--state-dir` default.** *Confirmed correct as extracted; one stale
+   documentation sentence fixed.* It used to default to the scaffold's primary
+   worktree; that derivation is gone and `server.py` declares the flag
+   `required=True`. The change is deliberately fail-closed — guessing a
+   directory would silently fork one runtime pool into two databases — and the
+   "Start the shared manager" section already states both the requirement and
+   that reason, so nothing there needed correcting.
+
+   What did need correcting is one sentence in the authority section that
+   still read "Linked worktrees share its default state directory via Git
+   common-dir". After the extraction, the *manager* has no default state
+   directory at all; the Git-common-dir derivation survives only for the local
+   task registry (`lib/vaws_state_paths.py::shared_workspace_root`, used by
+   `agent_sessions_root`). Left as written, that sentence invited exactly the
+   guess `--state-dir` was made required to prevent.
 
 Everything else matched: the host queue remains the sole allocator, the
 supervisor stays a subreaper whose disappearance yields `unknown` with the
@@ -186,3 +242,57 @@ with a sparse checkout of `.agents/lib/vaws_npu_coordination.py` and exports
 fails the pre-check, so a green run can never mean "tested nothing". When the
 scaffold moves, renames, or changes the host protocol, update the pin in
 `.github/workflows/ci.yml`.
+
+## 6. Sensitive-data audit of the retained history — corrected
+
+The extraction chose **public** visibility for this repository partly on the
+stated basis that a full-history audit found no real IP addresses. That basis
+was wrong. The finding below was established by re-running the scan here, not
+by taking either account on trust.
+
+### What is actually there
+
+One internal RFC 1918 address, `192.168.13.154`, appears in the **commit
+message** of `2613df4` ("feat: harden sessions and add shared ready-runtime
+coordination (#66)") — a retained upstream commit, not one the extraction
+wrote. It sits in a line recording that a preset was verified end-to-end on
+that host with real model weights.
+
+### What is not there
+
+Method, so it can be repeated: for every commit reachable from any ref,
+`git grep -I -n -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' <commit>`; separately
+`git log --all --format='%h|%s|%b'` through the same pattern.
+
+- **No tracked tree contains it, at any commit.** The only IPv4 literals in
+  any revision of any tracked file are `127.0.0.1` and `0.0.0.0`, in
+  `README.md`, `server.py`, `lib/vaws_task_client.py` and the tests. `HEAD` is
+  clean.
+- No absolute `/Users/<user>` paths appear in any commit message.
+- Author e-mail addresses in commit metadata are normal for any Git history.
+
+### What that means for visibility
+
+Public visibility adds **no new exposure of that string**. The same commit
+message is already public in the origin scaffold `maoxx241/vllm-ascend-workspace`
+as commit `0c468446efa11bcf8d3ce245ce20dca3c6bdbfdf`, in a public repository.
+Nothing here is a first publication.
+
+### The consequence that has to be written down
+
+This repository is now a **second public copy** of that commit message. If the
+scaffold's history is ever cleaned — `git filter-repo --replace-message`, or
+any equivalent — cleaning it there alone is **incomplete**: this repository
+would become the surviving public copy of the address, and the cleanup would
+have achieved nothing while appearing to have succeeded.
+
+Whoever performs that cleanup must rewrite both repositories, and any other
+extraction that retained the same upstream commit. In this repository the
+target is the message of `2613df4` only; no tree blob needs touching. Rewriting
+changes every commit id, so it invalidates existing clones and open branches in
+both places, which is why it is the owner's decision and not a side effect of
+this change.
+
+Neither this repository's history nor its visibility was changed here. The
+claim is corrected and the consequence is recorded; acting on it is the
+owner's call.

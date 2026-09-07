@@ -19,7 +19,38 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from test_coordinator import Backend, RuntimePool, runtime_spec, ROOT
-from server import create_app
+from server import ACCESS_FILE_MODE, create_app, load_access
+
+
+class AccessFileTests(unittest.TestCase):
+    """Startup validation of the bearer-token access file."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "access.json"
+        self.digest = hashlib.sha256(b"alice-secret-test").hexdigest()
+        self.path.write_text(json.dumps({"principals": {"alice": {"sha256": self.digest}}}))
+
+    def test_only_the_documented_private_mode_is_accepted(self):
+        self.path.chmod(ACCESS_FILE_MODE)
+        self.assertEqual(load_access(self.path)["principals"]["alice"]["sha256"], self.digest)
+        # 0700 has no group/other bits and used to pass; it is still not the
+        # mode the operator was told to create, so it fails closed now.
+        for mode in (0o700, 0o640, 0o604, 0o666, 0o400):
+            self.path.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaisesRegex(PermissionError, "chmod 600"):
+                load_access(self.path)
+
+    def test_a_malformed_digest_is_rejected_at_startup_not_at_comparison(self):
+        # A 64-character non-hex digest used to start a manager whose
+        # principal could never authenticate: the failure surfaced as a 401
+        # from `hmac.compare_digest`, indistinguishable from a wrong token.
+        pool = mock.Mock()
+        for digest in ("z" * 64, self.digest.upper(), " " + self.digest[1:], self.digest[:63], self.digest + "0"):
+            with self.subTest(digest=repr(digest[:8])), self.assertRaisesRegex(ValueError, "SHA256"):
+                create_app(pool, {"principals": {"alice": {"sha256": digest}}})
+        self.assertTrue(create_app(pool, {"principals": {"alice": {"sha256": self.digest}}}))
 
 
 class HttpTests(unittest.IsolatedAsyncioTestCase):
