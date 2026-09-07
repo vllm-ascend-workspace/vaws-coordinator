@@ -204,10 +204,21 @@ verified before it was acted on.
    is the whole reason the validation exists, so the digest is now matched
    against `[0-9a-f]{64}`. Uppercase hex is rejected for the same reason it
    never worked: `hexdigest()` is lowercase.
-4. **`--state-dir` default.** It used to default to the scaffold's primary
-   worktree. That derivation is gone, so the flag is now required. This is a
-   deliberate fail-closed change: guessing a directory would silently fork one
-   runtime pool into two databases, which the README forbids.
+4. **`--state-dir` default.** *Confirmed correct as extracted; one stale
+   documentation sentence fixed.* It used to default to the scaffold's primary
+   worktree; that derivation is gone and `server.py` declares the flag
+   `required=True`. The change is deliberately fail-closed — guessing a
+   directory would silently fork one runtime pool into two databases — and the
+   "Start the shared manager" section already states both the requirement and
+   that reason, so nothing there needed correcting.
+
+   What did need correcting is one sentence in the authority section that
+   still read "Linked worktrees share its default state directory via Git
+   common-dir". After the extraction, the *manager* has no default state
+   directory at all; the Git-common-dir derivation survives only for the local
+   task registry (`lib/vaws_state_paths.py::shared_workspace_root`, used by
+   `agent_sessions_root`). Left as written, that sentence invited exactly the
+   guess `--state-dir` was made required to prevent.
 
 Everything else matched: the host queue remains the sole allocator, the
 supervisor stays a subreaper whose disappearance yields `unknown` with the

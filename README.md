@@ -23,10 +23,13 @@ elsewhere](#dependencies-owned-elsewhere) and [`docs/HANDOFF.md`](docs/HANDOFF.m
 | The child-subreaper execution supervisor | This repository, `workers/managed_jobs.py` |
 
 All participating clients, including independent clones, must connect to the
-**same manager**. Linked worktrees share its default state directory via Git
-common-dir; unrelated clones do not discover each other automatically. One
-process holds `manager.lock`; do not deploy separate databases for the same
-runtime pool. Use canonical host addresses and only register containers
+**same manager**. The manager has no default state directory: `--state-dir` is
+required, because one shared runtime pool must be exactly one database and
+this repository cannot derive a scaffold worktree to put it in. (The local
+task registry is separate and does still have a default: linked worktrees
+share it via Git common-dir, while unrelated clones resolve to themselves and
+never discover each other automatically.) One process holds `manager.lock`; do
+not deploy separate databases for the same runtime pool. Use canonical host addresses and only register containers
 dedicated to this pool, after resolving any old managed-session claims.
 
 Legacy session-local `leases.json` remains a compatibility mechanism, not a
