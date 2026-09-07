@@ -61,7 +61,8 @@ needs no knowledge of this repository and no resolver plugin on its behalf.
 
 | Path | Role |
 | --- | --- |
-| `server.py` | Authenticated Streamable HTTP MCP entrypoint and reconciliation loop |
+| `server.py` | Authenticated Streamable HTTP MCP entrypoint for the shared pool, and its reconciliation loop |
+| `task_server.py` | Stdio MCP entrypoint for the four task-facing tools; local-first, no token, one per client |
 | `backend.py` | Container/host probes composed from the injected adapters |
 | `prepare_runtime.py` | In-container attestation, publication and restoration |
 | `lib/vaws_ready_runtime.py` | Runtime pool, bindings, leases, events, manifests |
@@ -123,6 +124,41 @@ owned executions and returns runtimes only after release; it preserves local
 sources. Resume after finish reopens the same task, retaining its execution
 history. This is a job lifecycle, not a separate workflow engine.
 
+### Three MCP servers, and which one serves what
+
+The split into repositories left three servers, each serving exactly the
+semantics its repository owns. None proxies another.
+
+| Server | Transport | Serves | Needs |
+| --- | --- | --- | --- |
+| `task_server.py` (this repository) | stdio, one process per client, no token | `vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish` | the local task registry only; `vaws_run` additionally needs the HTTP manager below and answers `blocked`/`unavailable` without it |
+| `server.py` (this repository) | authenticated Streamable HTTP, one shared process | the pool: `session_open`, `runtime_checkout`, `execution_request`, `managed_execution_*`, `coordination_*`, … | `--state-dir`, an access file, remote-dev, the host queue module |
+| `mcp/server.py` (remote-dev repository) | stdio | the `remote_*` substrate tools | a remote-dev checkout and an explicit endpoint |
+
+The remote-dev server used to register the four task tools as well. It no
+longer does, and it will not grow a plugin hook for them: a client configured
+with only the remote-dev stdio entry gets a server with **no** `vaws_*` tools
+and nothing that says why. The task server is their home. A client can tell
+which server it reached from the `initialize` result: the task server declares
+`capabilities.experimental["vaws-coordinator-task"].service_api_version`
+(currently `"1"`). That is the authoritative location; a copy in
+`serverInfo.service_api_version` is for raw JSON-RPC readers only, because
+SDK clients validate `serverInfo` against a fixed model and drop the field
+(the official SDK 2.1.1 does, and keeps the `experimental` entry). A server
+that declares nothing has not declared the task tools, and a client must treat
+that as unknown rather than supported — `task_server.service_api_version()`
+is that probe. `python3 task_server.py --describe` prints the same declaration
+and tool list offline.
+
+`task_server.py` speaks JSON-RPC 2.0 over stdio in either framing: one JSON
+object per line, as the MCP stdio transport specifies and native clients send,
+or `Content-Length`-framed as the remote-dev server and hand-driven clients
+send. The first line decides for the session and replies use the same framing.
+It is standard library only and imports nothing from remote-dev. Tool results
+follow `remote-dev.result.v1` from `lib/vaws_result.py`, with `isError` set for
+every outcome other than `success`/`cancelled` so a `blocked` answer is never
+read as a remote success.
+
 ### Configure native attachments once
 
 Use Python 3.11+ for the local setup helper. Preview the files, then apply:
@@ -134,14 +170,27 @@ python3 /path/to/vaws-coordinator/scripts/vaws_client_setup.py --client codex \
   --project /actual/business/worktree --remote-dev-root /path/to/remote-dev --apply
 ```
 
-`--client` accepts `claude`, `grok`, `kimi`, `codex`, `cursor`. The helper merges
-hooks/MCP entries, preserves other hooks and permission settings, and places
-private backups under `<task registry>/../client-setup/`. It never authenticates
-a client, grants trust, or writes a bearer token. Complete the client's normal
-trust/approval prompts and resume/start it to load the hooks. Configuration is
-not acceptance. The stdio MCP entry points at the remote-dev server that
-registers the task tools; the coordinator's own authenticated HTTP entry stays
-a manual private-file step.
+`--client` accepts `claude`, `grok`, `kimi`, `codex`, `cursor`. The helper
+writes **two** stdio MCP entries in one operation, which is where the split's
+distribution cost lands: `vaws-task` (this checkout's `task_server.py`) and
+`remote-dev` (`<remote-dev>/mcp/server.py`, from `--remote-dev-root` or
+`VAWS_REMOTE_DEV_ROOT`). `--task-only` writes only the task server, for a
+deployment that has no remote-dev checkout and needs local task identity only.
+The helper merges hooks/MCP entries, preserves other hooks, servers and
+permission settings, and places private backups under
+`<task registry>/../client-setup/`. It never authenticates a client, grants
+trust, or writes a bearer token. Complete the client's normal trust/approval
+prompts for **each** server and resume/start it to load the hooks.
+Configuration is not acceptance. The coordinator's own authenticated HTTP entry
+stays a manual private-file step.
+
+A project configured before the task server existed has a `remote-dev` entry
+and nothing serving `vaws_*`. Re-run the helper with `--apply`: the existing
+entry is kept and repointed, `vaws-task` is added, and the client will ask you
+to approve the new server. Tool ids change from `mcp__remote-dev__vaws_*` to
+`mcp__vaws-task__vaws_*`; the session hook matches on the tool name and is
+unaffected, but any client permission rule written against the old prefix
+needs updating.
 
 Codex reviews new or changed hooks in `/hooks`; Cursor Agent separately approves
 the workspace and MCP server. Kimi skips project MCP configuration in an
@@ -183,11 +232,12 @@ not establish the native client lifecycle.
 
 Four portable names are defined here — `vaws_session`, `vaws_run`,
 `vaws_execution`, `vaws_finish` — in `lib/vaws_ops.py`, together with their
-descriptions and input schemas. An MCP host (today the remote-dev stdio
-server) registers them and injects its own result factory. Native context
-identifies the task; the agent supplies intent, source paths and the desired
-resource/environment. Users do not need to manage attachment, binding, fence
-or process receipt ids.
+descriptions and input schemas, and served by this repository's
+`task_server.py` over stdio (the canonical dotted names `vaws.session` … stay
+accepted on `tools/call`; `scripts/vaws.py` is the same facade as a CLI).
+Native context identifies the task; the agent supplies intent, source paths
+and the desired resource/environment. Users do not need to manage attachment,
+binding, fence or process receipt ids.
 
 `vaws_session(sources={"vllm": "/actual/vllm", "vllm-ascend": "/actual/va"})`
 binds actual worktrees without contacting the fleet. The task registry lives
@@ -202,7 +252,10 @@ work, place an untracked `coordinator-client.json` alongside `agent-sessions/`:
 
 The token file must be mode `0600`. Alternatively launch the client with
 `VAWS_COORDINATOR_URL` and `VAWS_COORDINATOR_TOKEN`. Use HTTPS or a loopback
-tunnel. Local task creation/editing/finish without remote jobs works offline.
+tunnel. Local task creation/editing/finish without remote jobs works offline:
+with no manager configured, or with one that is down, `vaws_session` and
+`vaws_finish` still succeed and `vaws_run` returns `blocked`/`unavailable`
+with the transport error as its summary — never a queue position or a job.
 
 `vaws_run` takes a stable request id, command, optional exact `profile_key` or
 `runtime_id`, and either physical `devices` or `npu_count`. Without a selected
@@ -289,7 +342,9 @@ performed by importing or running tests in this PR.
 Use the same HTTP manager from every client, with a separate non-admin token
 per principal. Keep the configuration below in private local files; the
 placeholder is not a token and must not be committed after replacement.
-The existing remote-dev MCP remains a separate server.
+The remote-dev MCP and this repository's `task_server.py` remain separate
+stdio servers; `scripts/vaws_client_setup.py` writes both of those, and never
+this HTTP entry.
 
 Claude Code project `.mcp.json`, Kimi Code `.kimi-code/mcp.json`, and Cursor
 project `.cursor/mcp.json` accept this shape:
