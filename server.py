@@ -19,10 +19,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / ".agents/lib"))
+ROOT = Path(__file__).resolve().parent
+sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
 from vaws_ready_runtime import RuntimePool, safe_id
-from vaws_local_state import shared_workspace_root
 
 PRINCIPAL = contextvars.ContextVar("vaws_coordinator_principal")
 
@@ -207,15 +206,42 @@ def create_app(pool, access, *, interval=2.0, allowed_hosts=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state-dir", type=Path, default=shared_workspace_root(ROOT) / ".vaws-local/coordinator")
+    # The state directory is explicit: one shared runtime pool must be exactly
+    # one database, and this repository can no longer derive the scaffold's
+    # primary worktree. Naming it wrongly would fork the pool silently.
+    parser.add_argument("--state-dir", type=Path, required=True,
+                        help="Untracked durable manager state; one directory per runtime pool")
     parser.add_argument("--access-file", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--remote-dev-root", type=Path, default=None,
+                        help="remote-dev checkout providing explicit-endpoint shell access "
+                             "and the job supervisor (default: $VAWS_REMOTE_DEV_ROOT)")
+    parser.add_argument("--host-queue-module", type=Path, default=None,
+                        help="Host NPU coordination module; the sole device-allocation "
+                             "authority (default: $VAWS_HOST_QUEUE_MODULE)")
+    parser.add_argument("--machine-inventory", type=Path, default=None,
+                        help="Optional shared machine directory for alias registration "
+                             "(default: $VAWS_MACHINE_INVENTORY)")
     args = parser.parse_args()
     if args.access_file.stat().st_mode & 0o077:
         parser.error("access file must be private (chmod 600)")
     from backend import RemoteBackend
+    from vaws_host_queue import host_queue_module_path
+    from vaws_machine_directory import MachineDirectory
+    from vaws_remote_dev import RemoteDevShell
     import uvicorn
-    app = create_app(RuntimePool(args.state_dir, RemoteBackend()), json.loads(args.access_file.read_text()))
+    shell = RemoteDevShell(args.remote_dev_root)
+    try:
+        # Preflight both mandatory dependencies before accepting requests: a
+        # manager that cannot reach the supervisor or the device authority must
+        # refuse to start instead of failing halfway through a first execution.
+        shell.worker_source("managed_jobs")
+        host_queue_module_path(args.host_queue_module)
+    except (RuntimeError, KeyError) as exc:
+        parser.error(str(exc))
+    backend = RemoteBackend(shell=shell, machines=MachineDirectory(args.machine_inventory),
+                            host_queue_module=args.host_queue_module)
+    app = create_app(RuntimePool(args.state_dir, backend), json.loads(args.access_file.read_text()))
     uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
 
 

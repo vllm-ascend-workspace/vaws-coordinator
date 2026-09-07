@@ -1,29 +1,36 @@
-"""Adapters to the existing remote-dev substrate and host NPU coordinator."""
+"""Adapters to the remote-dev substrate and host NPU device authority.
+
+Both dependencies live in other repositories and are injected, never
+vendored: remote-dev provides explicit-endpoint shell access and the
+child-subreaper job supervisor, and the host queue remains the single
+device-allocation authority. See `lib/vaws_remote_dev.py` and
+`lib/vaws_host_queue.py` for the exact required interfaces.
+"""
 from __future__ import annotations
 
-import importlib.util
 import json
 import shlex
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-# Keep the installed MCP SDK ahead of remote-dev's unrelated `mcp/` package.
-sys.path.append(str(ROOT / ".remote-dev"))
-sys.path.insert(0, str(ROOT / ".agents/lib"))
-from core.endpoint import resolve_endpoint
-from core.shell_ops import remote_bash
-from vaws_remote_toolbox import _load_inventory
+ROOT = Path(__file__).resolve().parent
+sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
+from vaws_host_queue import HostQueue
+from vaws_machine_directory import MachineDirectory
+from vaws_remote_dev import RemoteDevShell
 from vaws_runtime_profile import launch_preamble
-
-spec = importlib.util.spec_from_file_location("pool_host_coordination", ROOT / ".agents/skills/session-management/scripts/npu_coordination.py")
-coord = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(coord)
 
 
 class RemoteBackend:
+    def __init__(self, *, shell=None, host_queue=None, machines=None, host_queue_module=None):
+        # Dependencies resolve lazily so an unconfigured optional directory
+        # never prevents the manager from serving explicit registrations.
+        self.shell = shell or RemoteDevShell()
+        self.machines = machines or MachineDirectory()
+        self.host_queue = host_queue or HostQueue(self.bash, module_path=host_queue_module)
+
     def job(self, runtime, job_id, action, **parameters):
-        source = (ROOT / ".remote-dev/core/managed_jobs.py").read_text()
+        source = self.shell.worker_source("managed_jobs")
         request = {"root": runtime["endpoint"]["root"], "job_id": job_id, "action": action, **parameters}
         command = ("python3 - " + shlex.quote(json.dumps(request)) + " <<'VAWS_MANAGED_JOB'\n"
                    + "WORKER_SOURCE = " + repr(source)
@@ -64,39 +71,21 @@ print(json.dumps({'pid':matches[0]}))
         return json.loads(self.bash({**runtime["host_endpoint"], "root": "/", "cwd": "/"}, command))["pid"]
 
     def catalog(self):
-        inventory, path = _load_inventory(ROOT)
-        return {"inventory_path": str(path), "machines": [
-            {"alias": row.get("alias"), "host": row.get("host", {}).get("ip"),
-             "container_name": row.get("container", {}).get("name"),
-             "container_port": row.get("container", {}).get("ssh_port")}
-            for row in inventory["machines"]]}
+        return self.machines.catalog()
 
     def resolve_registration(self, spec):
         if "machine" not in spec:
             return spec
-        inventory, _ = _load_inventory(ROOT)
-        matches = [row for row in inventory["machines"] if row.get("alias") == spec["machine"]]
-        if len(matches) != 1:
-            raise ValueError("machine alias must resolve uniquely in the shared inventory")
-        host = matches[0]["host"]
+        host = self.machines.host(spec["machine"])
         return {"host_endpoint": {"host": host["ip"], "port": host.get("port", 22), "user": host.get("user", "root")},
                 "endpoint": {"host": host["ip"], "port": spec["port"], "root": spec["root"], "user": spec.get("user", "root")},
                 "container_name": spec["container_name"], "service_ports": spec.get("service_ports", [])}
 
     def host(self, runtime, request):
-        result = coord.ssh_execute(coord.LocalEndpoint(**runtime["host_endpoint"]),
-                                  coord.build_remote_command(request), timeout=45)
-        if result.returncode:
-            raise RuntimeError("host coordination failed; inspect endpoint logs and reconcile before retry")
-        payload = json.loads(result.stdout)
-        if payload.get("status") in {"failed", "needs_input", "probe_failed"}:
-            raise RuntimeError(payload.get("error", "host state unknown"))
-        return payload
+        return self.host_queue.request(runtime["host_endpoint"], request)
 
-    @staticmethod
-    def bash(target, command):
-        result = remote_bash(resolve_endpoint(target), command=command, timeout_ms=45000,
-                             runtime_env=False)["result"]
+    def bash(self, target, command):
+        result = self.shell.run(target, command, timeout_ms=45000)
         if result["outcome"] != "success":
             # The command itself may embed job environment, so the error
             # carries only the outcome and a bounded stderr tail; full logs
@@ -127,9 +116,9 @@ print(json.dumps({'pid':matches[0]}))
                 occupied = {int(row.split()[3].rsplit(":", 1)[1]) for row in listeners if len(row.split()) >= 4}
                 if occupied.intersection(runtime["service_ports"]):
                     raise RuntimeError("a reserved service port is still listening; resolve its owner before launch")
-        module = (ROOT / ".agents/lib/vaws_runtime_profile.py").read_text()
+        module = (ROOT / "lib/vaws_runtime_profile.py").read_text()
         request = json.dumps({"root": runtime["endpoint"]["root"], "snapshots": snapshots or {}})
-        build_source = (ROOT / ".agents/lib/vaws_build_inputs.py").read_text()
+        build_source = (ROOT / "lib/vaws_build_inputs.py").read_text()
         runner = "\n_build_namespace = {}\nexec(" + repr(build_source) + ", _build_namespace)\n" + '''
 import subprocess
 import sys
