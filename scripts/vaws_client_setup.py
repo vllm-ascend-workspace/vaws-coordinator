@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Install scoped native session hooks and the common remote-dev MCP entry.
+"""Install scoped native session hooks and the two stdio MCP entries.
 
 This configures files only. It does not grant client trust, change approval
 policies, authenticate clients, or contact a remote machine. The coordinator's
 own authenticated HTTP MCP entry stays a manual private-file step: this helper
 never writes a bearer token.
 
-The stdio MCP entry points at a remote-dev checkout (`--remote-dev-root` or
-`$VAWS_REMOTE_DEV_ROOT`), which is where the task tools are registered.
+Two stdio servers are written, because two repositories serve two different
+things and neither proxies the other:
+
+* `vaws-task` -> this checkout's `task_server.py`, which serves the four task
+  tools (`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`). It is
+  local-first and needs no remote-dev checkout.
+* `remote-dev` -> `<remote-dev checkout>/mcp/server.py` (`--remote-dev-root`
+  or `$VAWS_REMOTE_DEV_ROOT`), which serves the `remote_*` substrate tools.
+  It no longer registers any task tool.
+
+Writing both in one operation is where the split's distribution cost is
+absorbed. `--task-only` skips the remote-dev entry for a deployment that has
+no remote-dev checkout and only needs local task identity.
 """
 from __future__ import annotations
 
@@ -33,18 +44,41 @@ EVENTS = ("SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "PreToo
 # (vaws_agent_session.worktree_reference); a 3s budget would kill a healthy hook.
 HOOK_TIMEOUT_SECONDS = 12
 
+# MCP server names as clients see them (Codex/Grok TOML keys replace "-" with
+# "_"). Tool ids therefore read `mcp__vaws-task__vaws_session`, not
+# `mcp__remote-dev__vaws_session` as they did while remote-dev hosted them.
+TASK_SERVER_NAME = "vaws-task"
+REMOTE_DEV_SERVER_NAME = "remote-dev"
+TASK_SERVER = ROOT / "task_server.py"
+
 
 def remote_dev_server(root=None):
     configured = str(root or os.environ.get(REMOTE_DEV_ROOT_ENV, ""))
     if not configured:
         raise RemoteDevUnavailable(
-            f"the task tools are served by remote-dev; pass --remote-dev-root or set "
-            f"{REMOTE_DEV_ROOT_ENV} so the MCP entry points at an actual server"
+            f"the remote_* substrate tools are served by remote-dev; pass --remote-dev-root or "
+            f"set {REMOTE_DEV_ROOT_ENV} so that MCP entry points at an actual server, or pass "
+            f"--task-only to configure only this checkout's task server"
         )
     server = Path(configured).expanduser() / "mcp/server.py"
     if not server.is_file():
         raise RemoteDevUnavailable(f"remote-dev MCP server not found: {server}")
     return server
+
+
+def task_server():
+    if not TASK_SERVER.is_file():
+        raise FileNotFoundError(f"task server not found in this checkout: {TASK_SERVER}")
+    return TASK_SERVER
+
+
+def mcp_servers(remote_dev_root=None, *, task_only=False):
+    """Ordered `{server name: script path}` for every stdio entry to write."""
+    servers = {}
+    if not task_only:
+        servers[REMOTE_DEV_SERVER_NAME] = remote_dev_server(remote_dev_root)
+    servers[TASK_SERVER_NAME] = task_server()
+    return servers
 
 
 def hook_groups(client, project):
@@ -72,14 +106,18 @@ def merge_json(path, *, hooks=None, mcp=None):
         if path.parent.name == ".cursor":
             value.setdefault("version", 1)
     if mcp:
-        entry = value.setdefault("mcpServers", {}).setdefault("remote-dev", {})
-        entry.update(command=sys.executable, args=[str(mcp)], type="stdio")
-        entry.setdefault("timeout", 600000)
+        servers = value.setdefault("mcpServers", {})
+        for name, script in mcp.items():
+            # Update only our own entries; every other server, including the
+            # user's authenticated coordinator HTTP entry, is left untouched.
+            entry = servers.setdefault(name, {})
+            entry.update(command=sys.executable, args=[str(script)], type="stdio")
+            entry.setdefault("timeout", 600000)
     return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
 
 
-def managed_toml(path, name, text):
-    original = path.read_text() if path.exists() else ""
+def managed_toml(original, name, text):
+    """Replace or append one `# BEGIN/END VAWS <name>` block in TOML text."""
     begin, end = f"# BEGIN VAWS {name}\n", f"# END VAWS {name}\n"
     if begin in original:
         before, rest = original.split(begin, 1)
@@ -90,10 +128,10 @@ def managed_toml(path, name, text):
     return result
 
 
-def configuration(client, project, *, kimi_config=None, remote_dev_root=None):
+def configuration(client, project, *, kimi_config=None, remote_dev_root=None, task_only=False):
     project = project.expanduser().resolve(strict=True)
     groups = hook_groups(client, project)
-    server = remote_dev_server(remote_dev_root)
+    servers = mcp_servers(remote_dev_root, task_only=task_only)
     files = {}
     if client in {"claude", "cursor", "codex", "grok"}:
         relative = {"claude": ".claude/settings.local.json", "cursor": ".cursor/hooks.json",
@@ -102,24 +140,32 @@ def configuration(client, project, *, kimi_config=None, remote_dev_root=None):
         files[path] = merge_json(path, hooks=groups)
     if client in {"claude", "cursor", "kimi"}:
         path = project / {"claude": ".mcp.json", "cursor": ".cursor/mcp.json", "kimi": ".kimi-code/mcp.json"}[client]
-        files[path] = merge_json(path, mcp=server)
+        files[path] = merge_json(path, mcp=servers)
     if client in {"codex", "grok"}:
         path = project / ("." + client) / "config.toml"
-        original = tomllib.loads(path.read_text()) if path.exists() else {}
-        servers = original.get("mcp_servers", {})
-        # Never replace an existing server or edit credentials/policies. The
-        # shared server gains the task tools after its normal client restart.
-        if not any(name in servers for name in ("remote_dev", "remote-dev")):
-            body = "[mcp_servers.remote_dev]\ncommand = " + json.dumps(sys.executable) + "\n"
-            body += "args = " + json.dumps([str(server)]) + "\n"
-            files[path] = managed_toml(path, "remote-dev", body)
+        text = path.read_text() if path.exists() else ""
+        existing = (tomllib.loads(text) if text else {}).get("mcp_servers", {})
+        changed = False
+        for name, script in servers.items():
+            key = name.replace("-", "_")
+            # Never replace an existing server or edit credentials/policies. A
+            # configuration that already has one of the two servers gains only
+            # the missing one; both load after the client's normal restart.
+            if any(candidate in existing for candidate in (key, name)):
+                continue
+            body = f"[mcp_servers.{key}]\ncommand = " + json.dumps(sys.executable) + "\n"
+            body += "args = " + json.dumps([str(script)]) + "\n"
+            text = managed_toml(text, name, body)
+            changed = True
+        if changed:
+            files[path] = text
     if client == "kimi":
         path = kimi_config or Path(os.environ.get("KIMI_CODE_HOME", str(Path.home() / ".kimi-code"))) / "config.toml"
         command = groups["SessionStart"][0]["hooks"][0]["command"]
         body = "\n".join("[[hooks]]\nevent = " + json.dumps(event) + "\ncommand = " + json.dumps(command) +
                          "\ntimeout = " + str(HOOK_TIMEOUT_SECONDS) + "\n" for event in EVENTS)
         project_key = hashlib.sha256(str(project).encode()).hexdigest()[:16]
-        files[path] = managed_toml(path, "session-" + project_key, body)
+        files[path] = managed_toml(path.read_text() if path.exists() else "", "session-" + project_key, body)
     return files
 
 
@@ -128,12 +174,15 @@ def main():
     parser.add_argument("--client", choices=sorted(CLIENTS), required=True)
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--kimi-config", type=Path, help="Kimi's actual user config if launched with --config-file")
-    parser.add_argument("--remote-dev-root", type=Path, help="remote-dev checkout serving the task tools "
-                                                             "(default: $" + REMOTE_DEV_ROOT_ENV + ")")
+    parser.add_argument("--remote-dev-root", type=Path, help="remote-dev checkout serving the remote_* substrate "
+                                                             "tools (default: $" + REMOTE_DEV_ROOT_ENV + ")")
+    parser.add_argument("--task-only", action="store_true",
+                        help="Write only this checkout's task server entry; skip the remote-dev entry")
     parser.add_argument("--apply", action="store_true", help="Write with private backups; default is preview")
     args = parser.parse_args()
     files = configuration(args.client, args.project, kimi_config=args.kimi_config,
-                          remote_dev_root=args.remote_dev_root)
+                          remote_dev_root=args.remote_dev_root, task_only=args.task_only)
+    servers = mcp_servers(args.remote_dev_root, task_only=args.task_only)
     changed = []
     for path, content in files.items():
         if path.exists() and path.read_text() == content:
@@ -154,8 +203,10 @@ def main():
             os.replace(temporary, path)
         changed.append(item)
     print(json.dumps({"state": "configured" if args.apply else "preview", "files": changed,
+                      "mcp_servers": {name: str(path) for name, path in servers.items()},
                       "trust_granted": False, "connected": False,
-                      "next": "Review native client trust/approval prompts, restart or resume the client, then verify actual calls."}))
+                      "next": "Review native client trust/approval prompts for each listed server, restart or "
+                              "resume the client, then verify actual calls."}))
 
 
 if __name__ == "__main__":

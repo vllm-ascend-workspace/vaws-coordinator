@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VAWS local context and task facade; the same operations are remote-dev MCP tools."""
+"""VAWS local context and task facade; the same operations are served by task_server.py over MCP stdio."""
 from __future__ import annotations
 
 import argparse

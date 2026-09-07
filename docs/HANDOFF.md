@@ -31,6 +31,9 @@ can be pinned; state authorities cannot.
 | `.agents/hooks/vaws_session.py` | `hooks/vaws_session.py` | Same reason: it is the process that actually creates and resumes attachments. |
 | `.remote-dev/core/managed_jobs.py` | `workers/managed_jobs.py` | The child-subreaper execution supervisor. Nothing in remote-dev imports it; `backend.py` is its only consumer and the guarantees it implements are this component's guarantees. It lives in `workers/`, not `lib/`, because it is source text shipped into a container and never imported here — see §3. |
 | `.remote-dev/tests/test_managed_jobs.py` | `tests/test_managed_jobs.py` | Moves with its subject. |
+| `.remote-dev/mcp/server.py` (the `vaws.*` part) | `task_server.py` | Nothing served the four task tools after remote-dev dropped them in `f30b992` and declined a plugin hook. This is a new stdio server for exactly those tools, not a proxy through remote-dev and not a copy of its server: it is written against the standard library and imports nothing from remote-dev. |
+| `.remote-dev/tests/test_vaws_ops.py` | `tests/test_vaws_ops.py` | Recovered from `f30b992^`, assertions unchanged; only the `sys.path` setup and the `import core.vaws_ops` line were repointed at `lib/`. |
+| `.remote-dev/tests/test_cli_help.py` (the four `vaws.py` tests) | `tests/test_cli_help.py` | Recovered from `f30b992^`; only the four tests that exercise `scripts/vaws.py` were kept, with the script path, `ROOT` depth and one fake's signature (`vaws.py` now passes `make_result=`) adapted. |
 
 ### Stayed in the scaffold (consumed through a narrow interface)
 
@@ -81,9 +84,11 @@ is "before attestation" instead of "before remote-code-parity".
    - `.remote-dev/tests/test_mcp_schema.py:80` the `name.startswith("vaws.")`
      branch
    - delete `.remote-dev/tests/test_vaws_ops.py`
-   To keep serving the tools from that server, import this repository's
-   `lib/vaws_ops.py` (`TOOL_DESCRIPTIONS`, `TOOL_SCHEMAS`, `vaws_call`) and
-   call `vaws_call(name, args, make_result=core.result.make_result)`.
+   remote-dev did this in `f30b992` and stated it will not add plugin hooks
+   for foreign tools. The tools are served by this repository's own
+   `task_server.py` over stdio; `scripts/vaws_client_setup.py` writes both
+   stdio entries. Clients configured before that change have a `remote-dev`
+   entry and no `vaws_*` tools until the helper is re-run.
 5. Delete `.agents/scripts/vaws.py`, `.agents/scripts/vaws_client_setup.py`
    and `.agents/hooks/vaws_session.py`.
 6. `.agents/skills/session-management/tests/test_agent_sessions.py` imports
