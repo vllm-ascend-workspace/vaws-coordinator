@@ -104,6 +104,12 @@ is "before attestation" instead of "before remote-code-parity".
    match `session-management/scripts/npu_coordination.py:build_remote_command`.
    Changing the framing or the request/reply contract is a cross-repository
    change.
+10. **If the scaffold's history is ever cleaned of internal addresses, this
+    repository must be cleaned in the same operation.** One retained upstream
+    commit message exists as a second public copy here. Cleaning only the
+    scaffold leaves this repository as the surviving public copy, so the
+    cleanup would look complete and not be. See §6 for the exact commit, the
+    scan that established it, and why no tracked file is involved.
 
 ## 3. Interface required from remote-dev
 
@@ -236,3 +242,57 @@ with a sparse checkout of `.agents/lib/vaws_npu_coordination.py` and exports
 fails the pre-check, so a green run can never mean "tested nothing". When the
 scaffold moves, renames, or changes the host protocol, update the pin in
 `.github/workflows/ci.yml`.
+
+## 6. Sensitive-data audit of the retained history — corrected
+
+The extraction chose **public** visibility for this repository partly on the
+stated basis that a full-history audit found no real IP addresses. That basis
+was wrong. The finding below was established by re-running the scan here, not
+by taking either account on trust.
+
+### What is actually there
+
+One internal RFC 1918 address, `192.168.13.154`, appears in the **commit
+message** of `2613df4` ("feat: harden sessions and add shared ready-runtime
+coordination (#66)") — a retained upstream commit, not one the extraction
+wrote. It sits in a line recording that a preset was verified end-to-end on
+that host with real model weights.
+
+### What is not there
+
+Method, so it can be repeated: for every commit reachable from any ref,
+`git grep -I -n -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' <commit>`; separately
+`git log --all --format='%h|%s|%b'` through the same pattern.
+
+- **No tracked tree contains it, at any commit.** The only IPv4 literals in
+  any revision of any tracked file are `127.0.0.1` and `0.0.0.0`, in
+  `README.md`, `server.py`, `lib/vaws_task_client.py` and the tests. `HEAD` is
+  clean.
+- No absolute `/Users/<user>` paths appear in any commit message.
+- Author e-mail addresses in commit metadata are normal for any Git history.
+
+### What that means for visibility
+
+Public visibility adds **no new exposure of that string**. The same commit
+message is already public in the origin scaffold `maoxx241/vllm-ascend-workspace`
+as commit `0c468446efa11bcf8d3ce245ce20dca3c6bdbfdf`, in a public repository.
+Nothing here is a first publication.
+
+### The consequence that has to be written down
+
+This repository is now a **second public copy** of that commit message. If the
+scaffold's history is ever cleaned — `git filter-repo --replace-message`, or
+any equivalent — cleaning it there alone is **incomplete**: this repository
+would become the surviving public copy of the address, and the cleanup would
+have achieved nothing while appearing to have succeeded.
+
+Whoever performs that cleanup must rewrite both repositories, and any other
+extraction that retained the same upstream commit. In this repository the
+target is the message of `2613df4` only; no tree blob needs touching. Rewriting
+changes every commit id, so it invalidates existing clones and open branches in
+both places, which is why it is the owner's decision and not a side effect of
+this change.
+
+Neither this repository's history nor its visibility was changed here. The
+claim is corrected and the consequence is recorded; acting on it is the
+owner's call.
