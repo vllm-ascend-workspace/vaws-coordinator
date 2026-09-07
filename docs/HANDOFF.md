@@ -29,6 +29,8 @@ can be pinned; state authorities cannot.
 | `.agents/scripts/vaws.py` | `scripts/vaws.py` | The attach adapter and CLI form of the same four operations; it writes the task registry. |
 | `.agents/scripts/vaws_client_setup.py` | `scripts/vaws_client_setup.py` | Configures the hooks that create task attachments. Keeping it next to the registry keeps one writer of that state. |
 | `.agents/hooks/vaws_session.py` | `hooks/vaws_session.py` | Same reason: it is the process that actually creates and resumes attachments. |
+| `.remote-dev/core/managed_jobs.py` | `workers/managed_jobs.py` | The child-subreaper execution supervisor. Nothing in remote-dev imports it; `backend.py` is its only consumer and the guarantees it implements are this component's guarantees. It lives in `workers/`, not `lib/`, because it is source text shipped into a container and never imported here — see §3. |
+| `.remote-dev/tests/test_managed_jobs.py` | `tests/test_managed_jobs.py` | Moves with its subject. |
 
 ### Stayed in the scaffold (consumed through a narrow interface)
 
@@ -108,10 +110,10 @@ is "before attestation" instead of "before remote-code-parity".
 The sibling extraction of remote-dev is in flight and its final API is not
 published yet, so this is stated as an **assumption**, not a fact:
 
-> This repository assumes remote-dev keeps an explicit-endpoint shell API and
-> continues to ship its job supervisor as importable source text. It does not
-> assume anything about the resolver plugin interface, because it never asks
-> remote-dev to resolve an alias, session or machine.
+> This repository assumes remote-dev keeps an explicit-endpoint shell API. It
+> does not assume anything about the resolver plugin interface, because it
+> never asks remote-dev to resolve an alias, session or machine, and it no
+> longer assumes anything about the job supervisor, because it owns it.
 
 Concretely, from `$VAWS_REMOTE_DEV_ROOT`:
 
@@ -125,18 +127,32 @@ Concretely, from `$VAWS_REMOTE_DEV_ROOT`:
    returning `{"result": {...}}`, where the result carries `outcome`,
    `status`, `exit_code` and `refs.stdout` / `refs.stderr` as paths to local
    log files. Timeout stays 45 s; `runtime_env=False`.
-3. `core/managed_jobs.py` readable as source text. This repository ships it
-   into the container and drives it with `{"root", "job_id", "action", ...}`
-   requests (`prepare`, `go`, `status`, `tail`, `stop`) answered as one JSON
-   object on stdout, including the `receipt` (`pid`, `start_ticks`, `boot_id`,
-   `marker`, `process_guard`) and the `quiet` drain flag.
-4. Optional: `core.result.make_result` for the `remote-dev.result.v1`
+3. Optional: `core.result.make_result` for the `remote-dev.result.v1`
    envelope. When it is unavailable, `lib/vaws_result.py` emits a
    field-compatible mirror so offline local task operations keep working. The
    envelope contract stays remote-dev's; the mirror is not the authority.
 
 If remote-dev's shell API changes shape, `lib/vaws_remote_dev.py` is the only
 file to update.
+
+### No supervisor requirement — corrected
+
+A previous revision of this section listed a third requirement:
+`core/managed_jobs.py` readable as source text from the remote-dev checkout.
+**That requirement was wrong and must not be reintroduced.** remote-dev
+removed the supervisor in its commit `900ad15` on the reasoning that nothing
+there imports it and its only consumer is this repository, and that commit
+says the file moves here. Recording it as an external dependency at the same
+time left it in neither repository while `backend.py` still read it.
+
+It now lives at `workers/managed_jobs.py`, recovered byte-for-byte from
+remote-dev's history, and is read through `backend.worker_source`. The
+`{"root", "job_id", "action", ...}` protocol (`prepare`, `go`, `status`,
+`tail`, `stop`, answered as one JSON object on stdout with the `receipt` —
+`pid`, `start_ticks`, `boot_id`, `marker`, `process_guard` — and the `quiet`
+drain flag) is now an internal contract between `backend.py` and that file,
+not a cross-repository one. remote-dev supplies the shell transport it rides
+on and nothing more; `RemoteDevShell` has no `worker_source` method.
 
 ### Host transport change, stated explicitly
 
