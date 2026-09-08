@@ -24,9 +24,10 @@ Replies use the framing of the request. Standard library only: no SDK is
 imported for this, and nothing from remote-dev is imported either.
 
 Capability: the `initialize` result declares
-`capabilities.experimental["vaws-coordinator-task"].service_api_version`, and
-mirrors it in `serverInfo` for raw readers (SDK clients validate `serverInfo`
-against a fixed model and drop the copy; `experimental` is the one to probe).
+`capabilities.experimental["vaws-coordinator-task"].service_api_version` as
+the integer published in `service-api.json`, and mirrors it in `serverInfo`
+for raw readers (SDK clients validate `serverInfo` against a fixed model and
+drop the copy; `experimental` is the one to probe).
 A client that does not find it is talking to a
 server that never declared the task tools -- an older configuration or the
 remote-dev server itself -- and must treat the fact as unknown, not supported.
@@ -50,7 +51,13 @@ SERVICE_NAME = "vaws-coordinator-task"
 SERVER_VERSION = "0.1.0"
 # Bump when a tool's arguments, result fields or outcome mapping change in a
 # way a client has to know about. Absence means "no task tools declared".
-SERVICE_API_VERSION = "1"
+# `service-api.json` next to this module is the single source of that number,
+# so the wire declaration and the published contract cannot drift apart, and
+# it is an integer here because the four-provider contract is integer-typed:
+# a client comparing `initialize` against `service-api.json` or against a
+# sibling provider must never have to reconcile `"1"` with `1`.
+SERVICE_API_CONTRACT = json.loads((ROOT / "service-api.json").read_text(encoding="utf-8"))
+SERVICE_API_VERSION: int = int(SERVICE_API_CONTRACT["service_api_version"])
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 # Portable underscore names are advertised (dotted names break at least one
 # client's session registry); the canonical dotted names stay accepted on
@@ -100,18 +107,26 @@ def initialize_result(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def service_api_version(initialize_payload: dict[str, Any]) -> str | None:
+def service_api_version(initialize_payload: dict[str, Any]) -> int | None:
     """Client-side probe over an `initialize` result.
 
-    Returns the declared version, or None when the server declared nothing.
+    Returns the declared version as an integer, matching `service-api.json`
+    and the sibling providers, or None when the server declared nothing.
     None is "unknown": the peer may be the remote-dev server, an older task
     server, or anything else, and a client must degrade rather than assume
-    the task tools exist there.
+    the task tools exist there. A peer that still declares the old string
+    form is normalised to the integer contract; anything that is not an
+    integer at all is unknown too, since it names no contract version.
     """
     experimental = (initialize_payload.get("capabilities") or {}).get("experimental") or {}
     declared = experimental.get(SERVICE_NAME) or {}
     value = declared.get("service_api_version")
-    return None if value is None else str(value)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def list_tools() -> list[dict[str, Any]]:
