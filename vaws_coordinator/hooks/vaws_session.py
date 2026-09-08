@@ -11,9 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "lib"))
-from vaws_agent_session import AgentSessions, CLIENTS, load_context
+from vaws_coordinator.agent_session import CLIENTS, AgentSessions, load_context
 
 
 # Cross-client payload discriminators, pinned by each client's documented hook

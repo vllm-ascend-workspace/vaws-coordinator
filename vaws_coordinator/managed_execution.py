@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import shlex
 
-from vaws_runtime_profile import digest
+from vaws_coordinator.runtime_profile import digest
 
 JOB_TERMINAL = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
 LEASE_TERMINAL = {"released", "cancelled", "expired"}

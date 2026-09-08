@@ -1,77 +1,45 @@
-"""Local task facade for the shared coordinator and remote-dev substrate.
+"""Local task facade over this process's runtime pool.
 
-Only remote execution constructs a coordinator client. Local identity, source
-binding and native resume do not depend on a machine or network connection.
+Identity, source binding and native resume stay local. Remote execution talks
+to an in-process RuntimePool for this user — never to a hosted manager.
 """
+
 from __future__ import annotations
 
-import fcntl
 import contextlib
+import fcntl
 import json
 import os
 import subprocess
-import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from vaws_agent_session import AgentSessions, load_context
-from vaws_build_inputs import BUILD_INPUT_ENV_KEYS
-from vaws_parity import materialize_command
+from vaws_coordinator.agent_session import AgentSessions, load_context
+from vaws_coordinator.build_inputs import BUILD_INPUT_ENV_KEYS
+from vaws_coordinator.parity import materialize_command
+from vaws_coordinator.state_paths import coordinator_state_dir
 
 DONE = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
+LOCAL_OWNER = "local"
 
 
-class CoordinatorClient:
-    def __init__(self, state_dir: Path):
-        path = state_dir.parent / "coordinator-client.json"
-        config = json.loads(path.read_text()) if path.exists() else {}
-        self.url = os.environ.get("VAWS_COORDINATOR_URL") or config.get("url", "")
-        token = os.environ.get(config.get("token_env", "VAWS_COORDINATOR_TOKEN"), "")
-        if not token and config.get("token_file"):
-            secret = Path(config["token_file"]).expanduser()
-            if secret.stat().st_mode & 0o077:
-                raise ValueError("coordinator token file must be private (chmod 600)")
-            token = secret.read_text().strip()
-        if not self.url or not token:
-            raise RuntimeError("remote coordinator is not configured; local development remains available")
-        parsed = urlsplit(self.url)
-        if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}):
-            raise ValueError("use HTTPS or an authenticated tunnel to a loopback MCP endpoint")
-        self.headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                        "Accept": "application/json, text/event-stream"}
-        self.sequence = 0
-        result = self.rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
-                                        "clientInfo": {"name": "vaws-task", "version": "1"}})
-        self.headers["MCP-Protocol-Version"] = result["protocolVersion"]
-        request = urllib.request.Request(self.url, data=json.dumps(
-            {"jsonrpc": "2.0", "method": "notifications/initialized"}).encode(), headers=self.headers, method="POST")
-        with urllib.request.urlopen(request, timeout=15):
-            pass
+def _default_pool(sessions_dir: Path):
+    from vaws_coordinator.backend import RemoteBackend
+    from vaws_coordinator.ready_runtime import RuntimePool
 
-    def rpc(self, method, params):
-        self.sequence += 1
-        data = json.dumps({"jsonrpc": "2.0", "id": self.sequence, "method": method, "params": params}).encode()
-        request = urllib.request.Request(self.url, data=data, headers=self.headers, method="POST")
-        with urllib.request.urlopen(request, timeout=180) as response:
-            if response.headers.get("Mcp-Session-Id"):
-                self.headers["Mcp-Session-Id"] = response.headers["Mcp-Session-Id"]
-            payload = json.load(response)
-        if "error" in payload:
-            raise RuntimeError(payload["error"].get("message", "coordinator RPC failed"))
-        return payload["result"]
-
-    def call(self, name, **arguments):
-        result = self.rpc("tools/call", {"name": name, "arguments": arguments})
-        if result.get("isError"):
-            raise RuntimeError("; ".join(item.get("text", "") for item in result.get("content", []) if item.get("type") == "text"))
-        return result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    return RuntimePool(coordinator_state_dir(sessions_dir), RemoteBackend())
 
 
 class TaskClient:
-    def __init__(self, context_file="", *, client_factory=CoordinatorClient):
+    def __init__(self, context_file="", *, pool=None):
         self.context = load_context(context_file)
         self.store = AgentSessions(Path(self.context["state_dir"]))
-        self.client_factory = client_factory
+        self._pool = pool
+
+    @property
+    def pool(self):
+        if self._pool is None:
+            self._pool = _default_pool(self.store.state_dir)
+        return self._pool
 
     def status(self):
         context = self.store.context(self.context["attachment"]["id"])
@@ -85,8 +53,6 @@ class TaskClient:
 
     @contextlib.contextmanager
     def execution_lock(self, execution_id):
-        # Ids come from the registry; reject path components before opening a
-        # lock even for a caller-supplied status/stop id.
         if len(execution_id) != 64 or any(char not in "0123456789abcdef" for char in execution_id):
             raise ValueError("invalid local execution id")
         with (self.store.state_dir / ("execution-" + execution_id + ".lock")).open("a") as lock:
@@ -106,27 +72,26 @@ class TaskClient:
                 row = self.store.get(db, "execution", row["id"])
             if row["phase"] in DONE:
                 return {"execution_id": row["id"], "state": row["phase"], **row.get("observation", {})}
-            client = self.client_factory(self.store.state_dir)
             if row.get("managed_job"):
-                return self.observe(row["id"], client=client, _locked=True)
+                return self.observe(row["id"], _locked=True)
             context = self.store.context(self.context["attachment"]["id"])
             sources = {name: source["path"] for name, source in context["session"]["sources"].items()}
             if not {"vllm", "vllm-ascend"}.issubset(sources):
                 raise ValueError("bind the actual vllm and vllm-ascend worktrees before an Ascend execution")
             if "remote_session" not in row:
-                row["remote_session"] = client.call("session_open", session_id=context["session"]["id"], sources=sources)
+                row["remote_session"] = self.pool.session_open(LOCAL_OWNER, context["session"]["id"], sources)
                 self.store.save_execution(row)
             if "binding" not in row:
                 if not profile_key:
-                    candidates = [item for item in client.call("runtime_catalog")["runtimes"]
+                    candidates = [item for item in self.pool.catalog()
                                   if item["state"] == "ready" and (not runtime_id or item["runtime_id"] == runtime_id)]
                     profiles = {item["profile_key"] for item in candidates}
                     if len(profiles) != 1:
                         return {"state": "waiting_for_runtime", "execution_id": row["id"], "provisioning_started": False,
                                 "reason": "no unique ready profile; select the required environment"}
                     profile_key = next(iter(profiles))
-                binding = client.call("runtime_checkout", session=row["remote_session"]["id"], profile_key=profile_key,
-                                      request_id=row["id"], runtime_id=runtime_id)
+                binding = self.pool.checkout(LOCAL_OWNER, row["remote_session"]["id"], profile_key,
+                                             row["id"], runtime_id)
                 if binding.get("status") == "cache_miss":
                     return {**binding, "state": "waiting_for_runtime", "execution_id": row["id"]}
                 row.update(binding=binding, phase="bound", sources=sources)
@@ -135,13 +100,11 @@ class TaskClient:
                 row["snapshots"] = self._sync(row)
                 row["phase"] = "launch_pending"
                 self.store.save_execution(row)
-            # Persist snapshots before this call. A lost reply retries the same
-            # command/lease/job ids without re-syncing underneath a running job.
             binding = row["binding"]
-            job = client.call("managed_execution_start", binding_id=binding["id"], request_id=row["id"],
-                              snapshots=row["snapshots"], expected_build_key=binding["build_key"],
-                              command=command, env=env or {}, devices=spec["devices"], npu_count=spec["npu_count"],
-                              timeout_seconds=timeout_seconds)
+            job = self.pool.managed_start(
+                LOCAL_OWNER, binding["id"], row["id"], row["snapshots"], binding["build_key"],
+                spec["devices"], spec["npu_count"], command, env or {}, timeout_seconds,
+            )
             row.update(managed_job=job["id"], phase=job["state"], observation=job)
             self.store.save_execution(row)
             return {"execution_id": row["id"], **job}
@@ -167,39 +130,34 @@ class TaskClient:
             raise RuntimeError("source staging alone does not authorize execution")
         return payload["snapshot_commits"]
 
-    def observe(self, execution_id, action="status", force=False, *, client=None, _locked=False):
+    def observe(self, execution_id, action="status", force=False, *, _locked=False):
         if not _locked:
             with self.execution_lock(execution_id):
-                return self.observe(execution_id, action, force, client=client, _locked=True)
+                return self.observe(execution_id, action, force, _locked=True)
         with self.store.transaction() as db:
             row = self.store.get(db, "execution", execution_id)
         if row["session_id"] != self.context["session"]["id"]:
             raise PermissionError("execution belongs to another VAWS task")
         if not row.get("managed_job"):
             if row.get("phase") == "launch_pending":
-                client = client or self.client_factory(self.store.state_dir)
-                matches = [job for job in client.call("coordinator_status")["jobs"]
+                matches = [job for job in self.pool.status(LOCAL_OWNER)["jobs"]
                            if job["binding_id"] == row["binding"]["id"]
                            and job["request"]["request_id"] == row["id"]]
                 if len(matches) == 1:
                     row["managed_job"] = matches[0]["id"]
                     self.store.save_execution(row)
-                    return self.observe(execution_id, action, force, client=client, _locked=True)
+                    return self.observe(execution_id, action, force, _locked=True)
                 if action != "stop":
                     raise RuntimeError("launch outcome requires retrying the same vaws_run request_id")
-                # A late start against a returned binding is rejected by the
-                # coordinator. Do not resync or create a substitute execution.
             if action == "stop" and row.get("binding"):
-                client = client or self.client_factory(self.store.state_dir)
-                client.call("runtime_return", binding_id=row["binding"]["id"])
+                self.pool.return_runtime(LOCAL_OWNER, row["binding"]["id"])
                 row["phase"] = "cancelled"
                 self.store.save_execution(row)
             elif action == "stop":
                 row["phase"] = "cancelled"
                 self.store.save_execution(row)
             return {"execution_id": row["id"], "state": row["phase"]}
-        client = client or self.client_factory(self.store.state_dir)
-        job = client.call("managed_execution_control", job_id=row["managed_job"], action=action, force=force)
+        job = self.pool.managed_control(LOCAL_OWNER, row["managed_job"], action, force)
         row.update(phase=job["state"], observation=job)
         self.store.save_execution(row)
         return {"execution_id": row["id"], **job}

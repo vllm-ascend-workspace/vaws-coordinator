@@ -17,10 +17,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
-from backend import WORKERS, worker_source
-from vaws_host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
+from vaws_coordinator.backend import WORKERS, worker_source
+from vaws_coordinator.host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
 
 
 def load_supervisor():
@@ -187,7 +185,7 @@ class ManagedJobTests(unittest.TestCase):
 class ManagedJobEntrypointTests(unittest.TestCase):
     def test_main_without_wrapper_injected_worker_source_fails_with_clear_message(self):
         script = WORKERS / "managed_jobs.py"
-        request = {"root": str(ROOT), "job_id": "vaws-" + "e" * 64, "action": "status"}
+        request = {"root": "/tmp", "job_id": "vaws-" + "e" * 64, "action": "status"}
         completed = subprocess.run(
             [sys.executable, str(script), json.dumps(request)],
             capture_output=True, text=True, check=False)

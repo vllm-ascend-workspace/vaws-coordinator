@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from vaws_state_paths import agent_sessions_root
+from vaws_coordinator.state_paths import agent_sessions_root
 
 CLIENTS = {"claude", "grok", "kimi", "codex", "cursor"}
 

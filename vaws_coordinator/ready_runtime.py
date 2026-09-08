@@ -17,9 +17,9 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from vaws_runtime_profile import digest
-from vaws_run_manifest import new_manifest, write_manifest, utc_now
-from vaws_managed_execution import ExecutionRequestError, JOB_TERMINAL, ManagedExecution
+from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMINAL, ManagedExecution
+from vaws_coordinator.runtime_profile import digest
+from vaws_coordinator.vendor.vaws_run_manifest import new_manifest, utc_now, write_manifest
 
 TERMINAL = {"released", "cancelled", "expired"}
 

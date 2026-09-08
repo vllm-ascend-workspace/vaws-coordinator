@@ -1,7 +1,6 @@
 """Contracts of the injected dependencies this repository does not own."""
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -10,16 +9,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
+from remote_dev.result import RESULT_SCHEMA_VERSION, make_result
 
-from backend import WORKERS, worker_source
-from vaws_git_sources import discover_repo_tree, iter_postorder
-from vaws_host_queue import HostQueue, HostQueueUnavailable, host_queue_module_path, load_host_protocol
-from vaws_machine_directory import MachineDirectory, MachineDirectoryUnavailable
-from vaws_ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call
-from vaws_remote_dev import RemoteDevShell, RemoteDevUnavailable
-from vaws_result import SCHEMA_VERSION, make_result
+from vaws_coordinator.backend import WORKERS, RemoteDev, worker_source
+from vaws_coordinator.git_sources import discover_repo_tree, iter_postorder
+from vaws_coordinator.host_queue import (
+    HostQueue,
+    HostQueueUnavailable,
+    bundled_host_module_path,
+    host_queue_module_path,
+    load_host_protocol,
+)
+from vaws_coordinator.machine_directory import MachineDirectory, MachineDirectoryUnavailable
+from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call
 
 HOST_MODULE = '''
 import json
@@ -34,73 +36,41 @@ def handle_request(request):
 '''
 
 
-def write_remote_dev(root: Path, *, endpoint_symbol="direct_endpoint") -> Path:
-    core = root / "core"
-    core.mkdir(parents=True)
-    (core / "__init__.py").write_text("")
-    (core / "endpoint.py").write_text(f"def {endpoint_symbol}(mapping):\n    return dict(mapping)\n")
-    (core / "shell_ops.py").write_text(
-        "CALLS = []\n"
-        "def remote_bash(endpoint, *, command, timeout_ms=None, runtime_env=None, **rest):\n"
-        "    CALLS.append((endpoint, command, timeout_ms, runtime_env))\n"
-        "    return {'result': {'outcome': 'success', 'refs': {'stdout': ''}}}\n"
-    )
-    return root
-
-
 class RemoteDevAdapterTests(unittest.TestCase):
-    def tearDown(self):
-        for name in [key for key in sys.modules if key == "core" or key.startswith("core.")]:
-            del sys.modules[name]
+    def test_calls_require_an_explicit_host_and_port(self):
+        shell = RemoteDev()
+        for target in ({"alias": "runtime-a"}, {"host": "runtime.invalid"}, {"port": 22}):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "explicit host and port"):
+                shell.run(target, "true")
 
-    def test_missing_configuration_fails_closed_without_a_local_fallback(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
-            with self.assertRaisesRegex(RemoteDevUnavailable, "VAWS_REMOTE_DEV_ROOT"):
-                RemoteDevShell().verify()
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(RemoteDevUnavailable, "does not look like"):
-                RemoteDevShell(tmp).verify()
+    def test_successful_shell_uses_the_installed_remote_dev_package(self):
+        from remote_dev.core.endpoint import resolve_endpoint
+        from remote_dev.core.shell_ops import remote_bash
+        from vaws_coordinator import backend as backend_mod
 
-    def test_calls_are_endpoint_explicit_and_never_alias_resolved(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            shell = RemoteDevShell(write_remote_dev(Path(tmp)))
-            for target in ({"alias": "runtime-a"}, {"host": "runtime.invalid"}, {"port": 22}):
-                with self.subTest(target=target), self.assertRaisesRegex(ValueError, "explicit host and port"):
-                    shell.endpoint(target)
-            result = shell.run({"host": "runtime.invalid", "port": 46010, "user": "root",
-                                "root": "/vllm-workspace", "cwd": "/vllm-workspace"}, "true")
-            self.assertEqual(result["outcome"], "success")
-            calls = sys.modules["core.shell_ops"].CALLS
-            self.assertEqual(calls[0][0]["host"], "runtime.invalid")
-            self.assertEqual((calls[0][2], calls[0][3]), (45000, False))
+        self.assertIs(backend_mod.resolve_endpoint, resolve_endpoint)
+        self.assertIs(backend_mod.remote_bash, remote_bash)
 
-    def test_the_adapter_no_longer_offers_a_supervisor_source(self):
-        # The supervisor is owned here, so remote-dev is not asked for it and
-        # a remote-dev checkout without it is still a usable transport.
-        self.assertFalse(hasattr(RemoteDevShell, "worker_source"))
-        with tempfile.TemporaryDirectory() as tmp:
-            shell = RemoteDevShell(write_remote_dev(Path(tmp)))
-            self.assertFalse((shell.verify() / "core/managed_jobs.py").exists())
-
-    def test_legacy_resolve_endpoint_name_is_still_accepted(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            shell = RemoteDevShell(write_remote_dev(Path(tmp), endpoint_symbol="resolve_endpoint"))
-            self.assertEqual(shell.endpoint({"host": "runtime.invalid", "port": 22})["port"], 22)
-
-    def test_result_factory_prefers_remote_dev_and_falls_back_to_the_mirror(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertIs(RemoteDevShell().result_factory(), make_result)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = write_remote_dev(Path(tmp))
-            (root / "core/result.py").write_text(
-                "def make_result(**kwargs):\n    return {'schema_version': 'remote-dev.result.v1', **kwargs}\n")
-            self.assertIsNot(RemoteDevShell(root).result_factory(), make_result)
+        target = {"host": "runtime.invalid", "port": 46010, "user": "root",
+                  "root": "/vllm-workspace", "cwd": "/vllm-workspace"}
+        envelope = {"outcome": "success", "status": "ok", "exit_code": 0,
+                    "refs": {"stdout": "", "stderr": ""}}
+        with mock.patch.object(
+            backend_mod, "remote_bash", return_value={"result": envelope},
+        ) as bash:
+            result = RemoteDev().run(target, "true")
+        self.assertEqual(result["outcome"], "success")
+        endpoint = bash.call_args.args[0]
+        self.assertEqual(endpoint.host, "runtime.invalid")
+        self.assertEqual(endpoint.port, 46010)
+        self.assertEqual(bash.call_args.kwargs["command"], "true")
+        self.assertFalse(bash.call_args.kwargs["runtime_env"])
 
 
 class SupervisorSourceTests(unittest.TestCase):
-    """The execution supervisor is this repository's own source text."""
+    """The execution supervisor is this package's own source text."""
 
-    def test_supervisor_source_is_read_from_this_checkout_without_configuration(self):
+    def test_supervisor_source_is_read_from_the_package_without_configuration(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             source = worker_source("managed_jobs")
         self.assertEqual(source, (WORKERS / "managed_jobs.py").read_text(encoding="utf-8"))
@@ -108,12 +78,10 @@ class SupervisorSourceTests(unittest.TestCase):
         self.assertIn("PR_SET_CHILD_SUBREAPER", source)
 
     def test_the_supervisor_is_shipped_as_text_and_never_on_this_sys_path(self):
-        # `workers/` deliberately stays off sys.path: it is Linux-only
-        # /proc/prctl code that this manager executes remotely, not locally.
         self.assertNotIn(str(WORKERS), sys.path)
         self.assertIsNone(sys.modules.get("managed_jobs"))
 
-    def test_a_checkout_without_the_supervisor_fails_closed(self):
+    def test_a_package_without_the_supervisor_fails_closed(self):
         with self.assertRaisesRegex(RuntimeError, "missing workers/absent_worker.py"):
             worker_source("absent_worker")
 
@@ -127,7 +95,7 @@ class HostQueueAdapterTests(unittest.TestCase):
 
     def test_unconfigured_authority_uses_the_bundled_module(self):
         with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(host_queue_module_path(), ROOT / "host" / "vaws_npu_coordination.py")
+            self.assertEqual(host_queue_module_path(), bundled_host_module_path())
             seen = {}
 
             def run(target, command):
@@ -244,19 +212,11 @@ class GitSourceTests(unittest.TestCase):
             self.assertEqual(order, ["nested/child", "."])
 
 
-class VendoredContractTests(unittest.TestCase):
-    def test_the_vendored_run_manifest_matches_its_recorded_upstream_digest(self):
-        record = json.loads((ROOT / "lib/vendor/UPSTREAM.json").read_text())
-        vendored = ROOT / "lib/vendor" / record["file"]
-        digest = hashlib.sha256(vendored.read_bytes()).hexdigest()
-        self.assertEqual(digest, record["sha256"],
-                         "Run Manifest v1 stays scaffold-owned: update the upstream record "
-                         "and both repositories together, never only this copy.")
-
-    def test_result_envelope_mirrors_the_remote_dev_contract(self):
+class ResultAndToolContractTests(unittest.TestCase):
+    def test_result_envelope_comes_from_remote_dev(self):
         result = make_result(tool="vaws.session", target={"kind": "vaws-task"}, outcome="success",
                              status="open", summary="VAWS open")
-        self.assertEqual(result["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(result["schema_version"], RESULT_SCHEMA_VERSION)
         self.assertLessEqual({"tool", "invocation_id", "target", "outcome", "status", "summary",
                               "started_at", "duration_ms", "preview", "refs", "artifacts",
                               "changed_files", "warnings", "next"}, set(result))

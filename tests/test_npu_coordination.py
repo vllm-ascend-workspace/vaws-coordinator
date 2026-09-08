@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import threading
 import time
@@ -12,12 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-HOST_DIR = ROOT / "host"
-if str(HOST_DIR) not in sys.path:
-    sys.path.insert(0, str(HOST_DIR))
-
-from vaws_npu_coordination import (  # noqa: E402
+from vaws_coordinator.host.vaws_npu_coordination import (
     NpuCoordinator,
     _confirmed_free_probe,
     parse_npu_smi_info,

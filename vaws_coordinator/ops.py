@@ -1,26 +1,19 @@
 """Task-facing operations exposed identically to every MCP host.
 
 These four names (`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`)
-are coordinator semantics, not remote-development semantics: they create and
-resume VAWS tasks, bind actual worktrees, and drive pooled executions. They
-used to be registered inside the remote-dev MCP server, which owned neither
-the task registry nor the runtime pool. They now live here and are served by
-this repository's `task_server.py` over stdio (and by `scripts/vaws.py` as a
-CLI). Any other MCP host can still register them by importing this module and
-injecting its own result factory so one process emits exactly one result
-implementation.
+are coordinator semantics: they create and resume VAWS tasks, bind actual
+worktrees, and drive executions against this user's local pool.
 """
+
 from __future__ import annotations
 
 import json
-import sys
 import time
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from remote_dev.result import make_result as _default_make_result
 
 TOOL_DESCRIPTIONS = {
-    "vaws.session": "Inspect this native session's VAWS task and bind actual business worktrees. Local only: no machine or coordinator is required. Use the context_file supplied by the session hook.",
+    "vaws.session": "Inspect this native session's VAWS task and bind actual business worktrees. Local only: no machine is required. Use the context_file supplied by the session hook.",
     "vaws.run": "Run the task's current source snapshot on a compatible prepared runtime. Automatically sync, acquire devices, launch, renew, observe and release; never install packages or create containers. Keep request_id unchanged on retry.",
     "vaws.execution": "Observe, tail or stop one execution belonging to this VAWS task. Other tasks cannot be selected accidentally. Stop confirms process and NPU release.",
     "vaws.finish": "Finish this VAWS task by stopping only its owned executions and releasing resources; preserve worktrees and evidence.",
@@ -48,24 +41,12 @@ TOOL_SCHEMAS = {
 }
 
 
-def _default_result_factory():
-    from vaws_result import make_result
-
-    return make_result
-
-
 def vaws_call(name, args, *, make_result=None):
     started = time.monotonic()
     target = {"kind": "vaws-task"}
-    make_result = make_result or _default_result_factory()
+    make_result = make_result or _default_make_result
     try:
-        # Lazy import: a host that loads this module by path (for example the
-        # remote-dev MCP server) has not necessarily put lib/ on sys.path, and
-        # an import-time hard dependency would take down its unrelated tools.
-        for candidate in (ROOT / "lib", ROOT / "lib/vendor"):
-            if str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-        from vaws_task_client import TaskClient
+        from vaws_coordinator.task_client import TaskClient
         client = TaskClient(args.get("context_file", ""))
         target["session_id"] = client.context["session"]["id"]
         if name == "vaws.session":
@@ -86,9 +67,6 @@ def vaws_call(name, args, *, make_result=None):
             raise ValueError("unknown VAWS operation")
         outcome = "blocked" if status in {"uncertain", "waiting_for_runtime"} else "failed" if status == "failed" else "timeout" if status == "timeout" else "success"
         if name == "vaws.finish" and outcome == "success" and status != "finished":
-            # finish only completes in the terminal "finished" state; states
-            # like "finishing" mean executions are still stopping, which must
-            # not read as a successful finish.
             outcome = "blocked"
         result = make_result(tool=name, target=target, outcome=outcome, status=status,
                              summary="VAWS " + status.replace("_", " "),
