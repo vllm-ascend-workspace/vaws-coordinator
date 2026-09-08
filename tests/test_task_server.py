@@ -88,8 +88,23 @@ class CapabilityTests(unittest.TestCase):
 
     def test_service_api_json_matches_the_task_server_wire_value(self):
         payload = json.loads((ROOT / "service-api.json").read_text())
-        self.assertEqual(int(float(task_server.SERVICE_API_VERSION)), payload["service_api_version"])
+        self.assertEqual(task_server.SERVICE_API_VERSION, payload["service_api_version"])
         self.assertIn(payload["service_api_version"], payload["supports"])
+
+    def test_initialize_advertises_the_contract_version_as_an_integer(self):
+        # The four-provider contract is integer-typed. A client comparing the
+        # initialize result against service-api.json, or against a sibling
+        # provider such as remote-dev, must not meet `"1" != 1`.
+        result = initialize_result({})
+        declared = result["capabilities"]["experimental"][SERVICE_NAME]["service_api_version"]
+        mirrored = result["serverInfo"]["service_api_version"]
+        published = json.loads((ROOT / "service-api.json").read_text())["service_api_version"]
+        for value in (declared, mirrored, task_server.SERVICE_API_VERSION, service_api_version(result)):
+            self.assertIsInstance(value, int)
+            self.assertNotIsInstance(value, bool)
+            self.assertEqual(value, published)
+        # The declaration survives JSON as an integer, not as a quoted string.
+        self.assertEqual(json.loads(json.dumps(result))["serverInfo"]["service_api_version"], published)
 
     def test_a_server_that_declares_nothing_is_unknown_not_supported(self):
         self.assertEqual(service_api_version(initialize_result({})), SERVICE_API_VERSION)
@@ -100,6 +115,12 @@ class CapabilityTests(unittest.TestCase):
         self.assertIsNone(service_api_version(remote_dev_shaped))
         self.assertIsNone(service_api_version({}))
         self.assertIsNone(service_api_version({"capabilities": {"experimental": {SERVICE_NAME: {}}}}))
+        # A peer still declaring the old string form names the same contract
+        # version; something that is no version at all stays unknown.
+        legacy = {"capabilities": {"experimental": {SERVICE_NAME: {"service_api_version": "1"}}}}
+        self.assertEqual(service_api_version(legacy), SERVICE_API_VERSION)
+        garbage = {"capabilities": {"experimental": {SERVICE_NAME: {"service_api_version": "v1-beta"}}}}
+        self.assertIsNone(service_api_version(garbage))
 
     def test_json_rpc_plumbing_notifications_ping_and_unknown_methods(self):
         self.assertIsNone(handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))

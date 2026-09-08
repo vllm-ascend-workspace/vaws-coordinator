@@ -149,7 +149,9 @@ with only the remote-dev stdio entry gets a server with **no** `vaws_*` tools
 and nothing that says why. The task server is their home. A client can tell
 which server it reached from the `initialize` result: the task server declares
 `capabilities.experimental["vaws-coordinator-task"].service_api_version`
-(currently `"1"`). That is the authoritative location; a copy in
+(currently the integer `1`, read at import time from `service-api.json` next
+to the module so the wire value and the published, integer-typed four-provider
+contract cannot drift). That is the authoritative location; a copy in
 `serverInfo.service_api_version` is for raw JSON-RPC readers only, because
 SDK clients validate `serverInfo` against a fixed model and drop the field
 (the official SDK 2.1.1 does, and keeps the `experimental` entry). A server
