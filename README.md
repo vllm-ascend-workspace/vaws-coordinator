@@ -17,7 +17,7 @@ elsewhere](#dependencies-owned-elsewhere) and [`docs/HANDOFF.md`](docs/HANDOFF.m
 | Machine directory | The scaffold's shared inventory file, read through `VAWS_MACHINE_INVENTORY` |
 | VAWS task identity and native session attachments | Local `agent-sessions` registry, independent of the fleet |
 | Remote task references, exclusive runtime bindings, reserved service ports, managed jobs, messages | One shared coordinator database |
-| NPU tasks, queue, fences, activation and release | The scaffold's `vaws_npu_coordination.py`, executed on each physical host |
+| NPU tasks, queue, fences, activation and release | This repository's `host/vaws_npu_coordination.py`, executed on each physical host |
 | Source edits and execution outputs | The actual business worktree and its local state |
 | Remote shell transport | The separate remote-dev substrate |
 | The child-subreaper execution supervisor | This repository, `workers/managed_jobs.py` |
@@ -48,7 +48,6 @@ state.
 | Dependency | Configuration | Required interface |
 | --- | --- | --- |
 | remote-dev substrate | `--remote-dev-root` / `VAWS_REMOTE_DEV_ROOT` | `core.endpoint.direct_endpoint` (or `resolve_endpoint`) building an endpoint from an explicit `host/port/user/root/cwd` mapping; `core.shell_ops.remote_bash(endpoint, command=…, timeout_ms=…, runtime_env=False)` |
-| Host NPU queue | `--host-queue-module` / `VAWS_HOST_QUEUE_MODULE` | a stdlib-only module exposing `handle_request(request)` and `CoordinationError` |
 | Machine directory (optional) | `--machine-inventory` / `VAWS_MACHINE_INVENTORY` | the scaffold's machine inventory JSON |
 | Source materialization | `VAWS_PARITY_SCRIPT`, optional `VAWS_PARITY_WORKSPACE_ROOT` | the scaffold's `remote_code_parity.py sync --apply-mode materialize`, reporting `snapshot_commits` |
 | Local task registry location | `VAWS_AGENT_SESSIONS_DIR` | a private directory; also holds `coordinator-client.json` |
@@ -56,6 +55,14 @@ state.
 This component resolves endpoints **only** from explicit host/port mappings.
 It never asks remote-dev to resolve an alias, session or machine, so remote-dev
 needs no knowledge of this repository and no resolver plugin on its behalf.
+
+## Host NPU authority
+
+`host/vaws_npu_coordination.py` is the sole device-allocation authority. It is
+stdlib-only, shipped over SSH, and executed on each physical host. Durable
+state lives on the host (`/tmp/vaws-npu-coordinator/v1/`). The interface is
+`handle_request(request)` and `CoordinationError`. `VAWS_HOST_QUEUE_MODULE`
+overrides the bundled path; it is not required.
 
 ## Layout
 
@@ -71,16 +78,17 @@ needs no knowledge of this repository and no resolver plugin on its behalf.
 | `lib/vaws_build_inputs.py` | Native build-input identity shared with parity build keys |
 | `lib/vaws_agent_session.py`, `hooks/vaws_session.py`, `scripts/vaws_client_setup.py` | Local task identity and native attachment surface |
 | `lib/vaws_task_client.py`, `lib/vaws_ops.py`, `scripts/vaws.py` | Task facade and the four task-facing tools |
-| `lib/vaws_remote_dev.py`, `lib/vaws_host_queue.py`, `lib/vaws_machine_directory.py`, `lib/vaws_parity.py` | Narrow adapters to components owned elsewhere |
+| `host/vaws_npu_coordination.py` | Host NPU device-allocation authority; shipped to the host and executed there |
+| `lib/vaws_host_queue.py` | Client that ships the bundled (or overridden) host module |
+| `lib/vaws_remote_dev.py`, `lib/vaws_machine_directory.py`, `lib/vaws_parity.py` | Narrow adapters to components owned elsewhere |
 | `workers/managed_jobs.py` | The Linux child-subreaper execution supervisor, shipped into a container as source text and never imported here |
 | `lib/vendor/` | Byte-pinned copies of schemas owned elsewhere, with their upstream record |
 
-Run the suites with the pinned SDK and a configured host protocol:
+Run the suites with the pinned SDK. The host protocol is bundled:
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-VAWS_HOST_QUEUE_MODULE=/path/to/vaws_npu_coordination.py \
-  .venv/bin/python -m unittest discover -s tests -t tests
+.venv/bin/python -m unittest discover -s tests -t tests
 ```
 
 ## Task and native session lifecycle
@@ -318,8 +326,7 @@ other, including `0700`. Start one process:
 python server.py \
   --state-dir /absolute/private/state/.vaws-local/coordinator \
   --access-file /absolute/private/state/.vaws-local/coordinator/access.json \
-  --remote-dev-root /absolute/path/to/remote-dev \
-  --host-queue-module /absolute/path/to/vaws_npu_coordination.py
+  --remote-dev-root /absolute/path/to/remote-dev
 ```
 
 `--state-dir` is required: one shared runtime pool must be exactly one
@@ -589,11 +596,9 @@ return the runtime for quarantine and re-verification before any reuse.
 
 ## Validation boundaries and current limits
 
-CI uses the actual HTTP MCP SDK with two principals and the real SQLite host
-protocol — checked out from the scaffold at a pinned commit, because the host
-authority is not vendored here — but simulated container/occupancy probes.
-Without `VAWS_HOST_QUEUE_MODULE` the control-plane suite skips itself instead
-of pretending to pass; CI asserts the module exists before running. It covers competing
+CI uses the actual HTTP MCP SDK with two principals and the bundled SQLite host
+protocol, with simulated container/occupancy probes.
+`VAWS_HOST_QUEUE_MODULE` is an override, not a requirement. It covers competing
 management roots, authentication, ownership, restart, message cursors, no hidden
 provisioning, native inputs and complete-bundle corruption/missing-file cases.
 

@@ -34,12 +34,12 @@ can be pinned; state authorities cannot.
 | `.remote-dev/mcp/server.py` (the `vaws.*` part) | `task_server.py` | Nothing served the four task tools after remote-dev dropped them in `f30b992` and declined a plugin hook. This is a new stdio server for exactly those tools, not a proxy through remote-dev and not a copy of its server: it is written against the standard library and imports nothing from remote-dev. |
 | `.remote-dev/tests/test_vaws_ops.py` | `tests/test_vaws_ops.py` | Recovered from `f30b992^`, assertions unchanged; only the `sys.path` setup and the `import core.vaws_ops` line were repointed at `lib/`. |
 | `.remote-dev/tests/test_cli_help.py` (the four `vaws.py` tests) | `tests/test_cli_help.py` | Recovered from `f30b992^`; only the four tests that exercise `scripts/vaws.py` were kept, with the script path, `ROOT` depth and one fake's signature (`vaws.py` now passes `make_result=`) adapted. |
+| `.agents/lib/vaws_npu_coordination.py` | `host/vaws_npu_coordination.py` | The host device-allocation authority. Durable state lives on each host; two copies would mean two owners of that state. Ownership moved here; the scaffold consumes this checkout. |
 
 ### Stayed in the scaffold (consumed through a narrow interface)
 
 | Scaffold path | Why it stayed | How this repository consumes it |
 | --- | --- | --- |
-| `.agents/lib/vaws_npu_coordination.py` | The host device-allocation authority. Its durable state lives in each host's `/tmp`, and the scaffold's legacy session leases drive the same implementation. Two copies would mean two owners of one host's device state — the exact outcome to avoid. Six scaffold call sites versus one here. | `lib/vaws_host_queue.py` ships the configured module to the host and speaks `handle_request`/`CoordinationError`. `VAWS_HOST_QUEUE_MODULE`. |
 | `.agents/lib/vaws_remote_toolbox.py` | The managed VAWS toolbox with ~30 scaffold consumers. This repository used exactly one private symbol from it (`_load_inventory`), which is not an interface. | `lib/vaws_machine_directory.py` reads the inventory JSON directly. `VAWS_MACHINE_INVENTORY`. |
 | `.agents/lib/vaws_local_state.py` | Scaffold workspace state: machine profiles, workspace identity, inventory paths, ~24 consumers. Moving it would strand machine management, repo-init and every skill. | `--state-dir` is now explicit, and `lib/vaws_state_paths.py` re-homes only the two path resolvers the task registry needs (`shared_workspace_root`, `agent_sessions_root`), with `VAWS_AGENT_SESSIONS_DIR` as the explicit override. |
 | `.agents/lib/vaws_session_id.py` | Legacy session binding/lookup for session worktrees. Not imported by any coordinator file. | Not consumed. |
@@ -102,9 +102,10 @@ is "before attestation" instead of "before remote-code-parity".
    `.agents/coordinator/README.md`, the `vaws_session/vaws_run/
    vaws_execution/vaws_finish` tool surface and the moved libraries in their
    maintenance list. Repoint them at this repository.
-9. `.agents/lib/vaws_npu_coordination.py` is now a published interface, not
-   an internal module: `handle_request(request)` plus `CoordinationError`,
-   and the `failed`/`needs_input`/`probe_failed` statuses. Its wire framing is
+9. `.agents/lib/vaws_npu_coordination.py` is no longer scaffold-owned.
+   Consume `host/vaws_npu_coordination.py` from this checkout. The interface
+   is `handle_request(request)` plus `CoordinationError`, and the
+   `failed`/`needs_input`/`probe_failed` statuses. The wire framing stays
    duplicated in `lib/vaws_host_queue.py` (heredoc delimiter and runner) to
    match `session-management/scripts/npu_coordination.py:build_remote_command`.
    Changing the framing or the request/reply contract is a cross-repository
@@ -237,16 +238,12 @@ lease retained, reconciliation refuses to release without bounded evidence, a
 lost job directory never reads as completion, and a returned runtime is
 quarantined until a full re-registration verification passes.
 
-## 5. Cross-repository test dependency
+## 5. Host protocol in CI
 
-The control-plane suite runs against the actual host protocol rather than a
-hand-written double. CI checks out
-`maoxx241/vllm-ascend-workspace@161fed1b0fe6b48359be3f0cf33bb7d8befae113`
-with a sparse checkout of `.agents/lib/vaws_npu_coordination.py` and exports
-`VAWS_HOST_QUEUE_MODULE`. Without that module the suite skips itself and CI
-fails the pre-check, so a green run can never mean "tested nothing". When the
-scaffold moves, renames, or changes the host protocol, update the pin in
-`.github/workflows/ci.yml`.
+The control-plane suite runs against the bundled host protocol
+(`host/vaws_npu_coordination.py`) rather than a hand-written double. CI no
+longer checks the module out of the scaffold. `VAWS_HOST_QUEUE_MODULE` is an
+override, not a requirement.
 
 ## 6. Sensitive-data audit of the retained history — corrected
 
