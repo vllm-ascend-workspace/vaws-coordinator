@@ -13,11 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
-from vaws_git_sources import discover_repo_tree, iter_postorder
-from vaws_runtime_profile import capture, file_digest, profile_key, publish, restore, verify
-from vaws_build_inputs import runtime_build_inputs
+from vaws_coordinator.build_inputs import runtime_build_inputs
+from vaws_coordinator.git_sources import discover_repo_tree, iter_postorder
+from vaws_coordinator.runtime_profile import capture, file_digest, profile_key, publish, restore, verify
 
 
 def require_clean_sources(root: Path):

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vaws-remote-dev"
+version = "0.0.0"
+description = "Minimal remote_dev stub until the real package ships"
+requires-python = ">=3.11"
+
+[tool.hatch.build.targets.wheel]
+packages = ["remote_dev"]

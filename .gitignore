@@ -9,7 +9,6 @@ __pycache__/
 venv/
 *.log
 
-# Untracked local and manager state. Access files hold bearer-token digests,
-# manager databases hold live bindings and leases: never track either.
+# Untracked local coordinator and task-registry state.
 .vaws-local/
 .vaws-runtime/

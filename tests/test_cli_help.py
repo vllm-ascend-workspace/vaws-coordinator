@@ -4,37 +4,44 @@ import json
 import subprocess
 import sys
 import unittest
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliHelpTests(unittest.TestCase):
+    def test_coordinator_entry_and_task_server_help(self):
+        for args in (["--help"], ["task-server", "--help"]):
+            with self.subTest(args=args):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "vaws_coordinator", *args],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("usage:", proc.stdout)
+
     def test_task_facade_uses_one_cli_without_endpoint_or_network_requirements(self):
-        script = ROOT / "scripts/vaws.py"
         for args in (["--help"], ["attach", "--help"], ["session", "--help"],
                      ["run", "--help"], ["execution", "--help"], ["finish", "--help"]):
             with self.subTest(args=args):
-                proc = subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, check=False)
+                proc = subprocess.run(
+                    [sys.executable, "-m", "vaws_coordinator.vaws", *args],
+                    capture_output=True, text=True, check=False,
+                )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("usage:", proc.stdout)
 
     def test_json_arguments_are_not_overridden_by_argparse_defaults(self) -> None:
         code = """
-import importlib.util, json, sys
+import json, sys
 from unittest import mock
-spec = importlib.util.spec_from_file_location("vaws_cli", r"%s")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+import vaws_coordinator.vaws as module
 captured = {}
 def fake(name, args, **kwargs):
     captured.update(args)
     return {"result": {"outcome": "success"}}
-argv = ["vaws.py", "execution", "--execution-id", "e1", "--json", json.dumps({"action": "stop"})]
+argv = ["vaws", "execution", "--execution-id", "e1", "--json", json.dumps({"action": "stop"})]
 with mock.patch.object(module, "vaws_call", side_effect=fake), mock.patch.object(sys, "argv", argv):
     module.main()
 print(json.dumps(captured))
-""" % (ROOT / "scripts/vaws.py")
+"""
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         merged = json.loads(proc.stdout.strip().splitlines()[-1])
@@ -42,7 +49,7 @@ print(json.dumps(captured))
 
     def test_vaws_cli_bad_json_returns_result_contract_without_traceback(self) -> None:
         proc = subprocess.run(
-            [sys.executable, str(ROOT / "scripts/vaws.py"), "session", "--json", "{not json"],
+            [sys.executable, "-m", "vaws_coordinator.vaws", "session", "--json", "{not json"],
             capture_output=True,
             text=True,
             check=False,
@@ -59,7 +66,8 @@ print(json.dumps(captured))
         proc = subprocess.run(
             [
                 sys.executable,
-                str(ROOT / "scripts/vaws.py"),
+                "-m",
+                "vaws_coordinator.vaws",
                 "attach",
                 "--client",
                 "kimi",

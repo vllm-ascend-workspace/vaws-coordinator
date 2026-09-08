@@ -1,18 +1,11 @@
-"""Result envelope compatible with remote-dev's `remote-dev.result.v1`.
-
-The envelope contract is remote-dev's, not this repository's. This mirror is
-what `task_server.py` emits, so the task tools work in a deployment that has
-no remote-dev checkout and the task server never imports one; a foreign MCP
-host that registers the task tools should inject its own factory instead so
-one process emits exactly one implementation. The mirror must stay
-field-compatible and must never be treated as the schema authority.
-"""
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
+Outcome = Literal["success", "needs_input", "blocked", "failed", "timeout", "cancelled"]
 SCHEMA_VERSION = "remote-dev.result.v1"
 
 
@@ -29,7 +22,7 @@ def make_result(
     *,
     tool: str,
     target: dict[str, Any],
-    outcome: str,
+    outcome: Outcome,
     status: str,
     summary: str,
     invocation_id: str | None = None,
@@ -63,3 +56,7 @@ def make_result(
     if extra:
         payload.update(extra)
     return payload
+
+
+def dumps(data: dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)

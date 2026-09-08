@@ -7,15 +7,10 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
-from vaws_agent_session import AgentSessions, CLIENTS, load_context
-from vaws_ops import vaws_call
-from vaws_remote_dev import RemoteDevShell
+from remote_dev.result import make_result
 
-# Prefer remote-dev's own envelope when a checkout is configured, so one
-# deployment emits one result implementation; otherwise use the local mirror.
-make_result = RemoteDevShell().result_factory()
+from vaws_coordinator.agent_session import CLIENTS, AgentSessions, load_context
+from vaws_coordinator.ops import vaws_call
 
 
 def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:

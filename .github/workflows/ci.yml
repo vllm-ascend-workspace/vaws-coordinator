@@ -8,21 +8,19 @@ on:
 jobs:
   control-plane:
     # No Ascend NPU, no Docker daemon, no torch/torch_npu: this is a
-    # control-plane suite with the actual HTTP MCP SDK and the actual host
-    # protocol, against simulated container and occupancy probes.
+    # control-plane suite against the installed package and the bundled host
+    # protocol, with simulated container and occupancy probes.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
           python-version: '3.12'
 
-      - name: Install the pinned MCP SDK
+      - name: Install the package and run tests
         run: |
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -r requirements.txt
-
-      - name: Run the coordinator suites
-        run: .venv/bin/python -m unittest discover -s tests -t tests -v
+          uv venv
+          uv pip install -e ".[test]"
+          uv run python -m pytest -q

@@ -10,9 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
-from vaws_host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
+from vaws_coordinator.host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
 
 try:
     # The suite runs against the bundled host authority, or an explicit
@@ -29,8 +27,8 @@ sys.modules.setdefault("vaws_npu_coordination", host_protocol)
 handle_request = host_protocol.handle_request
 _confirmed_free_probe = host_protocol._confirmed_free_probe
 CoordinationError = host_protocol.CoordinationError
-from vaws_ready_runtime import RuntimePool
-from vaws_runtime_profile import capture, digest, verify, publish, restore
+from vaws_coordinator.ready_runtime import RuntimePool
+from vaws_coordinator.runtime_profile import capture, digest, publish, restore, verify
 
 
 class Backend:
@@ -107,7 +105,7 @@ class FakeShell:
 
 class BackendTests(unittest.TestCase):
     def test_docker_idle_probe_keeps_pid_column_and_rejects_workers(self):
-        from backend import RemoteBackend
+        from vaws_coordinator.backend import RemoteBackend
 
         backend = RemoteBackend()
         for rows, idle in [("PID STAT COMMAND\n123 S sleep\n", True),
@@ -128,7 +126,7 @@ class BackendTests(unittest.TestCase):
                     return ""
                 return json.dumps({"profile": {"launch_env": {}}})
 
-            with self.subTest(rows=rows), mock.patch.object(backend, "bash", side_effect=bash), mock.patch("backend.launch_preamble", return_value=""):
+            with self.subTest(rows=rows), mock.patch.object(backend, "bash", side_effect=bash), mock.patch("vaws_coordinator.backend.launch_preamble", return_value=""):
                 if idle:
                     self.assertEqual(backend.inspect(runtime_spec(1), idle=True)["container_id"], "container-1")
                 else:
@@ -137,7 +135,7 @@ class BackendTests(unittest.TestCase):
                     self.assertEqual(len(commands), 2)
 
     def test_bash_failure_carries_outcome_and_bounded_stderr_without_command(self):
-        from backend import RemoteBackend
+        from vaws_coordinator.backend import RemoteBackend
 
         target = {"host": "192.0.2.1", "port": 22, "user": "root"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -245,7 +243,7 @@ class PoolTests(unittest.TestCase):
         recovered = self.pool.control("alice", run["id"], "poll")
         self.assertEqual(recovered["state"], "granted")
         self.assertEqual(recovered["task_id"], run["task_id"])
-        from vaws_run_manifest import load_manifest
+        from vaws_coordinator.vendor.vaws_run_manifest import load_manifest
         manifest = load_manifest(self.root / "manager/runs" / (run["id"] + ".json"))
         self.assertEqual(manifest["status"], "planned")
         self.assertEqual(manifest["environment"]["coordination"]["state"], "granted")
@@ -695,7 +693,7 @@ class PoolTests(unittest.TestCase):
 class ProfileTests(unittest.TestCase):
     def test_attestation_requires_populated_pinned_native_submodules(self):
         import subprocess
-        from prepare_runtime import require_clean_sources
+        from vaws_coordinator.prepare_runtime import require_clean_sources
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -733,7 +731,7 @@ class ProfileTests(unittest.TestCase):
                 require_clean_sources(root)
 
     def test_complete_bundle_hashes_missing_metadata_env_and_cache_reuse(self):
-        from vaws_runtime_profile import PROFILE_FIELDS
+        from vaws_coordinator.runtime_profile import PROFILE_FIELDS
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "runtime"
             root.mkdir()
@@ -745,7 +743,7 @@ class ProfileTests(unittest.TestCase):
             inputs = {"vllm": "native-a", "vllm-ascend": "native-b"}
             manifest = capture(root, profile, inputs, {"kernels.so": "library", "binary_info_config.json": "metadata"}, {"cann": "cann.txt", "driver": "driver.txt", "smoke": "smoke.txt"})
             verify(root, manifest, check_environment=False)
-            with mock.patch("vaws_runtime_profile.importlib.metadata.version", return_value="test-version"), mock.patch("vaws_runtime_profile.sysconfig.get_config_var", return_value="test-version"):
+            with mock.patch("vaws_coordinator.runtime_profile.importlib.metadata.version", return_value="test-version"), mock.patch("vaws_coordinator.runtime_profile.sysconfig.get_config_var", return_value="test-version"):
                 bundle = publish(root, Path(tmp) / "bundles", manifest)
                 self.assertEqual(publish(root, Path(tmp) / "bundles", manifest), bundle)
                 (root / "smoke.txt").write_text("same passed smoke, new timestamp")
@@ -758,7 +756,7 @@ class ProfileTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "missing required"):
                     verify(root, manifest)
                 restore(root, bundle, manifest["build_key"])
-                with mock.patch("vaws_runtime_profile.sysconfig.get_config_var", return_value="different-abi"):
+                with mock.patch("vaws_coordinator.runtime_profile.sysconfig.get_config_var", return_value="different-abi"):
                     with self.assertRaisesRegex(ValueError, "Python ABI changed"):
                         verify(root, manifest)
                 (root / "binary_info_config.json").write_text("corrupt")
@@ -766,7 +764,7 @@ class ProfileTests(unittest.TestCase):
                     verify(root, manifest)
             with self.assertRaises(ValueError):
                 capture(root, profile, inputs, {"kernels.so": "library"}, {})
-            from vaws_runtime_profile import launch_preamble
+            from vaws_coordinator.runtime_profile import launch_preamble
             import os, subprocess
             profile["launch_env"]["PYTHONPATH"] = "/scoped/source"
             result = subprocess.check_output(["bash", "-c", launch_preamble(profile) + '\nprintf "%s" "$PYTHONPATH"'],
@@ -775,17 +773,17 @@ class ProfileTests(unittest.TestCase):
 
     def test_attest_records_smoke_timeout_as_evidence(self):
         import subprocess
-        import prepare_runtime
-        from vaws_runtime_profile import PROFILE_FIELDS
+        from vaws_coordinator import prepare_runtime
+        from vaws_coordinator.runtime_profile import PROFILE_FIELDS
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             profile = {key: "test-version" for key in PROFILE_FIELDS}
             profile.update(build_env={}, launch_env={}, compatibility_evidence="smoke-ref",
                            system_files={name: {"path": str(root / (name + ".txt")), "sha256": "0" * 64} for name in ("cann", "driver")})
-            with mock.patch("prepare_runtime.require_clean_sources"), \
-                    mock.patch("prepare_runtime.runtime_build_inputs", return_value={"vllm": "native-a"}), \
-                    mock.patch("prepare_runtime.subprocess.run",
+            with mock.patch("vaws_coordinator.prepare_runtime.require_clean_sources"), \
+                    mock.patch("vaws_coordinator.prepare_runtime.runtime_build_inputs", return_value={"vllm": "native-a"}), \
+                    mock.patch("vaws_coordinator.prepare_runtime.subprocess.run",
                                side_effect=subprocess.TimeoutExpired(cmd="smoke", timeout=60)):
                 with self.assertRaisesRegex(ValueError, "timed out"):
                     prepare_runtime.attest(root, {"profile": profile, "files": {}})

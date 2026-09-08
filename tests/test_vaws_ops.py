@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-for _path in (str(ROOT / "lib"), str(ROOT / "lib/vendor")):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
-
-import vaws_ops  # noqa: E402
-import vaws_task_client  # noqa: E402
+from vaws_coordinator import ops as vaws_ops
+from vaws_coordinator import task_client as vaws_task_client
 
 
 class FakeTaskClient:
@@ -26,8 +19,6 @@ class FakeTaskClient:
 
 class VawsOpsTests(unittest.TestCase):
     def test_finish_non_terminal_state_is_blocked_not_success(self) -> None:
-        # A finish that leaves the session in "finishing" (executions still
-        # stopping) must not report success (D7).
         with mock.patch.object(vaws_task_client, "TaskClient", FakeTaskClient):
             payload = vaws_ops.vaws_call("vaws.finish", {})
         self.assertEqual(payload["result"]["status"], "finishing")

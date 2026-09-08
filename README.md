@@ -1,618 +1,97 @@
-# vaws-coordinator — ready runtimes and cooperative execution
+# vaws-coordinator
 
-This is an opt-in, shared Streamable HTTP MCP service, independent of the
-`vllm-ascend-workspace` scaffold. It reuses **idle prepared containers**,
-environments and native artifacts. It does not keep model services resident:
-each development run starts its service using a pinned code snapshot.
+Local-process coordinator for one user's remote Ascend containers and host NPU
+allocation. It is not a hosted multi-user service.
 
-It was extracted from that scaffold's `.agents/coordinator/`. Everything it
-needs from another component is now injected configuration, never an import of
-that component's internals — see [Dependencies owned
-elsewhere](#dependencies-owned-elsewhere) and [`docs/HANDOFF.md`](docs/HANDOFF.md).
+Install it, run it on the machine you are sitting at, and it talks to *your*
+remote containers through the `vaws-remote-dev` package. Code identity is git.
 
-## Authority and scope
-
-| State | Owner |
-| --- | --- |
-| Machine directory | The scaffold's shared inventory file, read through `VAWS_MACHINE_INVENTORY` |
-| VAWS task identity and native session attachments | Local `agent-sessions` registry, independent of the fleet |
-| Remote task references, exclusive runtime bindings, reserved service ports, managed jobs, messages | One shared coordinator database |
-| NPU tasks, queue, fences, activation and release | This repository's `host/vaws_npu_coordination.py`, executed on each physical host |
-| Source edits and execution outputs | The actual business worktree and its local state |
-| Remote shell transport | The separate remote-dev substrate |
-| The child-subreaper execution supervisor | This repository, `workers/managed_jobs.py` |
-
-All participating clients, including independent clones, must connect to the
-**same manager**. The manager has no default state directory: `--state-dir` is
-required, because one shared runtime pool must be exactly one database and
-this repository cannot derive a scaffold worktree to put it in. (The local
-task registry is separate and does still have a default: linked worktrees
-share it via Git common-dir, while unrelated clones resolve to themselves and
-never discover each other automatically.) One process holds `manager.lock`; do
-not deploy separate databases for the same runtime pool. Use canonical host addresses and only register containers
-dedicated to this pool, after resolving any old managed-session claims.
-
-Legacy session-local `leases.json` remains a compatibility mechanism, not a
-cross-workspace allocator. The new path does not create a second local NPU
-lease: every request goes to the existing host authority. Direct SSH,
-unmanaged containers and generic remote-dev writes remain outside cooperative
-enforcement. An MCP fence is not an OS access-control boundary.
-
-## Dependencies owned elsewhere
-
-Each dependency below is configuration, resolved at startup or first use, and
-fails closed with a named variable when it is missing. None of them is
-vendored, because two copies of one authority would mean two owners of its
-state.
-
-| Dependency | Configuration | Required interface |
-| --- | --- | --- |
-| remote-dev substrate | `--remote-dev-root` / `VAWS_REMOTE_DEV_ROOT` | `core.endpoint.direct_endpoint` (or `resolve_endpoint`) building an endpoint from an explicit `host/port/user/root/cwd` mapping; `core.shell_ops.remote_bash(endpoint, command=…, timeout_ms=…, runtime_env=False)` |
-| Machine directory (optional) | `--machine-inventory` / `VAWS_MACHINE_INVENTORY` | the scaffold's machine inventory JSON |
-| Source materialization | `VAWS_PARITY_SCRIPT`, optional `VAWS_PARITY_WORKSPACE_ROOT` | the scaffold's `remote_code_parity.py sync --apply-mode materialize`, reporting `snapshot_commits` |
-| Local task registry location | `VAWS_AGENT_SESSIONS_DIR` | a private directory; also holds `coordinator-client.json` |
-
-This component resolves endpoints **only** from explicit host/port mappings.
-It never asks remote-dev to resolve an alias, session or machine, so remote-dev
-needs no knowledge of this repository and no resolver plugin on its behalf.
-
-## Host NPU authority
-
-`host/vaws_npu_coordination.py` is the sole device-allocation authority. It is
-stdlib-only, shipped over SSH, and executed on each physical host. Durable
-state lives on the host (`/tmp/vaws-npu-coordinator/v1/`). The interface is
-`handle_request(request)` and `CoordinationError`. `VAWS_HOST_QUEUE_MODULE`
-overrides the bundled path; it is not required.
-
-## Layout
-
-| Path | Role |
-| --- | --- |
-| `server.py` | Authenticated Streamable HTTP MCP entrypoint for the shared pool, and its reconciliation loop |
-| `task_server.py` | Stdio MCP entrypoint for the four task-facing tools; local-first, no token, one per client |
-| `backend.py` | Container/host probes composed from the injected adapters |
-| `prepare_runtime.py` | In-container attestation, publication and restoration |
-| `lib/vaws_ready_runtime.py` | Runtime pool, bindings, leases, events, manifests |
-| `lib/vaws_managed_execution.py` | Managed job state machine over pool and host authorities |
-| `lib/vaws_runtime_profile.py` | Immutable environment and complete native-bundle identity |
-| `lib/vaws_build_inputs.py` | Native build-input identity shared with parity build keys |
-| `lib/vaws_agent_session.py`, `hooks/vaws_session.py`, `scripts/vaws_client_setup.py` | Local task identity and native attachment surface |
-| `lib/vaws_task_client.py`, `lib/vaws_ops.py`, `scripts/vaws.py` | Task facade and the four task-facing tools |
-| `host/vaws_npu_coordination.py` | Host NPU device-allocation authority; shipped to the host and executed there |
-| `lib/vaws_host_queue.py` | Client that ships the bundled (or overridden) host module |
-| `lib/vaws_remote_dev.py`, `lib/vaws_machine_directory.py`, `lib/vaws_parity.py` | Narrow adapters to components owned elsewhere |
-| `workers/managed_jobs.py` | The Linux child-subreaper execution supervisor, shipped into a container as source text and never imported here |
-| `lib/vendor/` | Byte-pinned copies of schemas owned elsewhere, with their upstream record |
-
-Run the suites with the pinned SDK. The host protocol is bundled:
+## Install
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -t tests
+uv pip install git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main
 ```
 
-## Task and native session lifecycle
-
-```mermaid
-flowchart TD
-  User[User opens a new native session] --> Native[Native agent session]
-  Native -->|new native id| Task[New VAWS development task]
-  Resume[Resume the same native id] -->|reuse attachment| Task
-  Task -->|one to many| Attach[Root and child native attachments]
-  Attach -->|Codex / Claude / Grok / Kimi / Cursor| Local[Native local tools]
-  Task -->|references only| Sources[Actual business repository worktrees]
-  Local --> Sources
-  Task -->|remote work requested| Run[vaws_run]
-  Run --> Manager[Shared coordinator MCP]
-  Manager -->|exclusive checkout| Runtime[Prepared container and environment]
-  Sources -->|pin and materialize snapshot| Runtime
-  Manager -->|submit / preflight| Host[Physical host NPU authority]
-  Host -->|lease activated| Gate[Open owned process start gate]
-  Gate --> Service[New service process for this code snapshot]
-  Service -->|completion or explicit stop| Release[Confirm process and device release]
-  Release -->|reverify| Runtime
-```
-
-A new native root always creates a new VAWS task, including when another task
-uses the same cwd. **Resume of the same native session keeps the same VAWS
-task.** Child attachments inherit their recorded parent; an unrelated new
-native session joins only through explicit user assignment. No transcripts,
-window ids, branch names or "most recent session" guesses are used.
-
-Worktrees isolate repository code. A task may reference several actual
-repositories; create worktrees using native Git tools when needed and bind
-those paths. The task layer never resets, copies or deletes them. It needs no
-VAWS scaffold worktree per task and no machine to exist. A remote checkout is
-an execution resource, not the identity of the task or its native sessions.
-
-SessionEnd only records a detached attachment. A missed end hook does not
-establish that a window is alive or authorize resource cleanup. Managed jobs
-outlive frontend disconnection and have explicit timeouts. `vaws_finish` stops
-owned executions and returns runtimes only after release; it preserves local
-sources. Resume after finish reopens the same task, retaining its execution
-history. This is a job lifecycle, not a separate workflow engine.
-
-### Three MCP servers, and which one serves what
-
-The split into repositories left three servers, each serving exactly the
-semantics its repository owns. None proxies another.
-
-| Server | Transport | Serves | Needs |
-| --- | --- | --- | --- |
-| `task_server.py` (this repository) | stdio, one process per client, no token | `vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish` | the local task registry only; `vaws_run` additionally needs the HTTP manager below and answers `blocked`/`unavailable` without it |
-| `server.py` (this repository) | authenticated Streamable HTTP, one shared process | the pool: `session_open`, `runtime_checkout`, `execution_request`, `managed_execution_*`, `coordination_*`, … | `--state-dir`, an access file, remote-dev, the host queue module |
-| `mcp/server.py` (remote-dev repository) | stdio | the `remote_*` substrate tools | a remote-dev checkout and an explicit endpoint |
-
-The remote-dev server used to register the four task tools as well. It no
-longer does, and it will not grow a plugin hook for them: a client configured
-with only the remote-dev stdio entry gets a server with **no** `vaws_*` tools
-and nothing that says why. The task server is their home. A client can tell
-which server it reached from the `initialize` result: the task server declares
-`capabilities.experimental["vaws-coordinator-task"].service_api_version`
-(currently the integer `1`, read at import time from `service-api.json` next
-to the module so the wire value and the published, integer-typed four-provider
-contract cannot drift). That is the authoritative location; a copy in
-`serverInfo.service_api_version` is for raw JSON-RPC readers only, because
-SDK clients validate `serverInfo` against a fixed model and drop the field
-(the official SDK 2.1.1 does, and keeps the `experimental` entry). A server
-that declares nothing has not declared the task tools, and a client must treat
-that as unknown rather than supported — `task_server.service_api_version()`
-is that probe. `python3 task_server.py --describe` prints the same declaration
-and tool list offline.
-
-`task_server.py` speaks JSON-RPC 2.0 over stdio in either framing: one JSON
-object per line, as the MCP stdio transport specifies and native clients send,
-or `Content-Length`-framed as the remote-dev server and hand-driven clients
-send. The first line decides for the session and replies use the same framing.
-It is standard library only and imports nothing from remote-dev. Tool results
-follow `remote-dev.result.v1` from `lib/vaws_result.py`, with `isError` set for
-every outcome other than `success`/`cancelled` so a `blocked` answer is never
-read as a remote success.
-
-### Configure native attachments once
-
-Use Python 3.11+ for the local setup helper. Preview the files, then apply:
+Or run without a permanent install:
 
 ```bash
-python3 /path/to/vaws-coordinator/scripts/vaws_client_setup.py --client codex \
-  --project /actual/business/worktree --remote-dev-root /path/to/remote-dev
-python3 /path/to/vaws-coordinator/scripts/vaws_client_setup.py --client codex \
-  --project /actual/business/worktree --remote-dev-root /path/to/remote-dev --apply
+uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main vaws-coordinator task-server
 ```
 
-`--client` accepts `claude`, `grok`, `kimi`, `codex`, `cursor`. The helper
-writes **two** stdio MCP entries in one operation, which is where the split's
-distribution cost lands: `vaws-task` (this checkout's `task_server.py`) and
-`remote-dev` (`<remote-dev>/mcp/server.py`, from `--remote-dev-root` or
-`VAWS_REMOTE_DEV_ROOT`). `--task-only` writes only the task server, for a
-deployment that has no remote-dev checkout and needs local task identity only.
-The helper merges hooks/MCP entries, preserves other hooks, servers and
-permission settings, and places private backups under
-`<task registry>/../client-setup/`. It never authenticates a client, grants
-trust, or writes a bearer token. Complete the client's normal trust/approval
-prompts for **each** server and resume/start it to load the hooks.
-Configuration is not acceptance. The coordinator's own authenticated HTTP entry
-stays a manual private-file step.
+Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
+is the same entry as `vaws-coordinator`.
 
-A project configured before the task server existed has a `remote-dev` entry
-and nothing serving `vaws_*`. Re-run the helper with `--apply`: the existing
-entry is kept and repointed, `vaws-task` is added, and the client will ask you
-to approve the new server. Tool ids change from `mcp__remote-dev__vaws_*` to
-`mcp__vaws-task__vaws_*`; the session hook matches on the tool name and is
-unaffected, but any client permission rule written against the old prefix
-needs updating.
+The package depends on `vaws-remote-dev` (import `remote_dev`). Until that
+repository ships a `pyproject.toml`, local and CI installs use the stub at
+`tests/fakes/vaws-remote-dev`.
 
-Codex reviews new or changed hooks in `/hooks`; Cursor Agent separately approves
-the workspace and MCP server. Kimi skips project MCP configuration in an
-[untrusted workspace](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/AGENTS.md);
-use its normal workspace trust flow and `/mcp` to check
-the loaded servers. Do not work around those approvals with a shell import of
-the server implementation and report it as a native MCP call.
+## Start the task server
 
-| Client | Hook configuration | Native context delivery |
-| --- | --- | --- |
-| Claude Code | `.claude/settings.local.json` | SessionStart context and PreToolUse input augmentation |
-| Codex | `.codex/hooks.json` | SessionStart context and PreToolUse input augmentation; hook review remains required |
-| Grok | `.grok/hooks/vaws-session.json` | PreToolUse input augmentation; project trust remains required |
-| Kimi Code | Project-scoped entries in the actual user `config.toml` | UserPromptSubmit text; MCP stays in `.kimi-code/mcp.json` |
-| Cursor | `.cursor/hooks.json` | sessionStart additional context; MCP stays in `.cursor/mcp.json` |
+`vaws-coordinator task-server` serves the four task tools over stdio MCP:
 
-Kimi's user-level hook is guarded by the actual project path; use
-`--kimi-config` if the client loads a custom config. Grok's imports of Claude
-and Cursor hook files are ignored by those compatibility adapters to avoid
-duplicate task creation. If a client omits a child identifier, the adapter
-reports the missing association and does not invent one. The explicit adapter
-entry `scripts/vaws.py attach --parent-context ...` accepts the
-actual native id. For cross-tool spawning, pass `VAWS_PARENT_CONTEXT` to that
-child process only; explicit user assignment uses `VAWS_ATTACH_CONTEXT`.
-Never export these association variables globally for new user tasks.
+`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`.
 
-These adapters follow the native contracts in the
-[Claude hooks documentation](https://code.claude.com/docs/en/hooks),
-[Codex hooks documentation](https://learn.chatgpt.com/docs/hooks),
-[Grok hook implementation guide](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md),
-[Kimi hooks documentation](https://moonshotai.github.io/kimi-code/en/customization/hooks),
-and [Cursor hooks documentation](https://cursor.com/docs/hooks).
-New native lifecycle behavior still needs actual client calls in addition to
-the regression fixtures. Configuration, schema discovery, a connected server,
-or a direct adapter call establishes control-plane compatibility only; it does
-not establish the native client lifecycle.
-
-### Task-facing execution
-
-Four portable names are defined here — `vaws_session`, `vaws_run`,
-`vaws_execution`, `vaws_finish` — in `lib/vaws_ops.py`, together with their
-descriptions and input schemas, and served by this repository's
-`task_server.py` over stdio (the canonical dotted names `vaws.session` … stay
-accepted on `tools/call`; `scripts/vaws.py` is the same facade as a CLI).
-Native context identifies the task; the agent supplies intent, source paths
-and the desired resource/environment. Users do not need to manage attachment,
-binding, fence or process receipt ids.
-
-`vaws_session(sources={"vllm": "/actual/vllm", "vllm-ascend": "/actual/va"})`
-binds actual worktrees without contacting the fleet. The task registry lives
-in `VAWS_AGENT_SESSIONS_DIR`, or in this checkout's primary worktree under
-`.vaws-local/agent-sessions` when that variable is unset; several clients that
-must share one task identity have to name the same directory. To enable remote
-work, place an untracked `coordinator-client.json` alongside `agent-sessions/`:
-
-```json
-{"url":"http://127.0.0.1:8766/mcp","token_file":"/private/path/to/token"}
-```
-
-The token file must be mode `0600`. Alternatively launch the client with
-`VAWS_COORDINATOR_URL` and `VAWS_COORDINATOR_TOKEN`. Use HTTPS or a loopback
-tunnel. Local task creation/editing/finish without remote jobs works offline:
-with no manager configured, or with one that is down, `vaws_session` and
-`vaws_finish` still succeed and `vaws_run` returns `blocked`/`unavailable`
-with the transport error as its summary — never a queue position or a job.
-
-`vaws_run` takes a stable request id, command, optional exact `profile_key` or
-`runtime_id`, and either physical `devices` or `npu_count`. Without a selected
-profile, it proceeds only when there is one unique ready profile. No suitable
-runtime returns a waiting/cache-miss result without Docker, pip or compilation.
-The agent may continue local work. Explicit environment preparation is a
-separate operator action.
-
-On a warm hit the facade materializes one parity snapshot, persists its id,
-and submits a managed job. The manager prepares a waiting supervisor, verifies
-its host PID, activates a host lease, then opens its start gate. It renews that
-persisted execution independently of frontend connections. A live marked
-process retains the host allocation even during CPU initialization with no
-visible NPU process. Unknown ownership retains resources. Stopping a job
-signals only its recorded process family, then separately checks device release
-and re-verifies the container before reuse. Generic direct endpoint operations
-remain cooperative and do not acquire these protections automatically.
-
-Use `vaws_execution` for status/tail/stop. A lost launch reply is reconciled by
-the same job/request id; it must not cause another source materialization or
-another model launch. Start a new execution id after editing. Native outputs
-can be reused only when their source/build/environment identity still matches;
-every development execution starts a new service process.
-
-## Start the shared manager
-
-Requires Python 3.11+ on the manager (CI uses 3.12), not torch/torch_npu.
-Install `requirements.txt` in a dedicated virtualenv. The official MCP Python
-SDK is pinned to 2.1.1; the existing remote-dev MCP server and tool names are
-unchanged.
-
-3.11 is a hard floor, not a preference. The reconciliation loop in `server.py`
-catches the builtin `TimeoutError` around `asyncio.wait_for`, and
-`asyncio.TimeoutError` only became an alias of that builtin in 3.11. On 3.10
-`asyncio.TimeoutError` derives from `Exception`, not `OSError`, so the first
-reconciliation interval raises straight out of the task and the manager stops
-reconciling until shutdown re-raises it — no error, no reconciliation.
-`scripts/vaws_client_setup.py` additionally imports `tomllib`, which is 3.11+.
-
-Create a private, **untracked** access file, conventionally under the state
-directory you pass to `--state-dir`:
-
-```json
-{
-  "principals": {
-    "developer-a": {"sha256": "<64-hex SHA256 of a random bearer token>", "admin": false},
-    "pool-operator": {"sha256": "<64-hex SHA256 of a different random bearer token>", "admin": true}
-  }
-}
-```
-
-Generate at least 32 random bytes for each token. Store the tokens only in
-client secret configuration, never in tracked files. Each `sha256` must be 64
-lowercase hex characters; the manager rejects anything else at startup instead
-of letting that principal fail authentication forever. Set access-file mode
-`0600`: exactly that mode is required, and the manager refuses to start on any
-other, including `0700`. Start one process:
-
-```bash
-python server.py \
-  --state-dir /absolute/private/state/.vaws-local/coordinator \
-  --access-file /absolute/private/state/.vaws-local/coordinator/access.json \
-  --remote-dev-root /absolute/path/to/remote-dev
-```
-
-`--state-dir` is required: one shared runtime pool must be exactly one
-database, and this repository can no longer derive the scaffold's primary
-worktree. Naming two directories would silently fork the pool. The manager
-refuses to start when the shell transport, its own execution supervisor, or
-the device authority cannot be resolved, rather than failing halfway through
-a first execution.
-
-It binds `127.0.0.1:8766/mcp`. Configure each MCP client with that HTTP endpoint
-and `Authorization: Bearer <its token>`. Other machines can use authenticated
-SSH forwarding to the same loopback service. This is a private cooperative
-fleet service, not a public OAuth authorization server. Host/Origin checks
-remain enabled. No monitor, Docker daemon on the manager, or model service is
-required. Service-manager installation is an operator deployment step, not
-performed by importing or running tests in this PR.
-
-### Coding clients
-
-Use the same HTTP manager from every client, with a separate non-admin token
-per principal. Keep the configuration below in private local files; the
-placeholder is not a token and must not be committed after replacement.
-The remote-dev MCP and this repository's `task_server.py` remain separate
-stdio servers; `scripts/vaws_client_setup.py` writes both of those, and never
-this HTTP entry.
-
-Claude Code project `.mcp.json`, Kimi Code `.kimi-code/mcp.json`, and Cursor
-project `.cursor/mcp.json` accept this shape:
+Example Cursor / Claude `.mcp.json` (or `.cursor/mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "vaws-coordinator": {
-      "type": "http",
-      "url": "http://127.0.0.1:8766/mcp",
-      "headers": {"Authorization": "Bearer <PRIVATE_CLIENT_TOKEN>"}
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main",
+        "vaws-coordinator",
+        "task-server"
+      ]
     }
   }
 }
 ```
 
-For Claude Code, approve the project server or pass this private file through
-`--strict-mcp-config --mcp-config /absolute/path/config.json`. Kimi requires
-trusting the project folder before enabling its project MCP; start a new
-session after changing the server configuration. See the
-[Kimi MCP documentation](https://www.kimi.com/code/docs/kimi-code-cli/customization/mcp.html).
-In Cursor IDE, enable this source under **Tools & MCPs**, confirm that its
-the coordinator tools are connected, and start a new agent. Cursor CLI authentication is
-separate from a working IDE session.
+`vaws_session` and `vaws_finish` are local. `vaws_run` uses this process's own
+runtime pool and the host NPU authority. Pass the `context_file` supplied by
+the native session hook; never guess a task from cwd or history.
 
-Codex `.codex/config.toml` can use a token environment variable:
+## Host NPU queue (Python API)
 
-```toml
-[mcp_servers.vaws_coordinator]
-url = "http://127.0.0.1:8766/mcp"
-bearer_token_env_var = "VAWS_COORDINATOR_TOKEN"
+The scaffold imports the public allocation surface from one place:
+
+```python
+from vaws_coordinator.host_queue import (
+    HostQueue,
+    HostQueueUnavailable,
+    SCHEMA_VERSION,
+    CoordinationError,
+    handle_request,
+    host_queue_module_path,
+    load_host_protocol,
+)
 ```
 
-Export that principal's token in the environment launching Codex. Grok's
-project `.grok/config.toml` uses `headers`:
+`host/vaws_npu_coordination.py` stays stdlib-only. It is shipped over SSH and
+executed on the physical host. Durable host state is `/tmp/vaws-npu-coordinator/v1/`.
+`VAWS_HOST_QUEUE_MODULE` overrides the bundled file.
 
-```toml
-[mcp_servers.vaws-coordinator]
-url = "http://127.0.0.1:8766/mcp"
-enabled = true
+## Layout
 
-[mcp_servers.vaws-coordinator.headers]
-Authorization = "Bearer <PRIVATE_CLIENT_TOKEN>"
-```
+| Path | Role |
+| --- | --- |
+| `vaws_coordinator/cli.py` | `vaws-coordinator` / `python -m vaws_coordinator` |
+| `vaws_coordinator/task_server.py` | Stdio MCP for the four task tools |
+| `vaws_coordinator/host_queue.py` | Public host NPU API |
+| `vaws_coordinator/host/` | Host allocation module, shipped to the host |
+| `vaws_coordinator/backend.py` | Container/host probes via `remote_dev` |
+| `vaws_coordinator/prepare_runtime.py` | In-container attest / publish / restore |
+| `vaws_coordinator/workers/` | Linux supervisor source, shipped into a container |
+| `vaws_coordinator/vendor/vaws_run_manifest.py` | Scaffold Run Manifest v1 copy (git-pinned) |
 
-The coordinator tool names use underscores (`session_open`,
-`execution_request`, etc.). Client discovery prefixes may differ; do not
-rename existing remote-dev tools or use a dotted-name compatibility wrapper.
-
-To verify a new client, perform actual tool calls: open the same logical
-session twice and compare ids; inspect its owner-scoped status; request an
-unprepared profile and require `cache_miss` with `provisioning_started=false`;
-confirm that non-admin `runtime_register` fails; then inspect the runtime
-catalog and event cursor. A connection indicator or `tools/list` alone does
-not verify these contracts. Use a fresh private manager for an empty-catalog
-test; never reset a live manager to make an acceptance assertion pass.
-
-## Prepare once, outside the launch path
-
-1. Use existing machine-management/session preparation and approved parity
-   install commands to prepare an owned container. Do not adopt somebody
-   else's active container or silently change host CANN/drivers.
-2. Stop and verify **only its owned workers**. Keep the container running.
-   Materialize clean parity snapshots of vLLM and vllm-ascend. Verify the exact
-   environment combination on the target SoC; an image tag alone is not proof.
-3. Provide an untracked preparation specification with `profile` and `files`.
-   `profile` requires exact strings for `image_digest`, `soc`, `driver`, `cann`,
-   `python_abi` (SOABI), `torch`, `torch_npu`, `vllm`, `vllm_ascend`, `compiler`;
-   `build_env`, `launch_env`; an operator-reviewed `compatibility_evidence`
-   reference; and `system_files` entries for actual CANN/driver version files
-   (`{"path": "/absolute/path", "sha256": "..."}`). Include additional critical
-   `.pth`, compatibility-library or compiler files when the profile needs them.
-   Optional `packages` pins additional installed dependencies (for example
-   NumPy or Triton). Record build flags from the actual successful build recipe;
-   a handwritten manifest cannot infer what an arbitrary old library was built
-   against. Record deployment-required values such as `VLLM_VERSION` and the
-   full `VLLM_PLUGINS` selection explicitly; no version pair is inferred.
-4. `files` explicitly enumerates every runtime output relative to the runtime
-   root, mapping each path to a role. At minimum it needs `library` and
-   `metadata` roles. For Ascend custom operators include the kernel library,
-   `binary_info_config.json`, vendor metadata and associated binaries; the
-   preparer owns that complete dependency list. Do not include CMakeCache.txt
-   or symlinks into another worktree.
-5. Inside the container, using remote-dev, run this repository's preparation
-   command. Attestation is stdlib-only and needs `prepare_runtime.py` plus
-   `lib/` present in the container; it no longer imports the scaffold's parity
-   script, so a coordinator checkout alone is enough:
+## Development
 
 ```bash
-python prepare_runtime.py attest \
-  --root /vllm-workspace --spec /path/to/private-preparation-spec.json \
-  --owned-workers-stopped
-python prepare_runtime.py publish \
-  --root /vllm-workspace --cache /root/.cache/vaws/native-bundles \
-  --owned-workers-stopped
+uv venv && uv pip install -e ".[test]"
+python -m pytest
 ```
 
-Attestation checks installed versions/ABI/system-file hashes, executes import
-smoke (`torch_npu`, `vllm`, `vllm_ascend`, `acl`, and the actual
-`vllm_ascend_C` extension), fingerprints native inputs and
-writes `.vaws-runtime/ready-profile.json`. It does not prove model correctness,
-all possible operator dependencies or multi-node compatibility. Bundles are
-atomically published by profile/build identity and verified before reuse.
-Declared native submodules must be populated, clean and tracked at their
-pinned commits. Their cache identity uses recursive file content, so a new
-task's synthetic commit metadata alone does not invalidate unchanged kernels.
-Restoration deliberately requires the same installation path; relocatability
-of editable installs/native operators is not assumed.
-
-An administrator then calls `runtime_register` with a unique runtime id and:
-
-```json
-{
-  "machine": "<existing shared-inventory alias>",
-  "container_name": "<owned prepared container>",
-  "port": 46010,
-  "root": "/vllm-workspace",
-  "service_ports": [18010]
-}
-```
-
-Alternatively use explicit `host_endpoint`, `endpoint` and `container_name`.
-`machine_catalog` uses the same shared inventory loader as the toolbox;
-`runtime_catalog` lists prepared identities. The old inventory's base container
-is not automatically adopted. Registration/checkout verifies the Docker
-identity, idle workers, free declared TCP ports, packages, input fingerprints
-and complete output hashes. Uncertain probes produce a miss/repair state.
-`service_ports: []` reserves no serving ports and is suitable for operator jobs.
-
-## Agent development loop
-
-1. `session_open` records the actual local source paths; it creates no business
-   checkout and binds no machine. `runtime_checkout` selects an exact profile
-   (optionally a specific runtime) with an idempotency key. The returned
-   `host/port/user/root/cwd` fields work with existing remote-dev tools.
-2. With no execution pending/active, synchronize using parity's low-level
-   direct endpoint arguments and **`--apply-mode materialize`**. Add
-   `--source vllm=/actual/worktree --source vllm-ascend=/actual/worktree` for
-   external sources. This only updates source; it cannot install or compile.
-   Export the returned environment fingerprint and the profile's build flags
-   when computing parity build inputs. Do not use legacy `auto/install` as
-   the pool's warm checkout path: a new client's local install history may
-   otherwise request an unnecessary first rebuild.
-3. Keep editing with the staging watcher:
-
-```bash
-python /path/to/scaffold/.agents/skills/remote-code-parity/scripts/parity_watch.py --interval 1 -- \
-  --workspace-root /actual/scaffold --workspace-id task-a \
-  --source vllm=/actual/vllm --source vllm-ascend=/actual/vllm-ascend \
-  --server-name runtime-a --runtime-root /vllm-workspace \
-  --container-identity prepared-a@/vllm-workspace \
-  --container-host HOST --container-port PORT --container-user root
-```
-
-The watcher hashes content (including subsequent edits to the same dirty file)
-and incrementally publishes Git objects to the container cache. It **never
-materializes the runtime or builds**. A concurrent edit remains pending for
-the next cycle. The running source tree stays fixed. Watcher output is JSONL
-and is staging evidence, not a ready model endpoint.
-
-4. `execution_request` pins the actual materialized `snapshot_commits`, expected
-   `build_key`, exact `devices` or `npu_count` (`devices: []` for count mode),
-   priority and queue deadline. Changed native inputs or missing output files
-   fail before asking for cards. A compatible warm hit creates no container,
-   installs no dependencies and performs no compilation.
-5. For a cache miss, explicitly restore a matching bundle with
-   `prepare_runtime.py restore --cache ... --build-key ...`, or use the
-   existing installer to build only changed inputs, then attest/publish.
-   `runtime_refresh` accepts this new preparation only when no execution is
-   unresolved and the environment profile is unchanged. Building/preparing
-   is an explicit separate operation, never hidden inside a launch.
-6. Poll until granted; call `execution_control(action="preflight")` immediately
-   before launch. Use the returned physical `ASCEND_RT_VISIBLE_DEVICES`, the
-   binding's reserved service ports and `launch_preamble` through remote-dev.
-   The preamble **prepends** PATH/PYTHONPATH/LD_LIBRARY_PATH instead of removing
-   base acl/native-compat paths. Start a new owned service/job, activate with
-   its PID promptly (do not wait for weight loading), and heartbeat while it
-   runs. Readiness still needs all ranks and an actual model request.
-   Only `poll` may submit a locally pending, unsubmitted request to the manager.
-   `preflight`, `activate`, `heartbeat`, and `release` reject that state without
-   contacting the host; `cancel` records local cancellation without submitting it.
-   A never-submitted pending request cancels or expires locally even while its
-   host stays unreachable, because no host mutation was ever sent for it.
-7. Stop only this run's workers, then request `release`. The host must observe
-   every leased device free in repeated samples. `runtime_return` quarantines
-   the container until it is re-verified; it never kills a process or infers
-   successful cleanup from a client timeout. For managed jobs the manager
-   performs this re-verification itself: finishing supervision re-registers the
-   runtime through `runtime_register`, which re-runs the same idle-container
-   inspection and full profile/source verification an administrator would run.
-   If that verification fails, the runtime stays quarantined in `needs_repair`
-   until an administrator inspects it and registers it manually; returning a
-   plain (non-managed) binding always needs that administrator re-registration.
-
-The Linux execution supervisor is a child subreaper and remains responsible
-for the complete descendant family until every child has exited and the
-completion receipt is durable. `setsid` and a clean environment do not escape
-that ancestry tracking. If the supervisor disappears without a completion
-receipt, the execution is `unknown` and its card lease remains protected until
-host ownership is reconciled; garbage collection must not silently release it.
-
-The manager exports Run Manifest v1 records under its untracked `runs/`
-directory. It never marks a run `passed` merely because an allocation was
-released. Domain validation workflows attach their own acceptance evidence.
-
-## Cooperation and failure handling
-
-Before machine maintenance, an administrator calls `runtime_drain` for every
-registered runtime on that host. New checkouts stop; current owners retain
-their bindings and jobs until they explicitly finish. Returned draining
-runtimes are not automatically re-registered. Maintenance itself remains an
-explicit operator action; re-register only after the environment is verified.
-
-`coordination_peers`, `coordination_message`, `coordination_reply` and cursor-based
-`coordination_events` support cooperative yield requests. Messages carry sender
-identity and are untrusted text, not commands or permission to stop a peer.
-Accepting a request does not release devices. Clients must poll/listen; MCP
-does not wake a paused agent automatically.
-
-The resident manager advances the host queue and reconciles persisted requests
-in bounded batches. Manual `execution_*` leases still require their caller's
-heartbeats. Explicitly registered `managed_execution_*` jobs are renewed by
-the manager and survive frontend disconnects; idle native attachments are not
-heartbeated as executions.
-Lost replies are recovered using the same task id. A changed host epoch or a
-missing previously submitted task stays `uncertain`; inspect real ownership
-before manual reconciliation. Do not delete state to make a resource appear
-available. Manager restart preserves bindings/events; the host's `/tmp` epoch
-remains explicitly separate from that durable state.
-
-If a managed job's remote directory disappears while its card lease stays
-active, the job wedges in `stopping`: the manager never infers completion from
-a lost directory, and the host retain guard keeps the cards allocated.
-Recovery is an explicit operator action: inspect the host, confirm the job
-directory is gone and the process family is dead, then call
-`execution_reconcile(run_id, reason, evidence=..., force_release=true)`. The
-bounded evidence string is required and is recorded in the durable
-`run-reconciled` event; `force_release` releases the host lease with confirmed
-completion so the retain guard is cleared and the cards are freed. Without
-evidence the reconcile is rejected — the default stays fail-closed. Afterwards
-return the runtime for quarantine and re-verification before any reuse.
-
-## Validation boundaries and current limits
-
-CI uses the actual HTTP MCP SDK with two principals and the bundled SQLite host
-protocol, with simulated container/occupancy probes.
-`VAWS_HOST_QUEUE_MODULE` is an override, not a requirement. It covers competing
-management roots, authentication, ownership, restart, message cursors, no hidden
-provisioning, native inputs and complete-bundle corruption/missing-file cases.
-
-Treat native client lifecycle, real hardware execution, model service readiness,
-operator correctness, and performance as separate evidence tiers. Passing the
-control-plane suite does not establish any of them. Record environment identity,
-all-rank logs, bounded real requests, and requested metrics in the PR validation
-report when those claims are required.
-
-On upgrade, re-attest/publish prepared runtimes containing native submodules:
-their old commit-based input keys will fail the new content-based verification.
-No implicit rebuild or fallback to an old marker is performed.
-
-Multi-host atomic/gang allocation, pool auto-replenishment and transparent
-adapters for every legacy domain wrapper are not implemented in this version.
+Requires Python 3.11+.
