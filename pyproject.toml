@@ -30,10 +30,7 @@ packages = ["vaws_coordinator"]
 "vaws_coordinator/vendor/UPSTREAM.json" = "vaws_coordinator/vendor/UPSTREAM.json"
 
 [tool.uv.sources]
-# remote-dev main has no pyproject yet. This path is the local stub used to
-# install and test; switch to the git source when that repository ships a package:
-# vaws-remote-dev = { git = "https://github.com/vllm-ascend-workspace/remote-dev", branch = "main" }
-vaws-remote-dev = { path = "tests/fakes/vaws-remote-dev" }
+vaws-remote-dev = { git = "https://github.com/vllm-ascend-workspace/remote-dev", tag = "v0.1.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -19,6 +19,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Authenticate private remote-dev if a token is present
+        env:
+          TOKEN: ${{ secrets.REMOTE_DEV_READ_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+
       - name: Install the package and run tests
         run: |
           uv pip install -e ".[test]"

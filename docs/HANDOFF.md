@@ -22,21 +22,18 @@ from vaws_coordinator.host_queue import ...
 | Runtime pool / managed jobs | `vaws_coordinator.ready_runtime` | In-process, this user. |
 | Execution supervisor | `vaws_coordinator.workers.managed_jobs` | Source text shipped into a container. |
 | Result envelope | `remote_dev.result` | `schema_version: remote-dev.result.v1` |
-| Remote shell | `remote_dev.endpoint` / `remote_dev.shell_ops` | Pip package `vaws-remote-dev`. |
+| Remote shell | `remote_dev.core.endpoint` / `remote_dev.core.shell_ops` | Pip package `vaws-remote-dev`. |
 | Run Manifest v1 | scaffold; copy in `vaws_coordinator/vendor/` | Identity is the upstream git ref, not a hash. |
 
 ## What this package expects from remote-dev
 
 Import the installed `remote_dev` package. Do not locate a checkout by path.
 
-1. `remote_dev.result.make_result` — `remote-dev.result.v1`.
-2. `remote_dev.endpoint.resolve_endpoint(mapping)` from an explicit
+1. `remote_dev.result.make_result` — `RESULT_SCHEMA_VERSION` is `remote-dev.result.v1`.
+2. `remote_dev.core.endpoint.resolve_endpoint(mapping)` from an explicit
    `host` + `port` (this package refuses calls without both).
-3. `remote_dev.shell_ops.remote_bash(endpoint, *, command, timeout_ms, runtime_env)`
+3. `remote_dev.core.shell_ops.remote_bash(endpoint, *, command, timeout_ms, runtime_env)`
    returning `{"result": {...}}` with `outcome` and `refs.stdout` / `refs.stderr`.
-
-Until `vllm-ascend-workspace/remote-dev` ships a `pyproject.toml`, installs
-use the stub at `tests/fakes/vaws-remote-dev`.
 
 ## Scaffold follow-ups
 

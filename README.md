@@ -21,9 +21,8 @@ uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main va
 Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
 is the same entry as `vaws-coordinator`.
 
-The package depends on `vaws-remote-dev` (import `remote_dev`). Until that
-repository ships a `pyproject.toml`, local and CI installs use the stub at
-`tests/fakes/vaws-remote-dev`.
+The package depends on `vaws-remote-dev` (import `remote_dev`), pinned to
+tag `v0.1.0` via `[tool.uv.sources]`.
 
 ## Start the task server
 

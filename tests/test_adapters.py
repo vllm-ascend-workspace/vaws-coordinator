@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from remote_dev.result import SCHEMA_VERSION, make_result
+from remote_dev.result import RESULT_SCHEMA_VERSION, make_result
 
 from vaws_coordinator.backend import WORKERS, RemoteDev, worker_source
 from vaws_coordinator.git_sources import discover_repo_tree, iter_postorder
@@ -44,12 +44,27 @@ class RemoteDevAdapterTests(unittest.TestCase):
                 shell.run(target, "true")
 
     def test_successful_shell_uses_the_installed_remote_dev_package(self):
-        result = RemoteDev().run(
-            {"host": "runtime.invalid", "port": 46010, "user": "root",
-             "root": "/vllm-workspace", "cwd": "/vllm-workspace"},
-            "true",
-        )
+        from remote_dev.core.endpoint import resolve_endpoint
+        from remote_dev.core.shell_ops import remote_bash
+        from vaws_coordinator import backend as backend_mod
+
+        self.assertIs(backend_mod.resolve_endpoint, resolve_endpoint)
+        self.assertIs(backend_mod.remote_bash, remote_bash)
+
+        target = {"host": "runtime.invalid", "port": 46010, "user": "root",
+                  "root": "/vllm-workspace", "cwd": "/vllm-workspace"}
+        envelope = {"outcome": "success", "status": "ok", "exit_code": 0,
+                    "refs": {"stdout": "", "stderr": ""}}
+        with mock.patch.object(
+            backend_mod, "remote_bash", return_value={"result": envelope},
+        ) as bash:
+            result = RemoteDev().run(target, "true")
         self.assertEqual(result["outcome"], "success")
+        endpoint = bash.call_args.args[0]
+        self.assertEqual(endpoint.host, "runtime.invalid")
+        self.assertEqual(endpoint.port, 46010)
+        self.assertEqual(bash.call_args.kwargs["command"], "true")
+        self.assertFalse(bash.call_args.kwargs["runtime_env"])
 
 
 class SupervisorSourceTests(unittest.TestCase):
@@ -201,7 +216,7 @@ class ResultAndToolContractTests(unittest.TestCase):
     def test_result_envelope_comes_from_remote_dev(self):
         result = make_result(tool="vaws.session", target={"kind": "vaws-task"}, outcome="success",
                              status="open", summary="VAWS open")
-        self.assertEqual(result["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(result["schema_version"], RESULT_SCHEMA_VERSION)
         self.assertLessEqual({"tool", "invocation_id", "target", "outcome", "status", "summary",
                               "started_at", "duration_ms", "preview", "refs", "artifacts",
                               "changed_files", "warnings", "next"}, set(result))

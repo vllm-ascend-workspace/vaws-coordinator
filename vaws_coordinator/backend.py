@@ -11,8 +11,8 @@ import json
 import shlex
 from pathlib import Path
 
-from remote_dev.endpoint import resolve_endpoint
-from remote_dev.shell_ops import remote_bash
+from remote_dev.core.endpoint import resolve_endpoint
+from remote_dev.core.shell_ops import remote_bash
 
 from vaws_coordinator.host_queue import HostQueue
 from vaws_coordinator.machine_directory import MachineDirectory
