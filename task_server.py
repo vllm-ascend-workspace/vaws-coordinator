@@ -41,7 +41,8 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 ROOT = Path(__file__).resolve().parent
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor")]
+sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT / "host")]
+from vaws_npu_coordination import SCHEMA_VERSION
 from vaws_ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call
 from vaws_result import make_result
 
@@ -78,6 +79,7 @@ def capabilities() -> dict[str, Any]:
         "experimental": {
             SERVICE_NAME: {
                 "service_api_version": SERVICE_API_VERSION,
+                "host_protocol_schema_version": SCHEMA_VERSION,
                 "tools": sorted(ALIASES),
             }
         },

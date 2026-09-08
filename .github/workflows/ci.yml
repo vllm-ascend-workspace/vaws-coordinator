@@ -11,21 +11,8 @@ jobs:
     # control-plane suite with the actual HTTP MCP SDK and the actual host
     # protocol, against simulated container and occupancy probes.
     runs-on: ubuntu-latest
-    env:
-      # The host device authority stays scaffold-owned and is pinned here
-      # rather than vendored, so one host keeps exactly one allocator.
-      SCAFFOLD_REF: 161fed1b0fe6b48359be3f0cf33bb7d8befae113
-      VAWS_HOST_QUEUE_MODULE: ${{ github.workspace }}/.host-authority/.agents/lib/vaws_npu_coordination.py
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
-        with:
-          repository: maoxx241/vllm-ascend-workspace
-          ref: ${{ env.SCAFFOLD_REF }}
-          path: .host-authority
-          sparse-checkout: .agents/lib/vaws_npu_coordination.py
-          sparse-checkout-cone-mode: false
 
       - uses: actions/setup-python@v5
         with:
@@ -36,11 +23,6 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
-
-      - name: Require the host protocol before running the suite
-        # A missing module skips the control-plane suite by design; CI must
-        # fail loudly instead of reporting a green run that tested nothing.
-        run: test -f "$VAWS_HOST_QUEUE_MODULE"
 
       - name: Run the coordinator suites
         run: .venv/bin/python -m unittest discover -s tests -t tests -v

@@ -242,7 +242,8 @@ def main():
                              "(default: $VAWS_REMOTE_DEV_ROOT)")
     parser.add_argument("--host-queue-module", type=Path, default=None,
                         help="Host NPU coordination module; the sole device-allocation "
-                             "authority (default: $VAWS_HOST_QUEUE_MODULE)")
+                             "authority (default: bundled host/vaws_npu_coordination.py; "
+                             "override with $VAWS_HOST_QUEUE_MODULE)")
     parser.add_argument("--machine-inventory", type=Path, default=None,
                         help="Optional shared machine directory for alias registration "
                              "(default: $VAWS_MACHINE_INVENTORY)")

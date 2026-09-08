@@ -1,13 +1,10 @@
 """Client of the host NPU device-allocation authority.
 
-The host queue is **not** owned by this repository and is deliberately not
-vendored: its durable state lives on each physical host, and the scaffold's
-legacy session leases talk to the very same implementation. Two copies of that
-implementation would mean two owners of one host's device state, so this
-component stays a client of exactly one implementation.
+This repository owns ``host/vaws_npu_coordination.py``. The scaffold consumes
+that file from this checkout. There is exactly one implementation: two copies
+would mean two owners of one host's device state.
 
-Required interface — a stdlib-only Python module (the scaffold's
-``.agents/lib/vaws_npu_coordination.py``) that exposes:
+The module is stdlib-only, shipped to the host and executed there. It exposes:
 
 * ``handle_request(request) -> dict`` answering one JSON request
   (``status``/``submit``/``acquire``/``preflight``/``activate``/``heartbeat``/
@@ -18,9 +15,7 @@ Required interface — a stdlib-only Python module (the scaffold's
 * a ``failed``/``needs_input``/``probe_failed`` status for any answer that must
   not be read as an allocation.
 
-The module source is shipped to the host and executed there, exactly as the
-scaffold wrapper does, so the host needs no installation. Configure its local
-path with ``VAWS_HOST_QUEUE_MODULE``.
+``VAWS_HOST_QUEUE_MODULE`` overrides the bundled path; it is not required.
 """
 from __future__ import annotations
 
@@ -50,16 +45,16 @@ except Exception as _exc:
 
 
 class HostQueueUnavailable(RuntimeError):
-    """The host device-allocation authority is not configured on this manager."""
+    """An explicitly configured host-queue module path does not exist."""
+
+
+_BUNDLED_HOST_QUEUE_MODULE = Path(__file__).resolve().parent.parent / "host" / "vaws_npu_coordination.py"
 
 
 def host_queue_module_path(path: Path | str | None = None) -> Path:
     configured = str(path or os.environ.get(HOST_QUEUE_MODULE_ENV, ""))
     if not configured:
-        raise HostQueueUnavailable(
-            f"host NPU queue is not configured; set {HOST_QUEUE_MODULE_ENV} to the "
-            "host coordination module (the scaffold's vaws_npu_coordination.py)"
-        )
+        return _BUNDLED_HOST_QUEUE_MODULE
     resolved = Path(configured).expanduser()
     if not resolved.is_file():
         raise HostQueueUnavailable(f"host coordination module not found: {resolved}")

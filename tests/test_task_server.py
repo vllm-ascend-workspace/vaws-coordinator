@@ -12,11 +12,12 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
+sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT / "host"), str(ROOT)]
 
 import task_server
 from task_server import (ALIASES, SERVICE_API_VERSION, SERVICE_NAME, StdioTransport, call_tool, handle,
                          initialize_result, list_tools, service_api_version)
+from vaws_npu_coordination import SCHEMA_VERSION
 from vaws_agent_session import AgentSessions
 from vaws_ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS
 
@@ -80,6 +81,15 @@ class CapabilityTests(unittest.TestCase):
         # never an echo of an arbitrary string.
         self.assertEqual(initialize_result({"protocolVersion": "9999-01-01"})["protocolVersion"],
                          task_server.PROTOCOL_VERSIONS[-1])
+
+    def test_initialize_declares_the_bundled_host_protocol_schema_version(self):
+        declared = initialize_result({})["capabilities"]["experimental"][SERVICE_NAME]
+        self.assertEqual(declared["host_protocol_schema_version"], SCHEMA_VERSION)
+
+    def test_service_api_json_matches_the_task_server_wire_value(self):
+        payload = json.loads((ROOT / "service-api.json").read_text())
+        self.assertEqual(int(float(task_server.SERVICE_API_VERSION)), payload["service_api_version"])
+        self.assertIn(payload["service_api_version"], payload["supports"])
 
     def test_a_server_that_declares_nothing_is_unknown_not_supported(self):
         self.assertEqual(service_api_version(initialize_result({})), SERVICE_API_VERSION)

@@ -40,15 +40,15 @@ control_job = supervisor.control_job
 process_identity = supervisor.process_identity
 
 try:
-    # `process_guard_busy` belongs to the host device authority, which this
-    # repository deliberately does not vendor. Without that module the process
-    # checks skip themselves rather than asserting a weaker guarantee.
+    # `process_guard_busy` belongs to the bundled host authority. An explicit
+    # override that does not exist skips these checks rather than asserting a
+    # weaker guarantee.
     host_protocol = load_host_protocol()
 except HostQueueUnavailable as exc:  # pragma: no cover - configuration guard
     host_protocol = None
     HOST_PROTOCOL_REASON = (
-        f"{exc}. Point {HOST_QUEUE_MODULE_ENV} at the scaffold's "
-        "vaws_npu_coordination.py to run the process-guard checks."
+        f"{exc}. The bundled host/vaws_npu_coordination.py is missing or "
+        f"{HOST_QUEUE_MODULE_ENV} points at a path that does not exist."
     )
 else:
     sys.modules.setdefault("vaws_npu_coordination", host_protocol)
