@@ -15,15 +15,14 @@ sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
 from vaws_host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
 
 try:
-    # The host device authority is not owned by this repository and is
-    # deliberately not vendored: one host must have exactly one allocator
-    # implementation. The control-plane suite therefore runs against the
-    # actual module, loaded from the path this deployment configures.
+    # The suite runs against the bundled host authority, or an explicit
+    # VAWS_HOST_QUEUE_MODULE override. One host still has exactly one
+    # allocator implementation.
     host_protocol = load_host_protocol()
 except HostQueueUnavailable as exc:  # pragma: no cover - configuration guard
     raise unittest.SkipTest(
-        f"{exc}. Point {HOST_QUEUE_MODULE_ENV} at the scaffold's "
-        "vaws_npu_coordination.py to run the control-plane suite."
+        f"{exc}. The bundled host/vaws_npu_coordination.py is missing or "
+        f"{HOST_QUEUE_MODULE_ENV} points at a path that does not exist."
     ) from exc
 
 sys.modules.setdefault("vaws_npu_coordination", host_protocol)

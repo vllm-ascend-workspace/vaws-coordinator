@@ -15,7 +15,7 @@ sys.path[:0] = [str(ROOT / "lib"), str(ROOT / "lib/vendor"), str(ROOT)]
 
 from backend import WORKERS, worker_source
 from vaws_git_sources import discover_repo_tree, iter_postorder
-from vaws_host_queue import HostQueue, HostQueueUnavailable, load_host_protocol
+from vaws_host_queue import HostQueue, HostQueueUnavailable, host_queue_module_path, load_host_protocol
 from vaws_machine_directory import MachineDirectory, MachineDirectoryUnavailable
 from vaws_ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call
 from vaws_remote_dev import RemoteDevShell, RemoteDevUnavailable
@@ -125,9 +125,26 @@ class HostQueueAdapterTests(unittest.TestCase):
         self.module.write_text(HOST_MODULE)
         self.addCleanup(self.temp.cleanup)
 
-    def test_unconfigured_authority_fails_closed(self):
+    def test_unconfigured_authority_uses_the_bundled_module(self):
         with mock.patch.dict("os.environ", {}, clear=True):
-            with self.assertRaisesRegex(HostQueueUnavailable, "VAWS_HOST_QUEUE_MODULE"):
+            self.assertEqual(host_queue_module_path(), ROOT / "host" / "vaws_npu_coordination.py")
+            seen = {}
+
+            def run(target, command):
+                seen.update(command=command)
+                return json.dumps({"status": "ok", "tasks": []})
+
+            self.assertEqual(HostQueue(run).request({"host": "h", "port": 22}, {"action": "status"})["status"], "ok")
+            self.assertIn("def handle_request(", seen["command"])
+            self.assertIn("class CoordinationError", seen["command"])
+
+    def test_explicit_missing_module_fails_closed(self):
+        missing = Path(self.temp.name) / "absent.py"
+        with self.assertRaisesRegex(HostQueueUnavailable, "not found"):
+            HostQueue(lambda target, command: "", module_path=missing).request(
+                {"host": "h", "port": 22}, {"action": "status"})
+        with mock.patch.dict("os.environ", {"VAWS_HOST_QUEUE_MODULE": str(missing)}, clear=True):
+            with self.assertRaisesRegex(HostQueueUnavailable, "not found"):
                 HostQueue(lambda target, command: "").request({"host": "h", "port": 22}, {"action": "status"})
 
     def test_request_ships_the_configured_module_and_pins_the_host_root(self):
