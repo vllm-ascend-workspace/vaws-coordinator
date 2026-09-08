@@ -21,6 +21,5 @@ jobs:
 
       - name: Install the package and run tests
         run: |
-          uv venv
           uv pip install -e ".[test]"
           uv run python -m pytest -q
