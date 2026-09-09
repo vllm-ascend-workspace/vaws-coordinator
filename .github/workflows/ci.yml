@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p "$HOME"
           uv venv
-          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.4.0"
           uv pip install pytest
           uv pip install -e . --no-deps
           .venv/bin/python -m pytest -q
@@ -56,7 +56,7 @@ jobs:
         run: |
           mkdir -p "$HOME"
           uv venv .venv-pip
-          VIRTUAL_ENV="$PWD/.venv-pip" uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+          VIRTUAL_ENV="$PWD/.venv-pip" uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.4.0"
           VIRTUAL_ENV="$PWD/.venv-pip" uv pip install pytest
           VIRTUAL_ENV="$PWD/.venv-pip" uv pip install -e . --no-deps
           .venv-pip/bin/python -m pytest -q
@@ -87,7 +87,7 @@ jobs:
           cd "${{ runner.temp }}"
           uv venv .venv-wheel
           VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install \
-            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.4.0"
           VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install "${{ github.workspace }}"/dist/*.whl
           .venv-wheel/bin/python -c "import vaws_coordinator, pathlib; p=pathlib.Path(vaws_coordinator.__file__).resolve(); assert 'site-packages' in p.parts, p"
           .venv-wheel/bin/vaws-coordinator --help

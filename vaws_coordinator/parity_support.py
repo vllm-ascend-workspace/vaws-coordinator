@@ -1,72 +1,23 @@
 """Private helpers for the coordinator-owned parity implementation.
 
-Git, state, and the current SSH transport used by materialization live here so
-the package does not reach into a consumer working tree.
-
-``base_ssh_options`` is a provisional private copy of the scaffold's
-``vaws_ssh.base_ssh_options``. Do not grow this copy. P1/P18 replace the
-raw-SSH transport with the ``vaws-remote-dev`` package, which then owns
-endpoint option knowledge.
+Git, state, and SSH used by materialization live here so the package does not
+reach into a consumer working tree. SSH option construction and attached
+streams belong to ``vaws-remote-dev``.
 """
 from __future__ import annotations
 
 import contextlib
 import json
 import os
-import queue
 import re
 import shlex
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-
-_MUX_DIR = Path.home() / ".ssh" / "vaws-mux"
-_MUX_READY: bool | None = None
-
-
-def _ensure_mux_dir() -> bool:
-    global _MUX_READY
-    if _MUX_READY is not None:
-        return _MUX_READY
-    try:
-        _MUX_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(_MUX_DIR, 0o700)
-        _MUX_READY = True
-    except OSError:
-        _MUX_READY = False
-    return _MUX_READY
-
-
-def control_master_options() -> list[str]:
-    if not _ensure_mux_dir():
-        return []
-    return [
-        "-o", "ControlMaster=auto",
-        "-o", f"ControlPath={_MUX_DIR}/%C",
-        "-o", "ControlPersist=120",
-    ]
-
-
-def base_ssh_options(
-    *,
-    connect_timeout: int | None = None,
-    mux: bool = True,
-) -> list[str]:
-    options = [
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "LogLevel=ERROR",
-    ]
-    if connect_timeout is not None:
-        options.extend(["-o", f"ConnectTimeout={max(1, connect_timeout)}"])
-    if mux:
-        options.extend(control_master_options())
-    return options
 
 WORKSPACE_ID_PATTERN = re.compile(r'[^A-Za-z0-9._-]+')
 STATE_SUBDIR = Path('.vaws-local/remote-code-parity')
@@ -280,16 +231,6 @@ def quoted(script: str) -> str:
     return shlex.quote(script)
 
 
-def _ssh_base_cmd(endpoint: SshEndpoint) -> list[str]:
-    return [
-        'ssh',
-        *base_ssh_options(),
-        '-p',
-        str(endpoint.port),
-        endpoint.destination(),
-    ]
-
-
 def parse_progress_event(line: str) -> dict[str, Any] | None:
     if not line.startswith(PROGRESS_SENTINEL):
         return None
@@ -302,6 +243,22 @@ def parse_progress_event(line: str) -> dict[str, Any] | None:
     return payload
 
 
+def _remote_endpoint(endpoint: SshEndpoint, *, long_stream: bool = False):
+    from remote_dev.core.endpoint import Endpoint
+
+    if long_stream:
+        return Endpoint.for_long_stream(host=endpoint.host, port=endpoint.port, user=endpoint.user)
+    return Endpoint(host=endpoint.host, port=endpoint.port, user=endpoint.user)
+
+
+def _ssh_failure(returncode: int, stdout: str, stderr: str, *, what: str) -> RuntimeError:
+    return RuntimeError(
+        f'command failed ({returncode}): {what}\n'
+        f'stdout:\n{stdout}\n'
+        f'stderr:\n{stderr}'
+    )
+
+
 def ssh_exec(
     endpoint: SshEndpoint,
     script: str,
@@ -309,8 +266,26 @@ def ssh_exec(
     check: bool = True,
     capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    cmd = [*_ssh_base_cmd(endpoint), 'bash', '-c', shlex.quote(script)]
-    return run(cmd, check=check, capture_output=capture_output)
+    from remote_dev.core.ssh_transport import run_script
+
+    del capture_output
+    completed = run_script(_remote_endpoint(endpoint), script)
+    stdout = completed.stdout or ''
+    stderr = completed.stderr or ''
+    if completed.timed_out:
+        returncode = 255
+        stderr = stderr or 'remote command timed out'
+    else:
+        returncode = 0 if completed.returncode is None else int(completed.returncode)
+    result = subprocess.CompletedProcess(
+        ['ssh', endpoint.destination(), str(endpoint.port)],
+        returncode,
+        stdout,
+        stderr,
+    )
+    if check and result.returncode != 0:
+        raise _ssh_failure(result.returncode, stdout, stderr, what=f'ssh_exec {endpoint.destination()}')
+    return result
 
 
 def ssh_exec_stream(
@@ -320,92 +295,41 @@ def ssh_exec_stream(
     check: bool = True,
     stream_progress: bool = True,
 ) -> SshStreamingResult:
-    cmd = [*_ssh_base_cmd(endpoint), 'bash', '-c', shlex.quote(script)]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding='utf-8',
-        errors='replace',
-    )
+    from remote_dev.core.ssh_transport import run_stream
 
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-
-    q: queue.Queue[tuple[str, str | None]] = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     progress_events: list[dict[str, Any]] = []
 
-    def reader(stream_name: str, pipe: Any) -> None:
-        try:
-            for line in pipe:
-                q.put((stream_name, line))
-        finally:
-            q.put((stream_name, None))
-
-    threads = [
-        threading.Thread(target=reader, args=('stdout', proc.stdout), daemon=True),
-        threading.Thread(target=reader, args=('stderr', proc.stderr), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-
-    done_streams: set[str] = set()
-    while len(done_streams) < 2 or proc.poll() is None:
-        try:
-            stream_name, line = q.get(timeout=0.2)
-        except queue.Empty:
-            continue
-        if line is None:
-            done_streams.add(stream_name)
-            continue
-        if stream_name == 'stdout':
-            stdout_parts.append(line)
-            continue
-        event = parse_progress_event(line)
+    def on_output(channel: str, text: str) -> None:
+        if channel == 'stdout':
+            stdout_parts.append(text)
+            return
+        event = parse_progress_event(text)
         if event is not None:
             progress_events.append(event)
             if stream_progress:
-                sys.stderr.write(line if line.endswith('\n') else line + '\n')
+                sys.stderr.write(text if text.endswith('\n') else text + '\n')
                 sys.stderr.flush()
-            continue
-        stderr_parts.append(line)
+            return
+        stderr_parts.append(text)
 
-    returncode = proc.wait()
-    for thread in threads:
-        thread.join(timeout=1)
-
-    while True:
-        try:
-            stream_name, line = q.get_nowait()
-        except queue.Empty:
-            break
-        if line is None:
-            continue
-        if stream_name == 'stdout':
-            stdout_parts.append(line)
-            continue
-        event = parse_progress_event(line)
-        if event is not None:
-            if event not in progress_events:
-                progress_events.append(event)
-            if stream_progress:
-                sys.stderr.write(line if line.endswith('\n') else line + '\n')
-                sys.stderr.flush()
-            continue
-        stderr_parts.append(line)
-
+    completed = run_stream(
+        _remote_endpoint(endpoint, long_stream=True),
+        script,
+        merge_stderr=False,
+        on_output=on_output,
+    )
     stdout = ''.join(stdout_parts)
     stderr = ''.join(stderr_parts)
+    if completed.timed_out:
+        returncode = 255
+        if completed.stderr and completed.stderr not in stderr:
+            stderr = f'{stderr}{completed.stderr}' if stderr else completed.stderr
+    else:
+        returncode = 0 if completed.returncode is None else int(completed.returncode)
     if check and returncode != 0:
-        rendered_cmd = ' '.join(shlex.quote(part) for part in cmd)
-        raise RuntimeError(
-            f'command failed ({returncode}): {rendered_cmd}\n'
-            f'stdout:\n{stdout}\n'
-            f'stderr:\n{stderr}'
-        )
+        raise _ssh_failure(returncode, stdout, stderr, what=f'ssh_exec_stream {endpoint.destination()}')
     return SshStreamingResult(
         returncode=returncode,
         stdout=stdout,
@@ -415,27 +339,33 @@ def ssh_exec_stream(
 
 
 def ssh_stream_to_file(endpoint: SshEndpoint, remote_path: str, payload: str) -> None:
+    from remote_dev.core.ssh_transport import run_bytes
+
     script = f'mkdir -p {quoted(str(Path(remote_path).parent))} && cat > {quoted(remote_path)}'
-    cmd = [*_ssh_base_cmd(endpoint), 'bash', '-c', shlex.quote(script)]
-    result = subprocess.run(cmd, input=payload, text=True, capture_output=True)
+    result = run_bytes(_remote_endpoint(endpoint), script, stdin=payload.encode('utf-8'))
+    stdout = (result.stdout or b'').decode('utf-8', errors='replace')
+    stderr = (result.stderr or b'').decode('utf-8', errors='replace')
     if result.returncode != 0:
         raise RuntimeError(
-            f'failed to stream payload to {remote_path}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+            f'failed to stream payload to {remote_path}\nstdout:\n{stdout}\nstderr:\n{stderr}'
         )
 
 
 def ssh_stream_bytes_to_file(endpoint: SshEndpoint, remote_path: str, payload: bytes) -> None:
+    from remote_dev.core.ssh_transport import run_bytes
+
     script = (
         f'mkdir -p {quoted(str(Path(remote_path).parent))} && '
         f'head -c {len(payload)} > {quoted(remote_path)}'
     )
-    cmd = [*_ssh_base_cmd(endpoint), 'bash', '-c', shlex.quote(script)]
-    result = subprocess.run(cmd, input=payload, capture_output=True)
+    result = run_bytes(_remote_endpoint(endpoint), script, stdin=payload)
     if result.returncode != 0:
+        stdout = (result.stdout or b'').decode('utf-8', errors='replace')
+        stderr = (result.stderr or b'').decode('utf-8', errors='replace')
         raise RuntimeError(
             f'failed to stream binary payload to {remote_path}\n'
-            f'stdout:\n{result.stdout.decode("utf-8", errors="replace")}\n'
-            f'stderr:\n{result.stderr.decode("utf-8", errors="replace")}'
+            f'stdout:\n{stdout}\n'
+            f'stderr:\n{stderr}'
         )
 
 

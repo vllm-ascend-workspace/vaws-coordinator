@@ -18,13 +18,20 @@ from pathlib import Path
 from typing import Any, Callable
 
 from vaws_coordinator.host.vaws_npu_coordination import (  # noqa: F401
+    DEFAULT_CONTAINER_SSH_PORT_RANGE,
+    DEFAULT_SERVING_PORT_RANGE,
+    DEFAULT_STATE_DIR,
     SCHEMA_VERSION,
     CoordinationError,
     NpuCoordinator,
     handle_request,
+    parse_npu_smi_hbm,
     parse_npu_smi_info,
+    probe_listening_ports,
+    probe_named_container,
     process_guard_busy,
     probe_npu_occupancy,
+    resolve_host_state_dir,
 )
 
 HOST_QUEUE_MODULE_ENV = "VAWS_HOST_QUEUE_MODULE"

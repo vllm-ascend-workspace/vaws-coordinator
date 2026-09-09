@@ -686,22 +686,21 @@ def git_remote_url(container: SshEndpoint, mirror_path: str) -> str:
 
 
 def git_ssh_environment(container: SshEndpoint) -> dict[str, str]:
+    from remote_dev.core.endpoint import Endpoint
+    from remote_dev.core.ssh_transport import ssh_base_cmd
+
     env = os.environ.copy()
     env['GIT_TERMINAL_PROMPT'] = '0'
-    env['GIT_SSH_COMMAND'] = shlex.join(
-        [
-            'ssh',
-            '-T',
-            '-o',
-            'BatchMode=yes',
-            '-o',
-            'StrictHostKeyChecking=accept-new',
-            '-o',
-            'LogLevel=ERROR',
-            '-p',
-            str(container.port),
-        ]
+    cmd = list(
+        ssh_base_cmd(Endpoint(host=container.host, port=container.port, user=container.user))
     )
+    # Git appends host and the remote git command. ssh_base_cmd already
+    # includes `-- host`; keep the builder's options as the ssh prefix.
+    if '--' in cmd:
+        cmd = cmd[: cmd.index('--')]
+    if '-T' not in cmd:
+        cmd = [cmd[0], '-T', *cmd[1:]]
+    env['GIT_SSH_COMMAND'] = shlex.join(cmd)
     return env
 
 

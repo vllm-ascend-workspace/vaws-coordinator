@@ -350,5 +350,83 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(parsed['free'], [0])
 
 
+class SessionReservationPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.clock = FakeClock()
+        self.coordinator = NpuCoordinator(self.temp.name, clock=self.clock)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def submit(self, task_id: str, **extra):
+        request = {
+            "task_id": task_id,
+            "agent_id": f"agent-{task_id}",
+            "agent_alias": "team42",
+            "npu_count": 1,
+            "queue_ttl_seconds": 600,
+            "estimated_duration_seconds": 60,
+            **extra,
+        }
+        if "devices" in extra:
+            request.pop("npu_count", None)
+        return self.coordinator.submit(request)
+
+    def test_session_reserve_then_pool_acquire_conflict_and_wrong_owner_release(self) -> None:
+        listening = {"status": "ok", "ports": [22]}
+        reserved = self.coordinator.reserve_session(
+            {
+                "workspace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "session_id": "sess-path",
+                "container_name": "vaws-sess-path",
+                "npu_count": 1,
+            },
+            occupancy(),
+            listening,
+        )
+        self.assertEqual(reserved["status"], "reserved")
+        self.assertEqual(reserved["npu_devices"], [0])
+        self.assertIsInstance(reserved["container_ssh_port"], int)
+        self.submit("pool-waiter", devices=[0])
+        self.assertNotEqual(self.coordinator.acquire("pool-waiter", occupancy())["status"], "granted")
+        with self.assertRaisesRegex(Exception, "wrong owner"):
+            self.coordinator.release_session(
+                {
+                    "task_id": reserved["task"]["task_id"],
+                    "fence_token": reserved["task"]["fence_token"],
+                    "workspace_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "session_id": "sess-path",
+                },
+                occupancy(),
+                {"status": "ok", "exists": False, "running": False, "name": "vaws-sess-path"},
+            )
+        released = self.coordinator.release_session(
+            {
+                "task_id": reserved["task"]["task_id"],
+                "fence_token": reserved["task"]["fence_token"],
+                "workspace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "session_id": "sess-path",
+                "container_name": "vaws-sess-path",
+            },
+            occupancy(),
+            {"status": "ok", "exists": False, "running": False, "name": "vaws-sess-path"},
+        )
+        self.assertEqual(released["status"], "released")
+        self.assertEqual(self.coordinator.acquire("pool-waiter", occupancy())["status"], "granted")
+
+    def test_client_propagates_reserve_failure(self) -> None:
+        from vaws_coordinator.host_queue import HostQueue
+        from vaws_coordinator.session_resources import SessionResourceClient, SessionResourceError
+
+        def run(_target, command):
+            self.assertIn("session-reserve", command)
+            return '{"status":"waiting","reason":"not_enough_devices"}'
+
+        client = SessionResourceClient(HostQueue(run), {"host": "192.0.2.10", "port": 22})
+        with self.assertRaises(SessionResourceError):
+            client.reserve(workspace_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", session_id="sess-fail")
+
+
 if __name__ == "__main__":
     unittest.main()
