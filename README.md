@@ -23,8 +23,9 @@ is the same entry as `vaws-coordinator`.
 
 The package depends on `vaws-remote-dev>=0.1.0` (import `remote_dev`). It
 does not pin that package's git source; the workspace that installs this
-library chooses the tag. This checkout's `uv.toml` is local-only so `uv sync`
-here can resolve remote-dev.
+library chooses the tag. `uv sync` / `uv lock` are not the developer path
+here: a library that named remote-dev's git source in `pyproject.toml`
+would pin every consumer to that tag.
 
 ## Start the task server
 
@@ -95,9 +96,17 @@ executed on the physical host. Durable host state defaults to
 
 ## Development
 
+remote-dev is a git package. Install its source first, then this tree
+without resolving dependencies from an index:
+
 ```bash
-uv venv && uv pip install -e ".[test]"
-python -m pytest
+uv venv
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+uv pip install pytest
+uv pip install -e . --no-deps
+.venv/bin/python -m pytest
 ```
 
-Requires Python 3.11+.
+`uv venv` is the first command so an unreadable project config fails
+before install. Do not add `[tool.uv.sources]` for remote-dev: that table
+travels to consumers. Requires Python 3.11+.
