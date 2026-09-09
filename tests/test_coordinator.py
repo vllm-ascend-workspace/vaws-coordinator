@@ -890,6 +890,82 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(self.pool.managed_control("alice", job["id"])["state"], "running")
 
 
+class TaskClientOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        from vaws_coordinator.agent_session import AgentSessions
+        from vaws_coordinator.task_client import TaskClient
+        self.TaskClient = TaskClient
+        self.store = AgentSessions(self.root / "sessions")
+        self.task_a = self.store.attach("codex", "native-task-a", str(self.root))
+        self.task_b = self.store.attach("codex", "native-task-b", str(self.root))
+        self.assertNotEqual(self.task_a["session"]["id"], self.task_b["session"]["id"])
+        self.row = self.store.execution(self.task_a, "owned-fixture", {"command": "true"})
+        self.row.update(phase="cancelled", user="alice", roles=[])
+        self.store.save_execution(self.row)
+        self.service = mock.Mock()
+        self.owner = TaskClient(self.task_a["context_file"], user="alice", service=self.service)
+        self.foreign = TaskClient(self.task_b["context_file"], user="alice", service=self.service)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_foreign_read_stop_and_target_are_rejected_before_the_service(self):
+        for action in ("status", "tail", "stop", "target"):
+            with self.subTest(action=action):
+                self.service.reset_mock()
+                with self.assertRaisesRegex(ValueError, "another VAWS task"):
+                    self.foreign.observe(self.row["id"], action)
+                self.service.advance.assert_not_called()
+                self.service.finish.assert_not_called()
+        self.service.reset_mock()
+        with self.assertRaisesRegex(ValueError, "another VAWS task"):
+            self.foreign.target(self.row["id"])
+        self.service.advance.assert_not_called()
+        with self.store.transaction() as db:
+            latest = self.store.get(db, "execution", self.row["id"])
+        self.assertEqual(latest["phase"], "cancelled")
+        self.assertFalse(latest.get("cancel_requested"))
+
+    def test_owner_and_same_task_parent_child_may_observe(self):
+        self.service.advance.return_value = {"execution_id": self.row["id"], "state": "cancelled"}
+        own = self.owner.observe(self.row["id"])
+        self.assertEqual(own["state"], "cancelled")
+        self.service.advance.assert_called_once()
+        child_ctx = self.store.attach(
+            "codex", "native-task-a-child", str(self.root),
+            parent_context=self.task_a["context_file"],
+        )
+        self.assertEqual(child_ctx["session"]["id"], self.task_a["session"]["id"])
+        child = self.TaskClient(child_ctx["context_file"], user="alice", service=self.service)
+        self.service.reset_mock()
+        child_reply = child.observe(self.row["id"])
+        self.assertEqual(child_reply["state"], "cancelled")
+        self.service.advance.assert_called_once()
+        associated = self.store.attach(
+            "codex", "native-task-a-explicit", str(self.root),
+            association=self.task_a["context_file"],
+        )
+        self.assertEqual(associated["session"]["id"], self.task_a["session"]["id"])
+        peer = self.TaskClient(associated["context_file"], user="alice", service=self.service)
+        self.service.reset_mock()
+        peer_reply = peer.observe(self.row["id"], "stop")
+        self.assertEqual(peer_reply["state"], "cancelled")
+        self.service.advance.assert_called_once()
+
+    def test_unknown_and_malformed_ids_fail_without_the_service(self):
+        with self.assertRaisesRegex(ValueError, "invalid local execution id"):
+            self.owner.observe("not-an-id")
+        self.service.advance.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "unknown VAWS execution"):
+            self.owner.observe("0" * 64)
+        self.service.advance.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "invalid local execution id"):
+            self.owner.target("not-an-id")
+        self.service.advance.assert_not_called()
+
+
 class TaskClientTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

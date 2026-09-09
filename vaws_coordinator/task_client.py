@@ -76,6 +76,10 @@ class TaskClient:
         if not isinstance(execution_id, str) or len(execution_id) != 64 or any(
                 char not in "0123456789abcdef" for char in execution_id):
             raise ValueError("invalid local execution id")
+        with self.store.transaction() as db:
+            row = self.store.get(db, "execution", execution_id)
+        if row.get("session_id") != self.context["session"]["id"]:
+            raise ValueError("execution belongs to another VAWS task")
 
     def target(self, execution_id):
         self._require_execution_id(execution_id)
