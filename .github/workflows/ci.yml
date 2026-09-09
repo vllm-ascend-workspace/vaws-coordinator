@@ -22,7 +22,12 @@ jobs:
           enable-cache: false
 
       - name: Documented developer setup
+        # remote-dev is public. Fetch it anonymously; do not reintroduce a
+        # private-token step or a git credential rewrite.
+        env:
+          HOME: ${{ runner.temp }}/empty-home
         run: |
+          mkdir -p "$HOME"
           uv venv
           uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
           uv pip install pytest
@@ -45,10 +50,44 @@ jobs:
 
       - name: Pip-style install without a project venv
         # Does not use the default `.venv`. Still must not reintroduce a
-        # consumer-facing source pin.
+        # consumer-facing source pin. remote-dev is public; fetch anonymously.
+        env:
+          HOME: ${{ runner.temp }}/empty-home
         run: |
+          mkdir -p "$HOME"
           uv venv .venv-pip
           VIRTUAL_ENV="$PWD/.venv-pip" uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
           VIRTUAL_ENV="$PWD/.venv-pip" uv pip install pytest
           VIRTUAL_ENV="$PWD/.venv-pip" uv pip install -e . --no-deps
           .venv-pip/bin/python -m pytest -q
+
+  wheel:
+    # P14: build the wheel, install it into a clean venv, import the
+    # package, run the console script. vaws-remote-dev is not on PyPI, so
+    # the clean venv installs it from the public git URL first. That
+    # fetch is anonymous; a token step here is a defect.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          activate-environment: false
+          enable-cache: false
+
+      - name: Build, install the wheel, import, and --help
+        env:
+          HOME: ${{ runner.temp }}/empty-home
+        run: |
+          mkdir -p "$HOME"
+          unset GH_TOKEN GITHUB_TOKEN REMOTE_DEV_READ_TOKEN
+          uv build
+          cd "${{ runner.temp }}"
+          uv venv .venv-wheel
+          VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install \
+            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+          VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install "${{ github.workspace }}"/dist/*.whl
+          .venv-wheel/bin/python -c "import vaws_coordinator, pathlib; p=pathlib.Path(vaws_coordinator.__file__).resolve(); assert 'site-packages' in p.parts, p"
+          .venv-wheel/bin/vaws-coordinator --help
