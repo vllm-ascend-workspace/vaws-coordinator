@@ -151,19 +151,19 @@ class HostQueueAdapterTests(unittest.TestCase):
 
 class MachineDirectoryTests(unittest.TestCase):
     def test_unconfigured_directory_fails_closed_instead_of_an_empty_fleet(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
-            with self.assertRaisesRegex(MachineDirectoryUnavailable, "VAWS_MACHINE_INVENTORY"):
-                MachineDirectory().catalog()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(MachineDirectoryUnavailable, "machine directory is empty"):
+                MachineDirectory(path=Path(tmp) / "machines.json").catalog()
 
     def test_catalog_and_unique_alias_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "machine-inventory.json"
+            path = Path(tmp) / "machines.json"
             path.write_text(json.dumps({"machines": [
                 {"alias": "alpha", "host": {"ip": "host-a.invalid", "port": 22, "user": "root"},
                  "container": {"name": "prepared-a", "ssh_port": 46010}},
                 {"alias": "beta", "host": {"ip": "host-b.invalid"}, "container": {}},
                 {"alias": "beta", "host": {"ip": "host-c.invalid"}, "container": {}}]}))
-            directory = MachineDirectory(path)
+            directory = MachineDirectory(path=path)
             catalog = directory.catalog()
             self.assertEqual(catalog["inventory_path"], str(path.resolve()))
             self.assertEqual(catalog["machines"][0], {"alias": "alpha", "host": "host-a.invalid",
@@ -173,6 +173,19 @@ class MachineDirectoryTests(unittest.TestCase):
                 directory.host("beta")
             with self.assertRaisesRegex(ValueError, "resolve uniquely"):
                 directory.host("missing")
+
+    def test_consumer_passes_a_document_not_a_consumer_path(self):
+        document = {"machines": [
+            {"alias": "alpha", "host": {"ip": "host-a.invalid", "port": 22, "user": "root"},
+             "container": {"name": "prepared-a", "ssh_port": 46010}},
+        ]}
+        directory = MachineDirectory(document)
+        self.assertEqual(directory.host("alpha")["ip"], "host-a.invalid")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MachineDirectory(path=Path(tmp) / "machines.json")
+            written = store.replace(document)
+            self.assertTrue(written.is_file())
+            self.assertEqual(MachineDirectory(path=written).host("alpha")["port"], 22)
 
 
 class GitSourceTests(unittest.TestCase):

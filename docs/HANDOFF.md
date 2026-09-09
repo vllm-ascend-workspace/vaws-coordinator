@@ -23,7 +23,10 @@ from vaws_coordinator.host_queue import ...
 | Execution supervisor | `vaws_coordinator.workers.managed_jobs` | Source text shipped into a container. |
 | Result envelope | `remote_dev.result` | `schema_version: remote-dev.result.v1` |
 | Remote shell | `remote_dev.core.endpoint` / `remote_dev.core.shell_ops` | Pip package `vaws-remote-dev`. |
-| Run Manifest v1 | scaffold; copy in `vaws_coordinator/vendor/` | Identity is the upstream git ref, not a hash. |
+| Run Manifest v1 | this package, `vaws_coordinator.run_manifest` | `code` is Git identity (`source_head`, `snapshot_commit`). |
+| Code identity | this package, `vaws_coordinator.code_identity` | Dirty trees get a parentless snapshot commit. |
+| Code parity | this package, `vaws_coordinator.parity` | In-package CLI; no consumer script path. |
+| Machine directory | this package, `vaws_coordinator.machine_directory` | Consumers pass a document; store is coordinator-owned. |
 
 ## What this package expects from remote-dev
 

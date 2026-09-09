@@ -8,7 +8,8 @@ always wins over declarations.
 
 The module is stdlib-only because the agent-facing wrapper sends this source to
 the bare-metal host and executes it there.  State defaults to
-``/tmp/vaws-npu-coordinator/v1`` and is expected to disappear after a host or
+``/tmp/vaws-npu-coordinator/v1`` (override with ``VAWS_NPU_COORDINATOR_STATE_DIR``
+or ``request["state_dir"]``) and is expected to disappear after a host or
 ``/tmp`` reset; a missing database simply starts a new coordination epoch.
 """
 
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -27,6 +29,18 @@ from typing import Any, Callable, Iterator
 
 SCHEMA_VERSION = 3
 DEFAULT_STATE_DIR = "/tmp/vaws-npu-coordinator/v1"
+HOST_STATE_DIR_ENV = "VAWS_NPU_COORDINATOR_STATE_DIR"
+
+
+def resolve_host_state_dir(explicit: str | Path | None = None) -> str:
+    """Return the host coordination state directory.
+
+    Precedence: explicit argument, then ``VAWS_NPU_COORDINATOR_STATE_DIR``,
+    then ``DEFAULT_STATE_DIR``.
+    """
+    if explicit:
+        return str(explicit)
+    return os.environ.get(HOST_STATE_DIR_ENV) or DEFAULT_STATE_DIR
 DEFAULT_QUEUE_TTL_SECONDS = 3600
 DEFAULT_GRANT_TTL_SECONDS = 60
 DEFAULT_START_TTL_SECONDS = 60
@@ -1262,8 +1276,11 @@ def handle_request(
 ) -> dict[str, Any]:
     """Execute one structured coordinator request on the host."""
     action = request.get("action")
-    coordinator = NpuCoordinator(request.get("state_dir") or DEFAULT_STATE_DIR, clock=clock,
-                                 expected_epoch=request.get("coordination_epoch"))
+    coordinator = NpuCoordinator(
+        resolve_host_state_dir(request.get("state_dir")),
+        clock=clock,
+        expected_epoch=request.get("coordination_epoch"),
+    )
     if action == "submit":
         return coordinator.submit(request)
     if action == "acquire":

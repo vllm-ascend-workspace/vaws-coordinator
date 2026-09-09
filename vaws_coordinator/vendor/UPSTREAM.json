@@ -1,8 +1,0 @@
-{
-  "file": "vaws_run_manifest.py",
-  "owner": "vllm-ascend-workspace scaffold",
-  "upstream_path": ".agents/lib/vaws_run_manifest.py",
-  "upstream_ref": "161fed1",
-  "upstream_repo": "https://github.com/maoxx241/vllm-ascend-workspace",
-  "why": "Run Manifest v1 is the scaffold's cross-skill evidence schema. This coordinator is one producer and carries a copy because the scaffold is not an installable package. Identity is the upstream git ref."
-}

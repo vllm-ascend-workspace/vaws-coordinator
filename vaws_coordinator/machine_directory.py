@@ -1,47 +1,62 @@
-"""Read-only view of the shared machine directory.
+"""Coordinator-owned machine directory.
 
-The inventory file is written and validated by the scaffold's machine
-management (`machine_add.py`, `vaws_remote_toolbox`); this component only
-reads aliases so an administrator can register a prepared container by alias
-instead of retyping endpoints. Reading a directory is not an allocation.
-
-Configure the file with ``VAWS_MACHINE_INVENTORY``. Without it, registration
-still works with explicit ``host_endpoint``/``endpoint`` fields, and
-``machine_catalog`` fails closed instead of inventing an empty fleet.
+Consumers pass inventory *data* (a document) or the coordinator reads its own
+store under ``coordinator_state_dir() / machines.json``. This module never
+reads a consumer working-tree path.
 """
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-MACHINE_INVENTORY_ENV = "VAWS_MACHINE_INVENTORY"
+from vaws_coordinator.state_paths import coordinator_state_dir
+
+MACHINES_FILENAME = "machines.json"
 
 
 class MachineDirectoryUnavailable(RuntimeError):
-    """No shared machine directory is configured for this manager."""
+    """No machine directory document is available for this manager."""
 
 
 class MachineDirectory:
-    def __init__(self, path: Path | str | None = None):
-        self._path = Path(path).expanduser() if path else None
+    def __init__(
+        self,
+        document: Mapping[str, Any] | None = None,
+        *,
+        path: Path | str | None = None,
+    ):
+        self._document = dict(document) if document is not None else None
+        self._path = Path(path).expanduser() if path is not None else None
 
     def path(self) -> Path:
         if self._path is None:
-            configured = os.environ.get(MACHINE_INVENTORY_ENV, "")
-            if not configured:
-                raise MachineDirectoryUnavailable(
-                    f"machine directory is not configured; set {MACHINE_INVENTORY_ENV} to the "
-                    "shared inventory file, or register runtimes with explicit endpoints"
-                )
-            self._path = Path(configured).expanduser()
+            self._path = coordinator_state_dir() / MACHINES_FILENAME
         return self._path
 
+    def replace(self, document: Mapping[str, Any]) -> Path:
+        """Persist a consumer-supplied inventory document into this store."""
+        if not isinstance(document, Mapping) or not isinstance(document.get("machines"), list):
+            raise MachineDirectoryUnavailable("document is not a machine inventory")
+        self._document = dict(document)
+        path = self.path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
     def load(self) -> tuple[dict[str, Any], Path]:
+        if self._document is not None:
+            inventory = self._document
+            path = self._path if self._path is not None else Path("<memory>")
+            if not isinstance(inventory.get("machines"), list):
+                raise MachineDirectoryUnavailable("document is not a machine inventory")
+            return dict(inventory), path
         path = self.path().resolve()
         if not path.is_file():
-            raise MachineDirectoryUnavailable(f"machine inventory not found at {path}")
+            raise MachineDirectoryUnavailable(
+                f"machine directory is empty at {path}; pass a document to "
+                "MachineDirectory.replace() or MachineDirectory(document=...)"
+            )
         inventory = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(inventory, dict) or not isinstance(inventory.get("machines"), list):
             raise MachineDirectoryUnavailable(f"{path} is not a machine inventory document")
@@ -49,11 +64,18 @@ class MachineDirectory:
 
     def catalog(self) -> dict[str, Any]:
         inventory, path = self.load()
-        return {"inventory_path": str(path), "machines": [
-            {"alias": row.get("alias"), "host": row.get("host", {}).get("ip"),
-             "container_name": row.get("container", {}).get("name"),
-             "container_port": row.get("container", {}).get("ssh_port")}
-            for row in inventory["machines"]]}
+        return {
+            "inventory_path": str(path),
+            "machines": [
+                {
+                    "alias": row.get("alias"),
+                    "host": row.get("host", {}).get("ip"),
+                    "container_name": row.get("container", {}).get("name"),
+                    "container_port": row.get("container", {}).get("ssh_port"),
+                }
+                for row in inventory["machines"]
+            ],
+        }
 
     def host(self, alias: str) -> dict[str, Any]:
         inventory, _ = self.load()

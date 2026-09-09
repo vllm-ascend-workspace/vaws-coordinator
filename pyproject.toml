@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vaws-coordinator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local VAWS coordinator: task stdio MCP and host NPU allocation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Qi Mao" }]
 dependencies = [
-    "vaws-remote-dev",
+    "vaws-remote-dev>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -25,12 +25,6 @@ Homepage = "https://github.com/vllm-ascend-workspace/vaws-coordinator"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vaws_coordinator"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"vaws_coordinator/vendor/UPSTREAM.json" = "vaws_coordinator/vendor/UPSTREAM.json"
-
-[tool.uv.sources]
-vaws-remote-dev = { git = "https://github.com/vllm-ascend-workspace/remote-dev", tag = "v0.1.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

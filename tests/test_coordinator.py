@@ -3,12 +3,35 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
+
+
+def _init_git_workspace(path: Path) -> None:
+    """Session sources in this suite live under ``path``; export_manifest
+    resolves code identity from the containing worktree."""
+    path.mkdir(parents=True, exist_ok=True)
+    if (path / ".git").exists():
+        return
+    subprocess.run(["git", "-C", str(path), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "pool@example.invalid"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Pool Test"],
+        check=True,
+        capture_output=True,
+    )
+    (path / "README").write_text("pool\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "README"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-m", "init"], check=True, capture_output=True)
 
 from vaws_coordinator.host_queue import HOST_QUEUE_MODULE_ENV, HostQueueUnavailable, load_host_protocol
 
@@ -163,6 +186,7 @@ class PoolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        _init_git_workspace(self.root)
         self.backend = Backend(self.root / "host")
         self.pool = RuntimePool(self.root / "manager", self.backend)
         self.pool.register("runtime-a", runtime_spec(1))
@@ -243,7 +267,7 @@ class PoolTests(unittest.TestCase):
         recovered = self.pool.control("alice", run["id"], "poll")
         self.assertEqual(recovered["state"], "granted")
         self.assertEqual(recovered["task_id"], run["task_id"])
-        from vaws_coordinator.vendor.vaws_run_manifest import load_manifest
+        from vaws_coordinator.run_manifest import load_manifest
         manifest = load_manifest(self.root / "manager/runs" / (run["id"] + ".json"))
         self.assertEqual(manifest["status"], "planned")
         self.assertEqual(manifest["environment"]["coordination"]["state"], "granted")
