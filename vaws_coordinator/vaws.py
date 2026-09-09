@@ -43,11 +43,14 @@ def main():
         child.add_argument("--context-file")
         child.add_argument("--json", default="{}", help="Additional structured tool arguments")
         if name == "run":
-            child.add_argument("--request-id", required=True)
             child.add_argument("--command", required=True)
+            child.add_argument("--service", default=None)
+            child.add_argument("--restart", action="store_true")
+            child.add_argument("--timeout-seconds", type=int)
         if name == "execution":
             child.add_argument("--execution-id", required=True)
-            child.add_argument("--action", choices=["status", "tail", "stop"])
+            child.add_argument("--action", choices=["status", "tail", "stop", "target"])
+            child.add_argument("--role", default=None)
     args = vars(parser.parse_args())
     operation = args.pop("operation")
     if operation == "attach":

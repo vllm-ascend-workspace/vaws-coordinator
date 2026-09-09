@@ -266,8 +266,17 @@ class ParityCommandTests(unittest.TestCase):
             workspace_root="/tmp/workspace",
         )
         self.assertEqual(command[1:4], ["-m", "vaws_coordinator.parity", "sync"])
+        self.assertIn("--source", command)
+        self.assertIn("vllm=/tmp/vllm", command)
+        self.assertIn("vllm-ascend=/tmp/vllm-ascend", command)
         self.assertIn("--workspace-root", command)
         self.assertEqual(command[command.index("--workspace-root") + 1], "/tmp/workspace")
+        without_root = materialize_command(
+            workspace_id="ws", runtime_id="rt",
+            endpoint={"host": "h", "port": 22, "user": "root", "root": "/vllm-workspace"},
+            sources={"vllm": "/tmp/vllm", "vllm-ascend": "/tmp/vllm-ascend"},
+        )
+        self.assertNotIn("--workspace-root", without_root)
 
 
 class HostStateDirTests(unittest.TestCase):

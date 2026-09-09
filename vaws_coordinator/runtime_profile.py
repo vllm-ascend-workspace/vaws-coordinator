@@ -73,7 +73,7 @@ def profile_key(profile: dict[str, Any]) -> str:
     return digest(profile)
 
 
-def launch_preamble(profile: dict[str, Any]) -> str:
+def launch_preamble(profile: dict[str, Any], python: str | None = None) -> str:
     """Keep image-provided acl/native-compat paths when adding scoped paths."""
     profile_key(profile)
     lines = []
@@ -82,6 +82,10 @@ def launch_preamble(profile: dict[str, Any]) -> str:
             continue
         suffix = '${' + key + ':+:$' + key + '}' if key in {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH"} else ""
         lines.append(f"export {key}={shlex.quote(value)}\"{suffix}\"")
+    if python:
+        bindir = str(PurePosixPath(python).parent)
+        lines.append(f'export PATH={shlex.quote(bindir)}"${{PATH:+:$PATH}}"')
+        lines.append(f"export VAWS_PYTHON={shlex.quote(python)}")
     return "\n".join(lines)
 
 

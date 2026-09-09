@@ -27,9 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 DEFAULT_STATE_DIR = "/tmp/vaws-npu-coordinator/v1"
 HOST_STATE_DIR_ENV = "VAWS_NPU_COORDINATOR_STATE_DIR"
+DEFAULT_CONTAINER_SSH_PORT_RANGE = "46000:46999"
+DEFAULT_SERVING_PORT_RANGE = "30000:45999"
 
 
 def resolve_host_state_dir(explicit: str | Path | None = None) -> str:
@@ -47,6 +49,7 @@ DEFAULT_START_TTL_SECONDS = 60
 DEFAULT_HEARTBEAT_TTL_SECONDS = 120
 DEFAULT_ESTIMATED_DURATION_SECONDS = 3600
 HBM_BUSY_THRESHOLD_MB = 4096
+JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"
 
 TASK_STATES = {
     "queued",
@@ -59,6 +62,8 @@ TASK_STATES = {
     "cancelled",
 }
 RESERVING_TASK_STATES = {"granted", "starting", "active", "orphaned_busy"}
+PORT_KINDS = {"container_ssh", "service"}
+CONTAINER_SSH_TASK_PREFIX = "ssh."
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}$")
 
 
@@ -82,7 +87,7 @@ def process_guard_busy(value: str | dict | None, *, completion_confirmed: bool =
             return True
         if Path("/proc/sys/kernel/random/boot_id").read_text().strip() != guard["boot_id"]:
             return True
-        marker = ("VAWS_REMOTE_JOB_TOKEN=" + guard["marker"]).encode()
+        marker = (JOB_TOKEN_ENV + "=" + guard["marker"]).encode()
         unknown = False
         for process in Path("/proc").iterdir():
             if not process.name.isdigit():
@@ -133,6 +138,14 @@ def require_safe_id(value: str | None, *, label: str) -> str:
     return value
 
 
+def user_container_name(user: str) -> str:
+    return "vaws-" + require_safe_id(user, label="user")
+
+
+def container_ssh_task_id(user: str) -> str:
+    return CONTAINER_SSH_TASK_PREFIX + require_safe_id(user, label="user")
+
+
 def parse_devices(value: Any, *, allow_none: bool = True) -> list[int] | None:
     if value is None:
         if allow_none:
@@ -176,16 +189,136 @@ def _load_devices(value: str | None) -> list[int]:
     return [int(item) for item in loaded]
 
 
-def parse_npu_smi_info(output: str) -> dict[str, Any]:
-    """Parse visible devices plus process/HBM occupancy from common layouts."""
+def parse_port_range(value: str) -> tuple[int, int]:
+    start_s, sep, end_s = str(value).partition(":")
+    if not sep:
+        raise CoordinationError(f"port range must be START:END, got {value!r}")
+    try:
+        start = int(start_s)
+        end = int(end_s)
+    except ValueError as exc:
+        raise CoordinationError(f"invalid port range: {value!r}") from exc
+    if start <= 0 or end <= 0 or start > end or end > 65535:
+        raise CoordinationError(f"invalid port range: {value!r}")
+    return start, end
+
+
+def _parse_listening_port_text(output: str) -> set[int]:
+    ports: set[int] = set()
+    for line in output.splitlines():
+        match = re.search(r"[:.](\d+)$", line.strip())
+        if match:
+            ports.add(int(match.group(1)))
+    return ports
+
+
+def probe_listening_ports() -> dict[str, Any]:
+    """Return host TCP listen ports from ss, then netstat."""
+    commands = (
+        ["ss", "-ltnH"],
+        ["netstat", "-ltn"],
+    )
+    last_error = "ss and netstat are unavailable"
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = str(exc)
+            continue
+        if result.returncode != 0:
+            last_error = (result.stderr or result.stdout or f"{command[0]} failed")[-2000:]
+            continue
+        stdout = result.stdout or ""
+        if command[0] == "netstat":
+            addresses = []
+            for line in stdout.splitlines()[2:]:
+                fields = line.split()
+                if len(fields) >= 4:
+                    addresses.append(fields[3])
+            stdout = "\n".join(addresses)
+        else:
+            addresses = []
+            for line in stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 4:
+                    addresses.append(fields[3])
+            stdout = "\n".join(addresses)
+        return {
+            "status": "ok",
+            "ports": sorted(_parse_listening_port_text(stdout)),
+            "source": command[0],
+        }
+    return {"status": "failed", "error": last_error, "ports": []}
+
+
+def probe_named_container(name: str) -> dict[str, Any]:
+    """Report whether a docker container name exists and is running."""
+    if not name:
+        return {"status": "ok", "exists": False, "running": False, "name": name}
+    try:
+        listed = subprocess.run(
+            ["docker", "container", "ls", "-a", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "failed", "error": str(exc), "exists": None, "running": None, "name": name}
+    if listed.returncode != 0:
+        return {
+            "status": "failed",
+            "error": "host Docker state unavailable",
+            "exists": None,
+            "running": None,
+            "name": name,
+            "stderr": (listed.stderr or listed.stdout)[-2000:],
+        }
+    exists = name in listed.stdout.splitlines()
+    running = False
+    if exists:
+        try:
+            inspected = subprocess.run(
+                ["docker", "inspect", "--type", "container", name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"status": "failed", "error": str(exc), "exists": True, "running": None, "name": name}
+        if inspected.returncode != 0:
+            return {
+                "status": "failed",
+                "error": "docker inspect failed",
+                "exists": True,
+                "running": None,
+                "name": name,
+            }
+        try:
+            payload = json.loads(inspected.stdout)
+            running = bool(payload[0]["State"]["Running"])
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            return {"status": "failed", "error": str(exc), "exists": True, "running": None, "name": name}
+    return {"status": "ok", "exists": exists, "running": running, "name": name}
+
+
+def _parse_npu_smi_device_table(
+    output: str,
+) -> tuple[set[int], dict[int, dict[str, int]], dict[tuple[int, int], int]]:
+    """Visible Phy-IDs, HBM used/total, and (NPU, Chip) -> Phy-ID mapping."""
     dev_ids: set[int] = set()
     header_ids: set[int] = set()
     hbm: dict[int, dict[str, int]] = {}
     chip_devices: dict[tuple[int, int], int] = {}
     current_npu: int | None = None
-    lines = output.splitlines()
-
-    for line in lines:
+    for line in output.splitlines():
         if "0000:" in line:
             chip = re.match(r"\|\s*(\d+)\s+(\d+)\s+\|.*0000:", line)
             if chip:
@@ -208,9 +341,24 @@ def parse_npu_smi_info(output: str) -> dict[str, Any]:
         if header:
             current_npu = int(header.group(1))
             header_ids.add(current_npu)
-
     if not dev_ids:
         dev_ids.update(header_ids)
+    return dev_ids, hbm, chip_devices
+
+
+def parse_npu_smi_hbm(output: str) -> dict[int, dict[str, int]]:
+    """Physical-device HBM used/total from npu-smi info text.
+
+    Does not require a process table; occupancy failure still returns HBM.
+    """
+    _dev_ids, hbm, _chip_devices = _parse_npu_smi_device_table(output)
+    return dict(sorted(hbm.items()))
+
+
+def parse_npu_smi_info(output: str) -> dict[str, Any]:
+    """Parse visible devices plus process/HBM occupancy from common layouts."""
+    dev_ids, hbm, chip_devices = _parse_npu_smi_device_table(output)
+    lines = output.splitlines()
 
     process_busy: dict[int, list[dict[str, Any]]] = {}
     in_process_table = False
@@ -383,7 +531,10 @@ class NpuCoordinator:
                     heartbeat_at REAL,
                     heartbeat_deadline REAL,
                     pid INTEGER,
-                    message TEXT
+                    message TEXT,
+                    requested_service_port INTEGER,
+                    service_port_choices TEXT,
+                    granted_service_port INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_queue
                     ON tasks(state, priority DESC, submitted_at ASC);
@@ -400,6 +551,15 @@ class NpuCoordinator:
                 );
                 CREATE INDEX IF NOT EXISTS idx_holds_window
                     ON holds(state, not_before, end_at);
+                CREATE TABLE IF NOT EXISTS ports (
+                    port INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ports_task
+                    ON ports(task_id);
                 CREATE TABLE IF NOT EXISTS events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     at REAL NOT NULL,
@@ -424,6 +584,17 @@ class NpuCoordinator:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+            for column, decl in (
+                ("requested_service_port", "INTEGER"),
+                ("service_port_choices", "TEXT"),
+                ("granted_service_port", "INTEGER"),
+            ):
+                if column not in task_columns:
+                    try:
+                        connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {decl}")
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
             # Older clients send the host protocol source with each request.
             # They do not know about process guards. Do not let their generic
             # "hardware free" UPDATE release a guarded CPU-initializing job.
@@ -560,6 +731,20 @@ class NpuCoordinator:
                 raise CoordinationError("npu_count must be >= 1 when devices are not specified")
         else:
             count = len(devices)
+        requested_service_port = request.get("service_port")
+        if requested_service_port is not None:
+            requested_service_port = int(requested_service_port)
+            if requested_service_port < 0:
+                raise CoordinationError("service_port must be 0 or a positive TCP port")
+        service_port_choices = request.get("service_ports") or []
+        if not isinstance(service_port_choices, list) or any(
+            type(port) is not int or not 0 < port < 65536 for port in service_port_choices
+        ) or len(set(service_port_choices)) != len(service_port_choices):
+            raise CoordinationError("service_ports must contain distinct TCP ports")
+        if requested_service_port is not None and requested_service_port != 0 and requested_service_port not in service_port_choices:
+            raise CoordinationError("requested service_port is not in declared service_ports")
+        if requested_service_port is not None and not service_port_choices:
+            raise CoordinationError("service port requested but no declared runtime service ports")
         duration = int(request.get("estimated_duration_seconds") or DEFAULT_ESTIMATED_DURATION_SECONDS)
         if duration < 1:
             raise CoordinationError("estimated_duration_seconds must be >= 1")
@@ -586,6 +771,8 @@ class NpuCoordinator:
                     "container_name": container_name,
                     "requested_count": count,
                     "requested_devices": _json_devices(devices),
+                    "requested_service_port": requested_service_port,
+                    "service_port_choices": json.dumps(service_port_choices, separators=(",", ":")) if service_port_choices else None,
                 }
                 mismatched = {
                     key: {"existing": existing[key], "requested": value}
@@ -604,8 +791,8 @@ class NpuCoordinator:
                     task_id, agent_id, agent_alias, session_id, container_name,
                     requested_count, requested_devices, not_before, latest_start,
                     estimated_duration_seconds, preemptible, priority, state,
-                    submitted_at, updated_at, message
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                    submitted_at, updated_at, message, requested_service_port, service_port_choices
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -623,6 +810,8 @@ class NpuCoordinator:
                     now,
                     now,
                     request.get("message"),
+                    requested_service_port,
+                    json.dumps(service_port_choices, separators=(",", ":")) if service_port_choices else None,
                 ),
             )
             self._event(connection, "task-submitted", task_id=task_id, data={"count": count}, now=now)
@@ -809,6 +998,10 @@ class NpuCoordinator:
         if busy is not None and visible is not None:
             for row in connection.execute("SELECT * FROM tasks WHERE state='orphaned_busy'").fetchall():
                 devices = set(_load_devices(row["granted_devices"]))
+                # Service-port rows stay until an explicit release confirms the
+                # listener is gone. Age and occupancy alone are not enough.
+                if self._task_service_ports(connection, row["task_id"]):
+                    continue
                 if devices.issubset(visible) and not devices.intersection(busy) and not process_guard_busy(row["process_guard"]):
                     connection.execute(
                         "UPDATE tasks SET state='released', process_guard=NULL, updated_at=?, message=? WHERE task_id=?",
@@ -862,12 +1055,242 @@ class NpuCoordinator:
                 return True
         return False
 
+    def _coordination_epoch(self, connection: sqlite3.Connection) -> str:
+        row = connection.execute("SELECT value FROM meta WHERE key='coordination_epoch'").fetchone()
+        if row is None:
+            raise CoordinationError("coordination epoch is missing")
+        return str(row["value"])
+
+    @staticmethod
+    def _serialize_port(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["created_at"] = utc_now_iso(float(payload["created_at"]))
+        return payload
+
+    def _task_ports(self, connection: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            "SELECT * FROM ports WHERE task_id=? ORDER BY port ASC", (task_id,)
+        ).fetchall()
+        return [item for item in (self._serialize_port(row) for row in rows) if item is not None]
+
+    def _available_devices(
+        self,
+        connection: sqlite3.Connection,
+        observed: dict[str, Any],
+        *,
+        exclude_task: str | None,
+        start_at: float,
+        end_at: float,
+    ) -> list[int]:
+        busy = self._busy_set(observed) or set()
+        reserved = self._reserved_devices(connection, exclude_task=exclude_task)
+        available: list[int] = []
+        for device in observed.get("devices", []):
+            device = int(device)
+            if device in busy or device in reserved:
+                continue
+            if self._hold_conflicts(connection, device=device, start_at=start_at, end_at=end_at):
+                continue
+            available.append(device)
+        return available
+
+    def _select_granted_devices(
+        self,
+        *,
+        requested: list[int],
+        count: int,
+        available: list[int],
+    ) -> tuple[list[int] | None, list[int]]:
+        if requested:
+            missing = sorted(set(requested) - set(available))
+            if missing:
+                return None, missing
+            return requested, []
+        if len(available) < count:
+            return None, []
+        return sorted(available)[:count], []
+
+    def _allocated_ports(self, connection: sqlite3.Connection, *, exclude_task: str | None = None) -> set[int]:
+        allocated: set[int] = set()
+        for row in connection.execute("SELECT port, task_id FROM ports").fetchall():
+            if exclude_task and row["task_id"] == exclude_task:
+                continue
+            allocated.add(int(row["port"]))
+        return allocated
+
+    def _task_service_ports(self, connection: sqlite3.Connection, task_id: str) -> list[int]:
+        return [
+            int(row["port"])
+            for row in connection.execute(
+                "SELECT port FROM ports WHERE task_id=? AND kind='service' ORDER BY port",
+                (task_id,),
+            ).fetchall()
+        ]
+
+    def _claim_port(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        port: int,
+        kind: str,
+        task_id: str,
+        owner: str,
+        now: float,
+        listening: dict[str, Any] | None = None,
+        allow_listening: bool = False,
+    ) -> int:
+        if kind not in PORT_KINDS:
+            raise CoordinationError(f"unsupported port kind: {kind!r}")
+        if type(port) is not int or not 0 < port < 65536:
+            raise CoordinationError(f"invalid TCP port: {port!r}")
+        existing = connection.execute("SELECT kind, task_id FROM ports WHERE port=?", (port,)).fetchone()
+        if existing is not None:
+            if existing["task_id"] == task_id and existing["kind"] == kind:
+                return port
+            raise CoordinationError(f"port {port} is already reserved as {existing['kind']}")
+        if not allow_listening:
+            if listening is None or listening.get("status") != "ok":
+                raise CoordinationError(
+                    (listening or {}).get("error") or "host listening ports are unavailable"
+                )
+            live = {int(item) for item in listening.get("ports", [])}
+            if port in live:
+                raise CoordinationError(f"port {port} is already bound on the host")
+        connection.execute(
+            "INSERT INTO ports(port, kind, task_id, owner, created_at) VALUES(?, ?, ?, ?, ?)",
+            (port, kind, task_id, owner, now),
+        )
+        return port
+
+    def _select_service_port(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        choices: list[int],
+        requested: int,
+        task_id: str,
+        owner: str,
+        now: float,
+        listening: dict[str, Any],
+    ) -> int:
+        if listening.get("status") != "ok":
+            raise CoordinationError(
+                listening.get("error") or "host listening ports are unavailable"
+            )
+        if not choices:
+            raise CoordinationError("service port requested but no declared runtime service ports")
+        live = {int(item) for item in listening.get("ports", [])}
+        allocated = self._allocated_ports(connection, exclude_task=task_id)
+        preferred = None if requested == 0 else requested
+        if preferred is not None and preferred not in choices:
+            raise CoordinationError(f"service port {preferred} is not a declared runtime service port")
+        candidates = [preferred] if preferred is not None else list(choices)
+        owned = {
+            int(row["port"]): str(row["kind"])
+            for row in connection.execute(
+                "SELECT port, kind FROM ports WHERE task_id=?", (task_id,)
+            ).fetchall()
+        }
+        for port in candidates:
+            existing_kind = owned.get(port)
+            if existing_kind is not None:
+                if existing_kind != "service":
+                    if preferred is not None:
+                        raise CoordinationError(f"port {port} is already reserved as {existing_kind}")
+                    continue
+                return port
+            if port in allocated or port in live:
+                if preferred is not None:
+                    raise CoordinationError(f"port {port} is already reserved or bound on the host")
+                continue
+            connection.execute(
+                "INSERT INTO ports(port, kind, task_id, owner, created_at) VALUES(?, ?, ?, ?, ?)",
+                (port, "service", task_id, owner, now),
+            )
+            return port
+        raise CoordinationError("no free declared service port")
+
+    def _service_ports_busy(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        listening: dict[str, Any] | None,
+    ) -> list[int]:
+        ports = self._task_service_ports(connection, task_id)
+        if not ports:
+            return []
+        if listening is None or listening.get("status") != "ok":
+            return ports
+        live = {int(item) for item in listening.get("ports", [])}
+        return sorted(port for port in ports if port in live)
+
+    def _clear_service_ports(self, connection: sqlite3.Connection, task_id: str) -> None:
+        connection.execute("DELETE FROM ports WHERE task_id=? AND kind='service'", (task_id,))
+        connection.execute(
+            "UPDATE tasks SET granted_service_port=NULL WHERE task_id=?",
+            (task_id,),
+        )
+
+    def reserve_container_ssh(self, request: dict[str, Any]) -> dict[str, Any]:
+        user = require_safe_id(request.get("user"), label="user")
+        container_name = require_safe_id(request.get("container_name"), label="container name")
+        expected = user_container_name(user)
+        if container_name != expected:
+            raise CoordinationError(f"container name must be {expected}")
+        port = int(request["port"])
+        if not 0 < port < 65536:
+            raise CoordinationError(f"invalid TCP port: {port}")
+        task_id = container_ssh_task_id(user)
+        now = self.clock()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM ports WHERE task_id=? AND kind='container_ssh'",
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                if int(existing["port"]) != port or existing["owner"] != user:
+                    raise CoordinationError(
+                        f"user {user} already has SSH port {existing['port']} reserved"
+                    )
+                port = int(existing["port"])
+                reused = True
+            else:
+                self._claim_port(
+                    connection,
+                    port=port,
+                    kind="container_ssh",
+                    task_id=task_id,
+                    owner=user,
+                    now=now,
+                    allow_listening=True,
+                )
+                reused = False
+            self._event(
+                connection,
+                "container-ssh-reserved",
+                task_id=task_id,
+                data={"user": user, "container_name": container_name, "port": port, "reused": reused},
+                now=now,
+            )
+            return {
+                "status": "reserved",
+                "reused": reused,
+                "user": user,
+                "container_name": container_name,
+                "port": port,
+                "task_id": task_id,
+                "coordination_epoch": self._coordination_epoch(connection),
+            }
+
     def acquire(
         self,
         task_id: str,
         observed: dict[str, Any],
         *,
         grant_ttl_seconds: int = DEFAULT_GRANT_TTL_SECONDS,
+        listening: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         task_id = require_safe_id(task_id, label="task id")
         if grant_ttl_seconds < 1:
@@ -875,7 +1298,6 @@ class NpuCoordinator:
         if observed.get("status") != "ok":
             return {"status": "probe_failed", "error": observed.get("error"), "occupancy": observed}
         now = self.clock()
-        busy = self._busy_set(observed) or set()
         with self._transaction() as connection:
             changes = self._housekeep(connection, observed, now=now)
             row = self._task_row(connection, task_id)
@@ -900,20 +1322,22 @@ class NpuCoordinator:
                     "task": self._serialize_task(row),
                     "gc": changes,
                 }
-            reserved = self._reserved_devices(connection, exclude_task=task_id)
             estimated_end = now + int(row["estimated_duration_seconds"])
-            available = []
-            for device in observed.get("devices", []):
-                device = int(device)
-                if device in busy or device in reserved:
-                    continue
-                if self._hold_conflicts(connection, device=device, start_at=now, end_at=estimated_end):
-                    continue
-                available.append(device)
+            available = self._available_devices(
+                connection,
+                observed,
+                exclude_task=task_id,
+                start_at=now,
+                end_at=estimated_end,
+            )
             requested = _load_devices(row["requested_devices"])
-            if requested:
-                missing = sorted(set(requested) - set(available))
-                if missing:
+            selected, missing = self._select_granted_devices(
+                requested=requested,
+                count=int(row["requested_count"]),
+                available=available,
+            )
+            if selected is None:
+                if requested:
                     return {
                         "status": "waiting",
                         "reason": "requested_devices_unavailable",
@@ -922,42 +1346,63 @@ class NpuCoordinator:
                         "task": self._serialize_task(row),
                         "gc": changes,
                     }
-                selected = requested
-            else:
-                count = int(row["requested_count"])
-                if len(available) < count:
+                return {
+                    "status": "waiting",
+                    "reason": "not_enough_devices",
+                    "needed": int(row["requested_count"]),
+                    "available_devices": sorted(available),
+                    "task": self._serialize_task(row),
+                    "gc": changes,
+                }
+            granted_service_port = None
+            if row["requested_service_port"] is not None:
+                choices = json.loads(row["service_port_choices"] or "[]")
+                try:
+                    granted_service_port = self._select_service_port(
+                        connection,
+                        choices=[int(item) for item in choices],
+                        requested=int(row["requested_service_port"]),
+                        task_id=task_id,
+                        owner=str(row["agent_id"]),
+                        now=now,
+                        listening=listening or {"status": "failed", "error": "host listening ports were not probed"},
+                    )
+                except CoordinationError as exc:
                     return {
                         "status": "waiting",
-                        "reason": "not_enough_devices",
-                        "needed": count,
-                        "available_devices": sorted(available),
+                        "reason": "service_port_unavailable",
+                        "error": str(exc),
                         "task": self._serialize_task(row),
+                        "occupancy": observed,
                         "gc": changes,
                     }
-                selected = sorted(available)[:count]
             fence = self._next_fence(connection)
             deadline = now + grant_ttl_seconds
             connection.execute(
                 """
                 UPDATE tasks
                 SET state='granted', granted_devices=?, activation_deadline=?,
-                    fence_token=?, updated_at=?, message=?
+                    fence_token=?, granted_service_port=?, updated_at=?, message=?
                 WHERE task_id=?
                 """,
-                (_json_devices(selected), deadline, fence, now, "short-lived grant issued", task_id),
+                (_json_devices(selected), deadline, fence, granted_service_port, now, "short-lived grant issued", task_id),
             )
             self._event(
                 connection,
                 "task-granted",
                 task_id=task_id,
-                data={"devices": selected, "fence_token": fence, "deadline": utc_now_iso(deadline)},
+                data={"devices": selected, "fence_token": fence, "deadline": utc_now_iso(deadline),
+                      "service_port": granted_service_port},
                 now=now,
             )
             row = self._task_row(connection, task_id)
+        environment = {"ASCEND_RT_VISIBLE_DEVICES": ",".join(str(item) for item in selected)}
+        if granted_service_port is not None:
+            environment["VAWS_SERVICE_PORT"] = str(granted_service_port)
         return {
             "status": "granted",
             "task": self._serialize_task(row),
-            "environment": {"ASCEND_RT_VISIBLE_DEVICES": ",".join(str(item) for item in selected)},
+            "environment": environment,
             "occupancy": observed,
             "gc": changes,
         }
@@ -1019,10 +1464,13 @@ class NpuCoordinator:
             )
             self._event(connection, "preflight-passed", task_id=task_id, data={"devices": devices}, now=now)
             row = self._task_row(connection, task_id)
+        environment = {"ASCEND_RT_VISIBLE_DEVICES": ",".join(str(item) for item in devices)}
+        if row["granted_service_port"] is not None:
+            environment["VAWS_SERVICE_PORT"] = str(int(row["granted_service_port"]))
         return {
             "status": "starting",
             "task": self._serialize_task(row),
-            "environment": {"ASCEND_RT_VISIBLE_DEVICES": ",".join(str(item) for item in devices)},
+            "environment": environment,
             "occupancy": observed,
             "gc": changes,
         }
@@ -1105,7 +1553,7 @@ class NpuCoordinator:
         return {"status": "active", "task": self._serialize_task(row)}
 
     def release(self, task_id: str, token: int, observed: dict[str, Any], *,
-                completion_confirmed: bool = False) -> dict[str, Any]:
+                completion_confirmed: bool = False, listening: dict[str, Any] | None = None) -> dict[str, Any]:
         task_id = require_safe_id(task_id, label="task id")
         now = self.clock()
         busy = self._busy_set(observed)
@@ -1123,20 +1571,24 @@ class NpuCoordinator:
                 if busy is not None and visible is not None
                 else sorted(devices)
             )
-            if (busy is None or visible is None or conflicts
+            busy_ports = self._service_ports_busy(connection, task_id, listening)
+            if (busy is None or visible is None or conflicts or busy_ports
                     or process_guard_busy(row["process_guard"], completion_confirmed=completion_confirmed)):
                 connection.execute(
                     "UPDATE tasks SET state='orphaned_busy', updated_at=?, message=? WHERE task_id=?",
                     (now, "release requested but processes or hardware remained busy or unknown", task_id),
                 )
-                self._event(connection, "release-deferred", task_id=task_id, data={"devices": conflicts}, now=now)
+                self._event(connection, "release-deferred", task_id=task_id,
+                            data={"devices": conflicts, "service_ports": busy_ports}, now=now)
                 row = self._task_row(connection, task_id)
                 return {
                     "status": "orphaned_busy",
                     "conflicting_devices": conflicts,
+                    "conflicting_service_ports": busy_ports,
                     "task": self._serialize_task(row),
                     "occupancy": observed,
                 }
+            self._clear_service_ports(connection, task_id)
             connection.execute(
                 "UPDATE tasks SET state='released', process_guard=NULL, updated_at=?, message=? WHERE task_id=?",
                 (now, "hardware observed free; cooperative lease released", task_id),
@@ -1145,7 +1597,8 @@ class NpuCoordinator:
             row = self._task_row(connection, task_id)
         return {"status": "released", "task": self._serialize_task(row), "occupancy": observed}
 
-    def cancel(self, task_id: str, observed: dict[str, Any] | None = None) -> dict[str, Any]:
+    def cancel(self, task_id: str, observed: dict[str, Any] | None = None,
+               listening: dict[str, Any] | None = None) -> dict[str, Any]:
         task_id = require_safe_id(task_id, label="task id")
         now = self.clock()
         busy = self._busy_set(observed)
@@ -1159,14 +1612,23 @@ class NpuCoordinator:
             if row["state"] in {"released", "expired", "cancelled"}:
                 return {"status": row["state"], "task": self._serialize_task(row)}
             devices = set(_load_devices(row["granted_devices"]))
-            still_busy = bool(devices) and (
-                busy is None
-                or visible is None
-                or not devices.issubset(visible)
-                or bool(devices & busy)
+            busy_ports = self._service_ports_busy(connection, task_id, listening)
+            still_busy = (
+                (
+                    bool(devices)
+                    and (
+                        busy is None
+                        or visible is None
+                        or not devices.issubset(visible)
+                        or bool(devices & busy)
+                    )
+                )
+                or bool(busy_ports)
                 or process_guard_busy(row["process_guard"])
             )
             next_state = "orphaned_busy" if still_busy else "cancelled"
+            if next_state == "cancelled":
+                self._clear_service_ports(connection, task_id)
             connection.execute(
                 "UPDATE tasks SET state=?, process_guard=CASE WHEN ?='cancelled' THEN NULL ELSE process_guard END, updated_at=?, message=? WHERE task_id=?",
                 (next_state, next_state, now, "cancel requested", task_id),
@@ -1194,6 +1656,12 @@ class NpuCoordinator:
                     "SELECT * FROM tasks ORDER BY submitted_at ASC, task_id ASC"
                 ).fetchall()
             holds = connection.execute("SELECT * FROM holds ORDER BY not_before ASC, hold_id ASC").fetchall()
+            if task_id:
+                port_rows = connection.execute(
+                    "SELECT * FROM ports WHERE task_id=? ORDER BY port ASC", (task_id,)
+                ).fetchall()
+            else:
+                port_rows = connection.execute("SELECT * FROM ports ORDER BY port ASC").fetchall()
             events = connection.execute(
                 "SELECT * FROM events ORDER BY event_id DESC LIMIT ?", (max(0, event_limit),)
             ).fetchall()
@@ -1206,6 +1674,7 @@ class NpuCoordinator:
             "ephemeral": True,
             "tasks": [self._serialize_task(row) for row in tasks],
             "holds": [self._serialize_hold(row) for row in holds],
+            "ports": [item for item in (self._serialize_port(row) for row in port_rows) if item is not None],
             "events": [
                 {
                     "event_id": row["event_id"],
@@ -1273,6 +1742,7 @@ def handle_request(
     *,
     probe: Callable[[], dict[str, Any]] = probe_npu_occupancy,
     clock: Callable[[], float] = time.time,
+    listening_ports: Callable[[], dict[str, Any]] = probe_listening_ports,
 ) -> dict[str, Any]:
     """Execute one structured coordinator request on the host."""
     action = request.get("action")
@@ -1288,6 +1758,7 @@ def handle_request(
             request["task_id"],
             probe(),
             grant_ttl_seconds=int(request.get("grant_ttl_seconds") or DEFAULT_GRANT_TTL_SECONDS),
+            listening=listening_ports(),
         )
     if action == "preflight":
         return coordinator.preflight(
@@ -1320,10 +1791,15 @@ def handle_request(
             interval_seconds=float(request.get("interval_seconds") or 2.0),
             probe=probe,
         )
-        return coordinator.release(request["task_id"], int(request["fence_token"]), observed,
-                                   completion_confirmed=request.get("completion_confirmed") is True)
+        return coordinator.release(
+            request["task_id"],
+            int(request["fence_token"]),
+            observed,
+            completion_confirmed=request.get("completion_confirmed") is True,
+            listening=listening_ports(),
+        )
     if action == "cancel":
-        return coordinator.cancel(request["task_id"], probe())
+        return coordinator.cancel(request["task_id"], probe(), listening=listening_ports())
     if action == "hold-add":
         return coordinator.add_hold(request, probe())
     if action == "hold-remove":
@@ -1335,4 +1811,6 @@ def handle_request(
             task_id=request.get("task_id"),
             event_limit=int(request.get("event_limit") or 50),
         )
+    if action == "container-ssh-reserve":
+        return coordinator.reserve_container_ssh(request)
     raise CoordinationError(f"unsupported action: {action!r}")

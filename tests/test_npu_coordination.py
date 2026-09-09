@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import os
+import select
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,9 +16,11 @@ from pathlib import Path
 from unittest import mock
 
 from vaws_coordinator.host.vaws_npu_coordination import (
+    JOB_TOKEN_ENV,
     NpuCoordinator,
     _confirmed_free_probe,
     parse_npu_smi_info,
+    process_guard_busy,
 )
 
 
@@ -115,6 +121,198 @@ class CoordinationTests(unittest.TestCase):
             self.assertNotEqual(self.coordinator.acquire("retained-waiter", occupancy())["status"], "granted")
             self.assertEqual(self.coordinator.release("retained-task", token, occupancy(), completion_confirmed=True)["status"], "released")
             self.assertEqual(self.coordinator.acquire("retained-waiter", occupancy())["status"], "granted")
+
+    def test_process_guard_source_scans_public_remote_dev_marker(self):
+        from vaws_coordinator.host import vaws_npu_coordination as module
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        self.assertIn('JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"', source)
+        self.assertNotIn("VAWS_REMOTE_JOB_TOKEN", source)
+
+    def _job_child_env(self, *, public: str | None, legacy: str | None) -> dict[str, str]:
+        env = os.environ.copy()
+        if public is None:
+            env.pop(JOB_TOKEN_ENV, None)
+        else:
+            env[JOB_TOKEN_ENV] = public
+        if legacy is None:
+            env.pop("VAWS_REMOTE_JOB_TOKEN", None)
+        else:
+            env["VAWS_REMOTE_JOB_TOKEN"] = legacy
+        return env
+
+    def _spawn_ready_child(self, env: dict[str, str]) -> subprocess.Popen:
+        script = (
+            "import sys, time\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+        return subprocess.Popen(
+            [sys.executable, "-u", "-c", script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _stop_child(self, proc: subprocess.Popen | None) -> None:
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+    def _proc_diag(self, proc: subprocess.Popen) -> str:
+        root = Path("/proc") / str(proc.pid)
+        try:
+            stat = (root / "stat").read_text()
+            state = stat.rsplit(") ", 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, IndexError) as exc:
+            stat, state = f"<unreadable {type(exc).__name__}: {exc}>", "?"
+        try:
+            environ = (root / "environ").read_bytes()
+            env_note = f"{len(environ)} bytes"
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError) as exc:
+            environ, env_note = b"", f"unreadable {type(exc).__name__}: {exc}"
+        stderr = b""
+        if proc.stderr is not None:
+            try:
+                if proc.poll() is None:
+                    os.set_blocking(proc.stderr.fileno(), False)
+                stderr = proc.stderr.read() or b""
+            except (OSError, ValueError, BlockingIOError, TypeError):
+                pass
+        return (
+            f"pid={proc.pid} returncode={proc.poll()} stat_state={state} "
+            f"environ={env_note} stat={stat[:200]!r} stderr={stderr[:500]!r}"
+        )
+
+    def _await_live_environ(self, proc: subprocess.Popen, expected: bytes) -> Path:
+        stdout = proc.stdout
+        if stdout is None:
+            self.fail(f"child {self._proc_diag(proc)} has no stdout ready pipe")
+        deadline = time.time() + 5
+        buf = b""
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            readable, _, _ = select.select([stdout], [], [], remaining)
+            if readable:
+                chunk = os.read(stdout.fileno(), 64)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"ready\n" in buf:
+                    break
+            if proc.poll() is not None:
+                self.fail(f"child died before ready signal {self._proc_diag(proc)}")
+        else:
+            self.fail(f"child never emitted ready signal stdout={buf!r} {self._proc_diag(proc)}")
+        if b"ready\n" not in buf:
+            self.fail(
+                f"child closed stdout without ready signal stdout={buf!r} {self._proc_diag(proc)}"
+            )
+        deadline = time.time() + 2
+        last = "no /proc snapshot"
+        while time.time() < deadline:
+            root = Path("/proc") / str(proc.pid)
+            try:
+                stat = (root / "stat").read_text()
+                state = stat.rsplit(") ", 1)[1].split()[0]
+                environ = (root / "environ").read_bytes()
+                last = f"stat_state={state} environ_bytes={len(environ)} returncode={proc.poll()}"
+                if state != "Z" and expected in environ.split(b"\0"):
+                    return root
+            except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, IndexError) as exc:
+                last = f"{type(exc).__name__}: {exc} returncode={proc.poll()}"
+            if proc.poll() is not None:
+                self.fail(
+                    f"child died after ready before /proc showed expected token "
+                    f"{last} {self._proc_diag(proc)}"
+                )
+            time.sleep(0.01)
+        self.fail(
+            f"child ready but /proc never showed expected token {last} {self._proc_diag(proc)}"
+        )
+
+    def _iter_only_pids(self, *pids: int):
+        entries = [Path("/proc") / str(pid) for pid in pids]
+        original = Path.iterdir
+
+        def iterdir(self_path):
+            if os.fspath(self_path) == "/proc":
+                yield from entries
+                return
+            yield from original(self_path)
+
+        return mock.patch.object(Path, "iterdir", iterdir)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(), "process environ scan is Linux /proc")
+    def test_process_guard_sees_remote_dev_job_token_not_legacy_name(self):
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        marker = os.urandom(16).hex()
+        public_token = f"{JOB_TOKEN_ENV}={marker}".encode()
+        legacy_token = f"VAWS_REMOTE_JOB_TOKEN={marker}".encode()
+        guard = {"marker": marker, "boot_id": boot_id}
+        proc = None
+        leftover = None
+        try:
+            proc = self._spawn_ready_child(self._job_child_env(public=marker, legacy=None))
+            root = self._await_live_environ(proc, public_token)
+            pairs = (root / "environ").read_bytes().split(b"\0")
+            self.assertIn(public_token, pairs)
+            self.assertNotIn(legacy_token, pairs)
+            self.assertNotEqual((root / "stat").read_text().rsplit(") ", 1)[1].split()[0], "Z")
+            with self._iter_only_pids(proc.pid):
+                self.assertTrue(process_guard_busy(guard))
+        finally:
+            self._stop_child(proc)
+        try:
+            leftover = self._spawn_ready_child(self._job_child_env(public=None, legacy=marker))
+            root = self._await_live_environ(leftover, legacy_token)
+            pairs = (root / "environ").read_bytes().split(b"\0")
+            self.assertNotIn(public_token, pairs)
+            self.assertIn(legacy_token, pairs)
+            self.assertNotEqual((root / "stat").read_text().rsplit(") ", 1)[1].split()[0], "Z")
+            with self._iter_only_pids(leftover.pid):
+                self.assertFalse(process_guard_busy(guard))
+        finally:
+            self._stop_child(leftover)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(), "process environ scan is Linux /proc")
+    def test_process_guard_permission_error_keeps_busy(self):
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        marker = os.urandom(16).hex()
+        blocked = Path("/proc") / "1"
+        original_iterdir = Path.iterdir
+        original_read_text = Path.read_text
+        original_read_bytes = Path.read_bytes
+
+        def iterdir(self_path):
+            if os.fspath(self_path) == "/proc":
+                yield blocked
+                return
+            yield from original_iterdir(self_path)
+
+        def read_text(self_path, *args, **kwargs):
+            if self_path.name == "stat" and self_path.parent == blocked:
+                raise PermissionError
+            return original_read_text(self_path, *args, **kwargs)
+
+        def read_bytes(self_path, *args, **kwargs):
+            if self_path.name == "environ" and self_path.parent == blocked:
+                raise PermissionError
+            return original_read_bytes(self_path, *args, **kwargs)
+
+        with mock.patch.object(Path, "iterdir", iterdir), \
+                mock.patch.object(Path, "read_text", read_text), \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            self.assertTrue(process_guard_busy({"marker": marker, "boot_id": boot_id}))
 
     def activate(self, task_id: str, *, heartbeat_ttl: int = 10) -> int:
         granted = self.coordinator.acquire(task_id, occupancy(), grant_ttl_seconds=10)
@@ -348,6 +546,67 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(parsed['status'], 'ok')
         self.assertEqual(parsed['busy']['1'][0]['pid'], 4321)
         self.assertEqual(parsed['free'], [0])
+
+
+class ContainerPortOwnershipTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.clock = FakeClock()
+        self.coordinator = NpuCoordinator(self.temp.name, clock=self.clock)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_user_ssh_reservation_blocks_service_collision_and_survives_release(self) -> None:
+        reserved = self.coordinator.reserve_container_ssh(
+            {"user": "maoxx241", "container_name": "vaws-maoxx241", "port": 46001}
+        )
+        self.assertEqual(reserved["status"], "reserved")
+        self.assertEqual(reserved["port"], 46001)
+        again = self.coordinator.reserve_container_ssh(
+            {"user": "maoxx241", "container_name": "vaws-maoxx241", "port": 46001}
+        )
+        self.assertTrue(again["reused"])
+        with self.assertRaisesRegex(Exception, "already has SSH port"):
+            self.coordinator.reserve_container_ssh(
+                {"user": "maoxx241", "container_name": "vaws-maoxx241", "port": 46002}
+            )
+        with self.assertRaisesRegex(Exception, "must be vaws-maoxx241"):
+            self.coordinator.reserve_container_ssh(
+                {"user": "maoxx241", "container_name": "vaws-other", "port": 46001}
+            )
+        self.coordinator.submit(
+            {
+                "task_id": "exec-1",
+                "agent_id": "maoxx241",
+                "npu_count": 1,
+                "queue_ttl_seconds": 600,
+                "estimated_duration_seconds": 60,
+                "service_port": 0,
+                "service_ports": [46001, 48001],
+            }
+        )
+        listening = {"status": "ok", "ports": [46001]}
+        granted = self.coordinator.acquire("exec-1", occupancy(), listening=listening)
+        self.assertEqual(granted["status"], "granted")
+        self.assertEqual(granted["task"]["granted_service_port"], 48001)
+        self.assertEqual(granted["environment"]["VAWS_SERVICE_PORT"], "48001")
+        token = granted["task"]["fence_token"]
+        busy_port = self.coordinator.release(
+            "exec-1", token, occupancy(), completion_confirmed=True,
+            listening={"status": "ok", "ports": [46001, 48001]},
+        )
+        self.assertEqual(busy_port["status"], "orphaned_busy")
+        released = self.coordinator.release(
+            "exec-1", token, occupancy(), completion_confirmed=True,
+            listening={"status": "ok", "ports": [46001]},
+        )
+        self.assertEqual(released["status"], "released")
+        snapshot = self.coordinator.snapshot(occupancy())
+        self.assertEqual(
+            [(row["port"], row["kind"]) for row in snapshot["ports"]],
+            [(46001, "container_ssh")],
+        )
 
 
 if __name__ == "__main__":

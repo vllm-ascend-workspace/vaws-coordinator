@@ -62,6 +62,10 @@ class MachineDirectory:
             raise MachineDirectoryUnavailable(f"{path} is not a machine inventory document")
         return inventory, path
 
+    def machines(self) -> list[dict[str, Any]]:
+        inventory, _ = self.load()
+        return list(inventory["machines"])
+
     def catalog(self) -> dict[str, Any]:
         inventory, path = self.load()
         return {
@@ -83,3 +87,16 @@ class MachineDirectory:
         if len(matches) != 1:
             raise ValueError("machine alias must resolve uniquely in the shared inventory")
         return matches[0]["host"]
+
+    def upsert_machine(self, record: Mapping[str, Any]) -> Path:
+        """Insert or replace one host record. Never wipe the rest of the directory."""
+        host_ip = (record.get("host") or {}).get("ip")
+        try:
+            inventory, _ = self.load()
+            machines = [row for row in inventory["machines"]
+                        if (row.get("host") or {}).get("ip") != host_ip and row.get("alias") != record.get("alias")]
+            machines.append(dict(record))
+            document = {**inventory, "machines": machines}
+        except MachineDirectoryUnavailable:
+            document = {"machines": [dict(record)]}
+        return self.replace(document)

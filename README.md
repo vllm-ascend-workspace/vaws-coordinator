@@ -21,7 +21,7 @@ uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main va
 Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
 is the same entry as `vaws-coordinator`.
 
-The package depends on `vaws-remote-dev>=0.1.0` (import `remote_dev`). It
+The package depends on `vaws-remote-dev>=0.5.0` (import `remote_dev`). It
 does not pin that package's git source; the workspace that installs this
 library chooses the tag. `uv sync` / `uv lock` are not the developer path
 here: a library that named remote-dev's git source in `pyproject.toml`
@@ -52,9 +52,17 @@ Example Cursor / Claude `.mcp.json` (or `.cursor/mcp.json`):
 }
 ```
 
-`vaws_session` and `vaws_finish` are local. `vaws_run` uses this process's own
-runtime pool and the host NPU authority. Pass the `context_file` supplied by
-the native session hook; never guess a task from cwd or history.
+Start `vaws-coordinator daemon` for this user/state-dir. `task-server`, the
+`vaws` CLI, and `TaskClient` call that process. They do not each create a
+private scheduler.
+
+`vaws_session` exposes the local task identity. `vaws_finish` closes admission
+and stops the task's owned executions; the daemon then returns remaining
+bindings and marks the task finished without a second finish.
+`vaws_run` admits a business command plus environment/resource/topology needs;
+the daemon places, prepares, launches and observes it. Pass the `context_file` supplied by the
+native session hook; never guess a task from cwd or history. Do not pass
+request IDs, profile hashes, or runtime IDs.
 
 ## Host NPU queue (Python API)
 
@@ -97,7 +105,7 @@ executed on the physical host. Durable host state defaults to
 ## Development
 
 `uv sync` is not the setup path. This library declares
-`vaws-remote-dev>=0.1.0` without a git source: remote-dev is not on PyPI,
+`vaws-remote-dev>=0.5.0` without a git source: remote-dev is not on PyPI,
 so `uv sync` / `uv lock` fail with an unsatisfiable-dependency error.
 That is intentional. A library that pinned remote-dev's git URL would
 take the upgrade decision away from every consumer, and
@@ -108,7 +116,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.5.0"
 uv pip install pytest
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest

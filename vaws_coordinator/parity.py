@@ -64,19 +64,18 @@ def materialize_command(
     sources: dict[str, str],
     workspace_root: Path | str | None = None,
 ) -> list[str]:
-    """Build the in-package parity CLI that materializes sources.
+    """Build the in-package parity CLI that materializes explicit source repos.
 
-    ``workspace_root`` is the git worktree being snapshotted (operational
-    data), not a path to a consumer implementation. It defaults to cwd.
+    Bound ``sources`` are the worktrees to snapshot. A Git parent of those
+    trees is not required. ``workspace_root`` is only optional local state.
     """
-    root = Path(workspace_root).expanduser() if workspace_root else Path.cwd()
+    if not {"vllm", "vllm-ascend"}.issubset(sources or {}):
+        raise ValueError("bind the actual vllm and vllm-ascend worktrees before materialization")
     command = [
         sys.executable,
         "-m",
         "vaws_coordinator.parity",
         "sync",
-        "--workspace-root",
-        str(root),
         "--workspace-id",
         workspace_id,
         "--server-name",
@@ -94,6 +93,8 @@ def materialize_command(
         "--apply-mode",
         "materialize",
     ]
+    if workspace_root:
+        command.extend(["--workspace-root", str(Path(workspace_root).expanduser())])
     for name, path in sources.items():
         command.extend(["--source", name + "=" + path])
     return command
@@ -229,7 +230,7 @@ DEFAULT_GIT_TRANSPORT_TIMEOUT_SECONDS = 900.0
 DEFAULT_CONTAINER_LOCK_STALE_SECONDS = 3600
 # Keep runtime-private state and profiling artifacts that may be needed for
 # post-run analysis across parity refreshes.
-DEFAULT_ROOT_PRESERVE_PATHS = ('Mooncake', '.vaws-runtime')
+DEFAULT_ROOT_PRESERVE_PATHS = ('Mooncake', '.vaws-runtime', '.venv', 'venv', 'build')
 STATE_FILENAME = 'runtime-state.json'
 CONSENT_FILENAME = 'install-consents.json'
 PARITY_BRANCH_NAME = 'parity-current'
@@ -686,22 +687,21 @@ def git_remote_url(container: SshEndpoint, mirror_path: str) -> str:
 
 
 def git_ssh_environment(container: SshEndpoint) -> dict[str, str]:
+    from remote_dev.core.endpoint import Endpoint
+    from remote_dev.core.ssh_transport import ssh_base_cmd
+
     env = os.environ.copy()
     env['GIT_TERMINAL_PROMPT'] = '0'
-    env['GIT_SSH_COMMAND'] = shlex.join(
-        [
-            'ssh',
-            '-T',
-            '-o',
-            'BatchMode=yes',
-            '-o',
-            'StrictHostKeyChecking=accept-new',
-            '-o',
-            'LogLevel=ERROR',
-            '-p',
-            str(container.port),
-        ]
+    cmd = list(
+        ssh_base_cmd(Endpoint(host=container.host, port=container.port, user=container.user))
     )
+    # Git appends host and the remote git command. ssh_base_cmd already
+    # includes `-- host`; keep the builder's options as the ssh prefix.
+    if '--' in cmd:
+        cmd = cmd[: cmd.index('--')]
+    if '-T' not in cmd:
+        cmd = [cmd[0], '-T', *cmd[1:]]
+    env['GIT_SSH_COMMAND'] = shlex.join(cmd)
     return env
 
 
@@ -1055,18 +1055,44 @@ def container_repo_path(runtime_root: str, record: SnapshotRecord) -> str:
     return str(Path(runtime_root) / record.relpath)
 
 
-def first_install_prepare_script(runtime_root: str) -> str:
-    lines = ['set -eo pipefail', f'mkdir -p {quoted(runtime_root)}', f'cd {quoted(runtime_root)}']
-    lines.extend(remote_runtime_env_exports())
-    lines.extend(DEFAULT_ENV_PREAMBLE)
-    lines.extend(
+def prepare_isolated_root_script(runtime_root: str) -> str:
+    """Create or reset an isolated task root. Never pip-uninstall image packages."""
+    hostname_repair = (
+        'if command -v hostname >/dev/null 2>&1; then '
+        'h="$(hostname 2>/dev/null || true)"; '
+        'if [ -n "$h" ] && ! grep -q -F "$h" /etc/hosts 2>/dev/null; then '
+        'echo "127.0.0.1 $h" >> /etc/hosts; fi; fi'
+    )
+    return '\n'.join(
         [
-            '$PIP uninstall -y vllm vllm-ascend vllm_ascend >/dev/null 2>&1 || true',
+            'set -eo pipefail',
+            f'mkdir -p {quoted(runtime_root)}',
+            hostname_repair,
             f'rm -rf {quoted(str(Path(runtime_root) / "vllm"))} {quoted(str(Path(runtime_root) / "vllm-ascend"))}',
             f'rm -rf {quoted(str(Path(runtime_root) / ".git/modules/vllm"))} {quoted(str(Path(runtime_root) / ".git/modules/vllm-ascend"))}',
         ]
     )
-    return '\n'.join(lines)
+
+
+def task_python_exports(python: str) -> list[str]:
+    """Pin every pip/build/executable selection to the task-owned interpreter."""
+    q = quoted(python)
+    return [
+        f'export PYTHON={q}',
+        'export PIP="$PYTHON -m pip"',
+        'export HI_PYTHON="$PYTHON"',
+        'export Python3_EXECUTABLE="$PYTHON"',
+        'export Python_EXECUTABLE="$PYTHON"',
+        'PYTHON_BIN_DIR="$(dirname "$PYTHON")"',
+        'if [ -n "${VAWS_PYTHON_SHIM_DIR:-}" ]; then',
+        '  ln -sf "$PYTHON" "$VAWS_PYTHON_SHIM_DIR/python"',
+        '  ln -sf "$PYTHON" "$VAWS_PYTHON_SHIM_DIR/python3"',
+        'fi',
+        'export PATH="${VAWS_PYTHON_SHIM_DIR:+$VAWS_PYTHON_SHIM_DIR:}$PYTHON_BIN_DIR:$PATH"',
+        'hash -r',
+        'export CMAKE_ARGS="-DPython3_EXECUTABLE=\\"$PYTHON\\" -DPython_EXECUTABLE=\\"$PYTHON\\""',
+        f'test -x {q}',
+    ]
 
 
 def render_git_clean(repo_dir: str, preserve_paths: tuple[str, ...]) -> str:
@@ -1089,7 +1115,12 @@ def materialize_runtime(
     dry_run: bool,
 ) -> None:
     record_by_relpath = {record.relpath: record for record in records}
-    root_record = record_by_relpath['.']
+    if '.' in record_by_relpath:
+        roots = [record_by_relpath['.']]
+    else:
+        roots = [record for record in records if '/' not in record.relpath]
+    if not roots:
+        raise ValueError('materialize requires explicit source records (vllm, vllm-ascend)')
     parity_tracking_ref = f'refs/remotes/parity/{PARITY_BRANCH_NAME}'
 
     def render_repo_step(record: SnapshotRecord) -> str:
@@ -1111,10 +1142,7 @@ def materialize_runtime(
                 f'git -C {quoted(repo_dir)} reset --hard {quoted(parity_tracking_ref)} >/dev/null',
             ]
         )
-        if record.relpath in ('', '.'):
-            lines.append(render_git_clean(repo_dir, root_preserve_paths))
-        else:
-            lines.append(f'git -C {quoted(repo_dir)} clean -ffd >/dev/null')
+        lines.append(render_git_clean(repo_dir, root_preserve_paths))
         for child in record.submodules:
             child_relpath = child['path'] if record.relpath in ('', '.') else f"{record.relpath}/{child['path']}"
             child_record = record_by_relpath[child_relpath]
@@ -1143,7 +1171,8 @@ def materialize_runtime(
         f'mkdir -p {quoted(str(Path(runtime_root) / marker_dirname))}',
     ]
     repo_scripts: list[str] = []
-    collect_scripts(root_record, repo_scripts)
+    for root_record in roots:
+        collect_scripts(root_record, repo_scripts)
     parts.extend(repo_scripts)
     ssh_exec(container, '\n'.join(parts))
 
@@ -1177,11 +1206,14 @@ def runtime_install_step_script(
     container_identity: str,
     step: str,
     uninstall_packages: tuple[str, ...] = (),
+    python: str | None = None,
 ) -> str:
     lines = ['set -euo pipefail', f'cd {quoted(runtime_root)}']
     lines.extend(remote_runtime_env_exports())
     lines.append(f'export VAWS_RUNTIME_ROOT={quoted(runtime_root)}')
     lines.extend(DEFAULT_ENV_PREAMBLE)
+    if python:
+        lines.extend(task_python_exports(python))
     if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-requirements'}:
         lines.extend(
             [
@@ -1266,30 +1298,24 @@ def runtime_install_step_script(
                 '  message="$2"',
                 '  target_dir="$3"',
                 '  expected_seconds="$4"',
-                '  install_cmd="$5"',
-                '  log_file="$(mktemp -t parity-install.XXXXXX.log)"',
+                '  shift 4',
                 '  cd "$target_dir"',
                 '  configure_pip_index',
-                '  set +e',
-                f'  run_with_log_progress "$phase" "$message via {PIP_INDEX_NAME}" "$expected_seconds" "$log_file" bash -lc "$install_cmd"',
-                '  status=$?',
-                '  set -e',
-                '  rm -f "$log_file"',
-                '  return "$status"',
+                f'  run_with_progress "$phase" "$message via {PIP_INDEX_NAME}" "$expected_seconds" "$@"',
                 '}',
             ]
         )
 
     if step == 'uninstall':
         pkg_args = ' '.join(uninstall_packages) if uninstall_packages else 'vllm vllm-ascend vllm_ascend'
-        lines.append(f'$PYTHON -m pip uninstall -y {pkg_args} >/dev/null 2>&1 || true')
+        lines.append(f'"$PYTHON" -m pip uninstall -y {pkg_args} >/dev/null 2>&1 || true')
     elif step == 'install-vllm':
         lines.extend(
             [
                 f'cd {quoted(str(Path(runtime_root) / "vllm"))}',
                 'export VLLM_TARGET_DEVICE=empty',
                 'export TORCH_DEVICE_BACKEND_AUTOLOAD=0',
-                'install_editable_fast "runtime-install-vllm" "building editable vllm" . 900 "$PYTHON -m pip install --no-deps -e . --no-build-isolation"',
+                'install_editable_fast "runtime-install-vllm" "building editable vllm" . 900 "$PYTHON" -m pip install --no-deps -e . --no-build-isolation',
             ]
         )
     elif step == 'install-vllm-ascend-requirements':
@@ -1376,11 +1402,10 @@ def runtime_install_step_script(
                 '  fi',
                 '  if [ "$required_torch" != "$installed_torch" ]; then',
                 '    echo "ERROR: vllm-ascend custom-ops build requires torch==$required_torch but this image ships torch==$installed_torch." >&2',
-                '    echo "The checked-out vllm-ascend submodule is not version-matched to the base image, so building custom ops will fail in cmake." >&2',
-                '    echo "Resolve by either:" >&2',
-                '    echo "  (a) skip rebuilding custom ops and use the image stack:" >&2',
-                '    echo "      install_consent.py set-sync-mode --sync-mode image --approved-by-user" >&2',
-                '    echo "  (b) check out a vllm-ascend commit whose CMakeLists expects torch $installed_torch." >&2',
+                '    echo "The bound vllm-ascend sources are not version-matched to this environment." >&2',
+                '    echo "Bind a vllm-ascend worktree whose CMakeLists.txt expects torch $installed_torch," >&2',
+                '    echo "or request an environment recipe/image that provides torch $required_torch." >&2',
+                '    echo "The coordinator will not skip the custom-ops build or retarget the image stack." >&2',
                 '    exit 1',
                 '  fi',
                 '  echo "build-compat: image torch $installed_torch matches vllm-ascend requirement"',
@@ -1391,13 +1416,13 @@ def runtime_install_step_script(
         lines.extend(
             [
                 f'cd {quoted(str(Path(runtime_root) / "vllm-ascend"))}',
-                'install_editable_fast "runtime-install-vllm-ascend" "building editable vllm-ascend custom ops" . 2400 "$PYTHON -m pip install --no-deps -v -e . --no-build-isolation"',
+                'install_editable_fast "runtime-install-vllm-ascend" "building editable vllm-ascend custom ops" . 2400 "$PYTHON" -m pip install --no-deps -v -e . --no-build-isolation',
             ]
         )
     elif step == 'verify-imports':
         lines.extend(
             [
-                "$PYTHON - <<'PY'",
+                '"$PYTHON" - <<\'PY\'',
                 'import sys',
                 'import torch',
                 'import torch_npu  # noqa: F401',
@@ -1413,7 +1438,7 @@ def runtime_install_step_script(
         # compatible with CANN, so checking vllm deps would false-positive.
         lines.extend(
             [
-                "$PYTHON - <<'PY'",
+                '"$PYTHON" - <<\'PY\'',
                 'import sys',
                 'from importlib.metadata import requires, version as pkg_version',
                 'from packaging.requirements import Requirement',
@@ -1511,6 +1536,7 @@ def run_runtime_install_step(
     step: str,
     stream_progress: bool = False,
     uninstall_packages: tuple[str, ...] = (),
+    python: str | None = None,
 ) -> None:
     script = runtime_install_step_script(
         runtime_root=runtime_root,
@@ -1518,6 +1544,7 @@ def run_runtime_install_step(
         container_identity=container_identity,
         step=step,
         uninstall_packages=uninstall_packages,
+        python=python,
     )
     if stream_progress:
         ssh_exec_stream(container, script, stream_progress=True)
@@ -1646,7 +1673,7 @@ def read_runtime_install_env(
     lines.extend(DEFAULT_ENV_PREAMBLE)
     lines.extend(
         [
-            "$PYTHON - <<'PY'",
+            '"$PYTHON" - <<\'PY\'',
             'import json',
             'import os',
             f'keys = {json.dumps(RUNTIME_INSTALL_ENV_KEYS)}',
@@ -1796,23 +1823,31 @@ def build_snapshot_records(
     unpopulated: str = 'error',
     with_build_inputs: bool = True,
 ) -> list[SnapshotRecord]:
-    tree = discover_repo_tree(workspace_root, '.', None, source_roots, unpopulated=unpopulated)
+    source_roots = source_roots or {}
     child_records: dict[str, SnapshotRecord] = {}
     ordered_records = records if records is not None else []
-    for node in iter_postorder(tree):
-        if node.gitlink_commit:
-            record = gitlink_snapshot_record(node)
-        else:
-            record = build_synthetic_snapshot(
-                node,
-                workspace_id=workspace_id,
-                snapshot_id=snapshot_id,
-                denylist=denylist,
-                child_commits=child_records,
-            )
-        child_records[node.relpath] = record
-        record.source_path = str(node.repo_path.resolve()) if node.repo_path.exists() else str(node.repo_path)
-        ordered_records.append(record)
+
+    def consume(tree: RepoNode) -> None:
+        for node in iter_postorder(tree):
+            if node.gitlink_commit:
+                record = gitlink_snapshot_record(node)
+            else:
+                record = build_synthetic_snapshot(
+                    node,
+                    workspace_id=workspace_id,
+                    snapshot_id=snapshot_id,
+                    denylist=denylist,
+                    child_commits=child_records,
+                )
+            child_records[node.relpath] = record
+            record.source_path = str(node.repo_path.resolve()) if node.repo_path.exists() else str(node.repo_path)
+            ordered_records.append(record)
+
+    if source_roots:
+        for name, path in source_roots.items():
+            consume(discover_repo_tree(Path(path), name, None, None, unpopulated=unpopulated))
+    else:
+        consume(discover_repo_tree(workspace_root, '.', None, None, unpopulated=unpopulated))
     if with_build_inputs:
         for record in ordered_records:
             if record.relpath in ('vllm', 'vllm-ascend'):
@@ -1833,8 +1868,19 @@ def final_manifest(manifest: dict[str, Any], *, status: str, reinstall_status: s
     return enriched
 
 
+def resolve_state_root(workspace_root: str | None, sources: dict[str, Path]) -> Path:
+    if workspace_root:
+        return Path(workspace_root).expanduser().resolve()
+    if sources:
+        return next(iter(sources.values())).resolve().parent
+    raise ValueError('bind the actual vllm and vllm-ascend worktrees')
+
+
 def run_plan(args: argparse.Namespace) -> int:
-    workspace_root = repo_root_from(Path(args.workspace_root))
+    sources = parse_sources(getattr(args, 'source', []))
+    if not {'vllm', 'vllm-ascend'}.issubset(sources):
+        raise ValueError('bind the actual vllm and vllm-ascend worktrees')
+    workspace_root = resolve_state_root(getattr(args, 'workspace_root', None), sources)
     workspace_id = normalize_workspace_id(args.workspace_id)
     runtime_root = validate_absolute_posix_path(args.runtime_root, label='runtime root')
     container_cache_root = validate_absolute_posix_path(args.container_cache_root, label='container cache root')
@@ -1843,7 +1889,7 @@ def run_plan(args: argparse.Namespace) -> int:
     snapshot_id = args.snapshot_id or now_utc().replace(':', '').replace('-', '')
     records: list[SnapshotRecord] = []
     try:
-        records = build_snapshot_records(workspace_root, workspace_id, snapshot_id, tuple(DEFAULT_DENYLIST), parse_sources(getattr(args, 'source', [])), records)
+        records = build_snapshot_records(workspace_root, workspace_id, snapshot_id, tuple(DEFAULT_DENYLIST), sources, records)
         manifest = make_manifest(
             workspace_root=workspace_root,
             workspace_id=workspace_id,
@@ -1863,7 +1909,10 @@ def run_plan(args: argparse.Namespace) -> int:
 
 
 def run_sync(args: argparse.Namespace) -> int:
-    workspace_root = repo_root_from(Path(args.workspace_root))
+    sources = parse_sources(getattr(args, 'source', []))
+    if not {'vllm', 'vllm-ascend'}.issubset(sources):
+        raise ValueError('bind the actual vllm and vllm-ascend worktrees')
+    workspace_root = resolve_state_root(getattr(args, 'workspace_root', None), sources)
     workspace_id = normalize_workspace_id(args.workspace_id)
     runtime_root = validate_absolute_posix_path(args.runtime_root, label='runtime root')
     container_cache_root = validate_absolute_posix_path(args.container_cache_root, label='container cache root')
@@ -1878,7 +1927,7 @@ def run_sync(args: argparse.Namespace) -> int:
     manifest_path = manifest_path_for(container_cache_root, workspace_id, snapshot_id)
     current_phase = 'snapshot-built'
     try:
-        records = build_snapshot_records(workspace_root, workspace_id, snapshot_id, tuple(DEFAULT_DENYLIST), parse_sources(getattr(args, 'source', [])), records)
+        records = build_snapshot_records(workspace_root, workspace_id, snapshot_id, tuple(DEFAULT_DENYLIST), sources, records)
         try:
             record_map = {record.relpath: record for record in records}
             prior_runtime_state = load_runtime_state(workspace_root)
@@ -2234,7 +2283,7 @@ def run_sync(args: argparse.Namespace) -> int:
                 if first_install:
                     current_phase = 'first-install-prepare'
                     emit_progress(current_phase, runtime_root=runtime_root)
-                    ssh_exec(container, first_install_prepare_script(runtime_root))
+                    ssh_exec(container, prepare_isolated_root_script(runtime_root))
 
                 current_phase = 'materialize-runtime'
                 emit_progress(current_phase, runtime_root=runtime_root)
@@ -2460,7 +2509,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest='command', required=True)
 
     def add_shared_arguments(target: argparse.ArgumentParser) -> None:
-        target.add_argument('--workspace-root', required=True, help='Local workspace root.')
+        target.add_argument('--workspace-root', default='', help='Optional local state directory; bound --source worktrees are snapshotted directly.')
         target.add_argument('--source', action='append', default=[], help='Use an actual external business worktree: vllm=/path or vllm-ascend=/path.')
         target.add_argument('--workspace-id', required=True, help='Stable workspace id used for container cache namespacing.')
         target.add_argument('--server-name', required=True)

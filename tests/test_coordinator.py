@@ -3,9 +3,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -64,14 +67,65 @@ class Backend:
         self.calls = []
         self.jobs = {}
         self.fail_job_after = None
+        self.prepared = {}
+        self.require_prepared = False
+        self.machines = None
         self.attestation = {"profile_key": "profile-a", "build_key": "native-a",
                             "profile": {"launch_env": {"VLLM_VERSION": "test"}}}
+
+    def mark_prepared(self, spec, profile_key="profile-a", build_key="native-a"):
+        root = spec["endpoint"]["root"]
+        recipe = spec.get("recipe")
+        self.prepared[root] = {
+            "python": spec["python"],
+            "recipe": recipe,
+            "profile": {"launch_env": {"VLLM_VERSION": "test"}, "recipe": recipe},
+            "profile_key": profile_key,
+            "build_key": build_key,
+        }
+
+    def prepare_task_root(self, spec, *, sources, environment, donor_python=None, **kwargs):
+        root = spec["endpoint"]["root"]
+        python = spec["python"]
+        if donor_python and python == donor_python:
+            raise ValueError("task-owned interpreter must not be the donor interpreter")
+        if not sources or not {"vllm", "vllm-ascend"}.issubset(sources):
+            raise ValueError("bind the actual vllm and vllm-ascend worktrees before preparation")
+        recipe = (environment or {}).get("recipe") or (environment or {}).get("image") or spec.get("recipe")
+        profile = {"launch_env": {"VLLM_VERSION": "test"}, "recipe": recipe}
+        for key in ("python_abi", "cann", "soc", "machine_type"):
+            if (environment or {}).get(key):
+                profile[key] = environment[key]
+        self.prepared[root] = {
+            "python": python,
+            "recipe": recipe,
+            "profile": profile,
+            "profile_key": "profile-" + (recipe or "prepared"),
+            "build_key": "native-" + (recipe or "prepared"),
+        }
+        return self.inspect(spec)
 
     def inspect(self, runtime, **kwargs):
         if self.fail:
             raise TimeoutError("probe unavailable")
         self.calls.append(("inspect", kwargs))
-        return copy.deepcopy(self.attestation)
+        root = (runtime.get("endpoint") or {}).get("cwd") or (runtime.get("endpoint") or {}).get("root")
+        python = runtime.get("python")
+        prepared = self.prepared.get(root)
+        if prepared is None:
+            if self.require_prepared:
+                raise ValueError("missing ready-profile.json")
+            observed = copy.deepcopy(self.attestation)
+            observed["container_id"] = "cid-" + str(runtime.get("container_name") or "unknown")
+            return observed
+        if prepared["python"] != python:
+            raise ValueError("interpreter does not match prepared root")
+        return {
+            "profile_key": prepared["profile_key"],
+            "build_key": prepared["build_key"],
+            "profile": copy.deepcopy(prepared["profile"]),
+            "container_id": "cid-" + str(runtime.get("container_name") or "unknown"),
+        }
 
     def host(self, runtime, request):
         if self.fail:
@@ -81,10 +135,15 @@ class Backend:
             guard = json.loads(value) if isinstance(value, str) else value
             return bool(guard) and (any(not job["quiet"] and job["receipt"]["process_guard"] == guard for job in self.jobs.values())
                                    or (guard.get("retain_until_release") and not completion_confirmed))
+        listening = {"status": "ok", "ports": list(getattr(self, "listening", []))}
+        host = runtime["host_endpoint"]["host"]
+        state = Path(self.state) / host.replace(".", "_")
+        state.mkdir(parents=True, exist_ok=True)
         with mock.patch("vaws_npu_coordination.process_guard_busy", side_effect=guarded):
-            result = handle_request({**request, "state_dir": str(self.state), "interval_seconds": 0.001},
+            result = handle_request({**request, "state_dir": str(state), "interval_seconds": 0.001},
                                     probe=lambda: {"status": "ok", "devices": [0, 1],
-                                                   "busy": {str(d): ["test worker"] for d in self.busy}})
+                                                   "busy": {str(d): ["test worker"] for d in self.busy}},
+                                    listening_ports=lambda: listening)
         if self.fail_after == request["action"]:
             self.fail_after = None
             raise TimeoutError("reply lost after host mutation")
@@ -100,6 +159,10 @@ class Backend:
             self.jobs[job_id]["state"] = "running"
         if action == "stop" and job_id in self.jobs:
             self.jobs[job_id].update(state="cancelled", quiet=True)
+        if action == "tail":
+            job = self.jobs.get(job_id, {"state": "absent", "quiet": True})
+            text = job.get("stdout") or f"stdout-{job_id[-8:]}"
+            return {**copy.deepcopy(job), "stdout": text, "stderr": job.get("stderr") or "", "tail": text}
         if self.fail_job_after == action:
             self.fail_job_after = None
             raise TimeoutError("lost job reply")
@@ -109,9 +172,23 @@ class Backend:
         return receipt["pid"]
 
 
-def runtime_spec(number):
-    return {"endpoint": {"host": "192.0.2.1", "port": 46000 + number, "root": "/vllm-workspace"},
-            "host_endpoint": {"host": "192.0.2.1", "port": 22}, "container_name": "prepared-" + str(number), "service_ports": [48000 + number]}
+def runtime_spec(number, user="alice", python=None, root=None, service_ports=None, host=None, recipe=None):
+    host = host or "192.0.2.1"
+    ssh = {"alice": 46001, "bob": 46002}.get(user, 46100)
+    if host != "192.0.2.1":
+        ssh = 46100 + number
+    spec = {
+        "user": user,
+        "python": python or f"/opt/{user}/venvs/root-{number}/bin/python",
+        "endpoint": {"host": host, "port": ssh, "root": root or f"/vllm-workspace/{user}/{number}",
+                     "user": "root"},
+        "host_endpoint": {"host": host, "port": 22, "user": "root"},
+        "container_name": "vaws-" + user,
+        "service_ports": service_ports if service_ports is not None else [48000 + number],
+    }
+    if recipe:
+        spec["recipe"] = recipe
+    return spec
 
 
 class FakeShell:
@@ -127,35 +204,34 @@ class FakeShell:
 
 
 class BackendTests(unittest.TestCase):
-    def test_docker_idle_probe_keeps_pid_column_and_rejects_workers(self):
+    def test_inspect_verifies_selected_python_and_allows_sibling_workers(self):
         from vaws_coordinator.backend import RemoteBackend
 
         backend = RemoteBackend()
-        for rows, idle in [("PID STAT COMMAND\n123 S sleep\n", True),
-                           ("PID STAT COMMAND\n123 Z python\n124 S sleep\n", True),
-                           ("PID STAT COMMAND\n123 S python\n", False),
-                           ("PID STAT COMMAND\n", False),
-                           ("PID STAT COMMAND\nbroken\n", False)]:
-            commands = []
+        spec = runtime_spec(1, user="alice")
+        commands = []
 
-            def bash(target, command):
-                commands.append(command)
-                if command.startswith("docker inspect"):
-                    return json.dumps({"Id": "container-1", "State": {"Running": True}})
-                if command.startswith("docker top"):
-                    self.assertTrue(command.endswith("-eo pid,stat,comm"))
-                    return rows
-                if command.startswith("ss "):
-                    return ""
-                return json.dumps({"profile": {"launch_env": {}}})
+        def bash(target, command):
+            commands.append(command)
+            if "docker inspect" in command:
+                return json.dumps({"Id": "container-alice", "State": {"Running": True}})
+            return json.dumps({"profile": {"launch_env": {}}, "profile_key": "profile-a", "build_key": "native-a"})
 
-            with self.subTest(rows=rows), mock.patch.object(backend, "bash", side_effect=bash), mock.patch("vaws_coordinator.backend.launch_preamble", return_value=""):
-                if idle:
-                    self.assertEqual(backend.inspect(runtime_spec(1), idle=True)["container_id"], "container-1")
-                else:
-                    with self.assertRaisesRegex(RuntimeError, "not an idle"):
-                        backend.inspect(runtime_spec(1), idle=True)
-                    self.assertEqual(len(commands), 2)
+        with mock.patch.object(backend, "bash", side_effect=bash), mock.patch("vaws_coordinator.backend.launch_preamble", return_value=""):
+            observed = backend.inspect(spec, idle=True)
+        self.assertEqual(observed["container_id"], "container-alice")
+        self.assertTrue(any(spec["python"] in command for command in commands))
+        self.assertFalse(any("docker top" in command for command in commands))
+        self.assertFalse(any(command.startswith("ss ") for command in commands))
+
+        def stopped(target, command):
+            if "docker inspect" in command:
+                return json.dumps({"Id": "container-alice", "State": {"Running": False}})
+            raise AssertionError("profile probe must not run for a stopped container")
+
+        with mock.patch.object(backend, "bash", side_effect=stopped):
+            with self.assertRaisesRegex(RuntimeError, "not running"):
+                backend.inspect(spec, idle=True)
 
     def test_bash_failure_carries_outcome_and_bounded_stderr_without_command(self):
         from vaws_coordinator.backend import RemoteBackend
@@ -181,6 +257,20 @@ class BackendTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "blocked/cwd_outside_root"):
                 RemoteBackend(shell=FakeShell(blocked)).bash(target, "true")
 
+    def test_remote_prepare_refuses_donor_python_and_requires_sources(self):
+        from vaws_coordinator.backend import RemoteBackend
+
+        backend = RemoteBackend()
+        spec = runtime_spec(1, user="alice")
+        with self.assertRaisesRegex(ValueError, "donor"):
+            backend.prepare_task_root(spec, sources={"vllm": "/a", "vllm-ascend": "/b"},
+                                      environment={"recipe": "rc"}, donor_python=spec["python"])
+        spec = runtime_spec(1, user="alice", python="/vllm-workspace/tasks/s/h/r/.venv/bin/python",
+                            root="/vllm-workspace/tasks/s/h/r")
+        with self.assertRaisesRegex(ValueError, "worktrees"):
+            backend.prepare_task_root(spec, sources={}, environment={"recipe": "rc"},
+                                      donor_python="/opt/alice/venvs/root-1/bin/python")
+
 
 class PoolTests(unittest.TestCase):
     def setUp(self):
@@ -189,8 +279,8 @@ class PoolTests(unittest.TestCase):
         _init_git_workspace(self.root)
         self.backend = Backend(self.root / "host")
         self.pool = RuntimePool(self.root / "manager", self.backend)
-        self.pool.register("runtime-a", runtime_spec(1))
-        self.pool.register("runtime-b", runtime_spec(2))
+        self.pool.register("runtime-a", runtime_spec(1, user="alice"))
+        self.pool.register("runtime-b", runtime_spec(1, user="bob"))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -220,16 +310,15 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(self.bind("alice", self.root / "a")["id"], binding["id"])
         with self.assertRaises(PermissionError):
             self.pool.return_runtime("bob", binding["id"])
-        with self.assertRaises(ValueError):
-            self.pool.register("duplicate", runtime_spec(1))
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.pool.register("duplicate", runtime_spec(1, user="alice"))
         session = self.pool.session_open("bob", "other", {"va": str(self.root / "b")})
         miss = self.pool.checkout("bob", session["id"], "missing", "missing")
         self.assertEqual(miss["status"], "cache_miss")
         self.assertFalse(miss["provisioning_started"])
-        spec = runtime_spec(3)
-        spec["service_ports"] = [48001]
+        conflict = runtime_spec(2, user="bob", service_ports=[46001])
         with self.assertRaisesRegex(ValueError, "ports overlap"):
-            self.pool.register("port-conflict", spec)
+            self.pool.register("port-conflict", conflict)
 
     def test_yield_acceptance_and_timeout_never_release_or_reassign(self):
         binding = self.bind("alice", self.root / "a")
@@ -331,7 +420,7 @@ class PoolTests(unittest.TestCase):
         binding = self.bind("alice", self.root / "a")
         run = self.request("alice", binding)
         import sqlite3
-        with sqlite3.connect(self.backend.state / "coordinator.sqlite3") as db:
+        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
             db.execute("UPDATE meta SET value='new-epoch' WHERE key='coordination_epoch'")
         result = self.pool.control("alice", run["id"], "release")
         self.assertEqual(result["state"], "uncertain")
@@ -343,8 +432,9 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(self.pool.return_runtime("alice", binding["id"])["runtime_state"], "needs_repair")
         session = self.pool.session_open("bob", "bob-session", {"va": str(self.root / "b")})
         self.assertEqual(self.pool.checkout("bob", session["id"], "profile-a", "bob", binding["runtime_id"])["status"], "cache_miss")
-        self.pool.register(binding["runtime_id"], runtime_spec(1))
-        self.assertEqual(self.pool.checkout("bob", session["id"], "profile-a", "bob", binding["runtime_id"])["state"], "bound")
+        self.pool.register(binding["runtime_id"], runtime_spec(1, user="alice"))
+        self.assertEqual(self.pool.checkout("bob", session["id"], "profile-a", "bob", binding["runtime_id"])["status"], "cache_miss")
+        self.assertEqual(self.pool.checkout("alice", binding["intent"]["session"], "profile-a", "alice-again", binding["runtime_id"])["state"], "bound")
 
     def test_repeated_free_probe_requires_visibility_in_every_sample(self):
         samples = iter([{"status": "ok", "devices": [1], "busy": {}}, {"status": "ok", "devices": [0, 1], "busy": {}}])
@@ -369,10 +459,10 @@ class PoolTests(unittest.TestCase):
         self.pool.managed_control("alice", first["id"], "stop")
         ended = self.pool.managed_control("alice", first["id"])
         self.assertEqual(ended["state"], "cancelled")
-        self.assertTrue(ended["runtime_returned"])
+        self.assertFalse(ended.get("runtime_returned"))
         self.assertEqual(self.pool.status("bob")["jobs"][0]["state"], "running")
         self.assertFalse(self.backend.jobs[second["job_id"]]["quiet"])
-        self.assertEqual(next(row for row in self.pool.catalog() if row["runtime_id"] == a["runtime_id"])["state"], "ready")
+        self.assertEqual(next(row for row in self.pool.catalog() if row["runtime_id"] == a["runtime_id"])["state"], "bound")
 
     def test_managed_stop_is_not_overwritten_by_an_inflight_advance(self):
         import threading
@@ -485,7 +575,7 @@ class PoolTests(unittest.TestCase):
         job = self.managed("alice", binding)
         self.assertEqual(job["state"], "running")
         import sqlite3
-        with sqlite3.connect(self.backend.state / "coordinator.sqlite3") as db:
+        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
             db.execute("UPDATE tasks SET state='orphaned_busy'")
         self.backend.calls.clear()
         recovered = self.pool.managed_control("alice", job["id"])
@@ -518,7 +608,7 @@ class PoolTests(unittest.TestCase):
         binding = self.bind("alice", self.root / "a")
         job = self.managed("alice", binding)
         import sqlite3
-        with sqlite3.connect(self.backend.state / "coordinator.sqlite3") as db:
+        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
             db.execute("UPDATE meta SET value='new-epoch' WHERE key='coordination_epoch'")
         wedged = self.pool.managed_control("alice", job["id"])
         self.assertEqual(wedged["state"], "uncertain")
@@ -548,8 +638,12 @@ class PoolTests(unittest.TestCase):
         self.pool.managed_control("alice", job["id"], "stop")
         self.pool.managed_control("alice", job["id"])
         runtime = next(row for row in self.pool.catalog() if row["runtime_id"] == binding["runtime_id"])
+        self.assertEqual(runtime["state"], "bound")
+        self.assertTrue(runtime["draining"])
+        self.pool.return_runtime("alice", binding["id"])
+        runtime = next(row for row in self.pool.catalog() if row["runtime_id"] == binding["runtime_id"])
         self.assertEqual(runtime["state"], "draining")
-        self.pool.register(binding["runtime_id"], runtime_spec(1))
+        self.pool.register(binding["runtime_id"], runtime_spec(1, user="alice"))
         self.assertFalse(next(row for row in self.pool.catalog() if row["runtime_id"] == binding["runtime_id"])["draining"])
 
     def test_a_hung_host_probe_blocks_only_its_own_runtime(self):
@@ -558,7 +652,7 @@ class PoolTests(unittest.TestCase):
         original = self.backend.inspect
 
         def inspect(runtime, **kwargs):
-            if runtime.get("container_name") == "prepared-1":
+            if runtime.get("container_name") == "vaws-alice":
                 entered.set()
                 release.wait(10)
             return original(runtime, **kwargs)
@@ -579,7 +673,7 @@ class PoolTests(unittest.TestCase):
 
     def test_concurrent_checkout_races_never_double_bind_a_runtime(self):
         pool = RuntimePool(self.root / "single", self.backend)
-        pool.register("runtime-c", runtime_spec(3))
+        pool.register("runtime-c", runtime_spec(3, user="alice"))
         session = pool.session_open("alice", "race-session", {"va": str(self.root / "r")})
         with ThreadPoolExecutor(4) as workers:
             results = list(workers.map(lambda index: pool.checkout("alice", session["id"], "profile-a", "race-" + str(index)), range(4)))
@@ -595,14 +689,14 @@ class PoolTests(unittest.TestCase):
     def test_concurrent_conflicting_registration_has_exactly_one_winner(self):
         def attempt(index):
             try:
-                return self.pool.register("duplicate-" + str(index), runtime_spec(9))
+                return self.pool.register("duplicate-" + str(index), runtime_spec(9, user="alice"))
             except ValueError as exc:
                 return str(exc)
 
         with ThreadPoolExecutor(2) as workers:
             results = list(workers.map(attempt, range(2)))
         self.assertEqual(sum(isinstance(row, dict) for row in results), 1)
-        self.assertTrue(any(isinstance(row, str) and "already registered" in row for row in results))
+        self.assertTrue(any(isinstance(row, str) and "overlap" in row for row in results))
 
     def test_never_submitted_pending_run_cancels_and_expires_while_host_stays_down(self):
         import time
@@ -635,12 +729,14 @@ class PoolTests(unittest.TestCase):
         self.pool.return_runtime("alice", binding["id"])
         with self.assertRaisesRegex(ValueError, "returned binding"):
             self.bind("alice", self.root / "a")
+        self.pool.register("runtime-a2", runtime_spec(2, user="alice"))
         fresh = self.pool.checkout("alice", binding["intent"]["session"], "profile-a", "checkout-2")
         self.assertEqual(fresh["state"], "bound")
         self.assertNotEqual(fresh["id"], binding["id"])
         # The returned runtime stays quarantined; the fresh request binds the
-        # other ready runtime instead of replaying the dead binding.
+        # other ready root in the same user container.
         self.assertNotEqual(fresh["runtime_id"], binding["runtime_id"])
+        self.assertEqual(fresh["container_name"], binding["container_name"])
         quarantined = next(row for row in self.pool.catalog() if row["runtime_id"] == binding["runtime_id"])
         self.assertEqual(quarantined["state"], "needs_repair")
 
@@ -661,13 +757,14 @@ class PoolTests(unittest.TestCase):
 
         def inspect(runtime, **kwargs):
             observed = original(runtime, **kwargs)
-            if runtime.get("container_name") == "prepared-1":
+            if runtime.get("container_name") == "vaws-alice" and runtime["endpoint"]["cwd"].endswith("/1"):
                 observed["build_key"] = "drifted"
             return observed
 
         self.backend.inspect = inspect
+        self.pool.register("runtime-a2", runtime_spec(2, user="alice"))
         binding = self.bind("alice", self.root / "a")
-        self.assertEqual(binding["runtime_id"], "runtime-b")
+        self.assertEqual(binding["runtime_id"], "runtime-a2")
         drifted = next(row for row in self.pool.catalog() if row["runtime_id"] == "runtime-a")
         self.assertEqual(drifted["state"], "needs_repair")
         self.assertIn("prepared environment changed", drifted["error"])
@@ -712,6 +809,788 @@ class PoolTests(unittest.TestCase):
         self.assertTrue(result["event"]["force_release"])
         self.assertIn("no job directory", result["event"]["evidence"])
         self.assertEqual(self.pool.return_runtime("alice", binding["id"])["status"], "returned")
+
+    def _host_ports(self):
+        import sqlite3
+        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
+            return [(row[0], row[1], row[2]) for row in db.execute("SELECT port, kind, task_id FROM ports ORDER BY port")]
+
+    def test_two_successive_managed_jobs_reuse_the_user_container(self):
+        binding = self.bind("alice", self.root / "a")
+        first = self.managed("alice", binding, request_id="run-1")
+        self.pool.managed_control("alice", first["id"], "stop")
+        ended = self.pool.managed_control("alice", first["id"])
+        self.assertEqual(ended["state"], "cancelled")
+        runtime = next(row for row in self.pool.catalog() if row["runtime_id"] == binding["runtime_id"])
+        self.assertEqual(runtime["state"], "bound")
+        self.assertEqual(runtime["container_name"], "vaws-alice")
+        second = self.managed("alice", binding, request_id="run-2")
+        self.assertEqual(second["state"], "running")
+        self.assertEqual(binding["endpoint"]["port"], binding["endpoint"]["port"])
+        self.assertEqual(binding["container_name"], "vaws-alice")
+        self.assertIn((46001, "container_ssh", "ssh.alice"), self._host_ports())
+
+    def test_service_stop_releases_port_and_keeps_container_ssh(self):
+        binding = self.bind("alice", self.root / "a")
+        job = self.pool.managed_start("alice", binding["id"], "serve",
+                                      {"vllm": "a" * 40, "vllm-ascend": "b" * 40},
+                                      "native-a", [0], 0, "exec python serve.py", {}, None, service_port=0)
+        self.assertEqual(job["state"], "running")
+        self.assertEqual(job["service_port"], 48001)
+        self.assertEqual(job["environment"]["VAWS_SERVICE_PORT"], "48001")
+        self.assertIn((48001, "service", job["request"] and self.pool.status("alice")["runs"][0]["task_id"]), self._host_ports())
+        self.assertIn((46001, "container_ssh", "ssh.alice"), self._host_ports())
+        self.backend.listening = [48001]
+        stopping = self.pool.managed_control("alice", job["id"], "stop")
+        self.assertIn(stopping["state"], {"stopping", "releasing", "cancelled"})
+        still = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(still["lease_state"], "orphaned_busy")
+        self.assertIn((48001, "service", self.pool.status("alice")["runs"][0]["task_id"]), self._host_ports())
+        self.backend.listening = []
+        ended = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(ended["state"], "cancelled")
+        ports = self._host_ports()
+        self.assertIn((46001, "container_ssh", "ssh.alice"), ports)
+        self.assertFalse(any(kind == "service" for _, kind, _ in ports))
+
+    def test_two_roots_in_one_container_run_concurrently_and_stop_is_scoped(self):
+        second_root = self.pool.register("runtime-a2", runtime_spec(2, user="alice", python="/opt/alice/venvs/root-2/bin/python"))
+        alice = self.bind("alice", self.root / "a")
+        other_session = self.pool.session_open("alice", "second-task", {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "va")})
+        other = self.pool.checkout("alice", other_session["id"], "profile-a", "other-root", "runtime-a2")
+        first = self.managed("alice", alice, device=0, request_id="root-1")
+        second = self.managed("alice", other, device=1, request_id="root-2")
+        self.assertEqual((first["state"], second["state"]), ("running", "running"))
+        self.assertEqual(alice["container_name"], other["container_name"])
+        self.assertEqual(alice["endpoint"]["port"], other["endpoint"]["port"])
+        self.assertNotEqual(alice["endpoint"]["cwd"], other["endpoint"]["cwd"])
+        self.assertEqual(other["python"], "/opt/alice/venvs/root-2/bin/python")
+        self.pool.managed_control("alice", first["id"], "stop")
+        ended = self.pool.managed_control("alice", first["id"])
+        self.assertEqual(ended["state"], "cancelled")
+        peer = self.pool.status("alice")["jobs"]
+        live = next(row for row in peer if row["id"] == second["id"])
+        self.assertEqual(live["state"], "running")
+        self.assertFalse(self.backend.jobs[second["job_id"]]["quiet"])
+        self.assertEqual(second_root["container_name"], "vaws-alice")
+        self.assertIn((46001, "container_ssh", "ssh.alice"), self._host_ports())
+
+    def test_wrong_owner_and_stale_fence_cannot_mutate_another_run(self):
+        binding = self.bind("alice", self.root / "a")
+        job = self.managed("alice", binding)
+        with self.assertRaises(PermissionError):
+            self.pool.managed_control("bob", job["id"], "stop")
+        run = self.pool.status("alice")["runs"][0]
+        with self.assertRaises(CoordinationError):
+            self.backend.host(runtime_spec(1, user="alice"), {
+                "action": "release", "task_id": run["task_id"],
+                "fence_token": run["task"]["fence_token"] + 1,
+                "coordination_epoch": run["epoch"], "completion_confirmed": True,
+            })
+        self.assertEqual(self.pool.managed_control("alice", job["id"])["state"], "running")
+
+
+class TaskClientTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        _init_git_workspace(self.root)
+        for name in ("vllm", "vllm-ascend"):
+            _init_git_workspace(self.root / name)
+        self.backend = Backend(self.root / "host")
+        self.backend.require_prepared = True
+        self.pool = RuntimePool(self.root / "manager", self.backend)
+        self._seed(self.pool, "runtime-a", runtime_spec(1, user="alice", recipe="rc"))
+        from vaws_coordinator.agent_session import AgentSessions
+        from vaws_coordinator.task_client import TaskClient
+        self.store = AgentSessions(self.root / "sessions")
+        self.context = self.store.attach("codex", "native-alice", str(self.root))
+        self.store.bind_sources(self.context, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
+        self.client = TaskClient(self.context["context_file"], pool=self.pool, user="alice")
+        self.client.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+
+    def _seed(self, pool, runtime_id, spec):
+        self.backend.mark_prepared(spec)
+        return pool.register(runtime_id, spec)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_run_observe_and_target_expose_user_container_and_selected_python(self):
+        reply = self.client.run("true")
+        self.assertEqual(reply["state"], "running")
+        self.assertTrue(reply["target"]["live"])
+        self.assertEqual(reply["target"]["user"], "alice")
+        self.assertEqual(reply["target"]["container_name"], "vaws-alice")
+        self.assertEqual(reply["target"]["python"], runtime_spec(1, user="alice")["python"])
+        self.assertEqual(reply["target"]["endpoint"]["cwd"], "/vllm-workspace/alice/1")
+        observed = self.client.observe(reply["execution_id"], "target")
+        self.assertEqual(observed["target"]["runtime_id"], "runtime-a")
+        self.assertEqual(self.client.target(reply["execution_id"])["container_id"], "cid-vaws-alice")
+
+    def test_finish_closes_admission_before_a_new_run(self):
+        first = self.client.run("true")
+        self.assertEqual(first["state"], "running")
+        finished = self.client.finish()
+        self.assertEqual(finished["state"], "finished")
+        with self.assertRaisesRegex(ValueError, "resume the task"):
+            self.client.run("true")
+
+    def test_unknown_observation_retains_ownership_then_retry_completes(self):
+        reply = self.client.run("true")
+        original = self.backend.job
+
+        def once_unknown(runtime, identifier, action, **params):
+            if action == "status":
+                return {"state": "uncertain", "quiet": False, "reason": "probe failed"}
+            return original(runtime, identifier, action, **params)
+
+        self.backend.job = once_unknown
+        held = self.client.observe(reply["execution_id"])
+        self.assertEqual(held["state"], "uncertain")
+        self.backend.job = original
+        recovered = self.client.observe(reply["execution_id"])
+        self.assertEqual(recovered["state"], "running")
+        self.assertEqual(recovered["execution_id"], reply["execution_id"])
+
+    def test_two_executions_keep_task_root_and_other_task_cannot_overwrite(self):
+        first = self.client.run("true")
+        self.client.observe(first["execution_id"], "stop")
+        second = self.client.run("sleep 1")
+        self.assertEqual(second["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
+        other_context = self.store.attach("codex", "native-alice-2", str(self.root))
+        self.store.bind_sources(other_context, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
+        from vaws_coordinator.task_client import TaskClient
+        other = TaskClient(other_context["context_file"], pool=self.pool, user="alice")
+        other.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+        stolen = other.run("true")
+        stolen_cwd = (stolen.get("target") or {}).get("endpoint", {}).get("cwd")
+        self.assertNotEqual(stolen_cwd, second["target"]["endpoint"]["cwd"])
+
+    def test_queued_execution_advances_after_frontend_is_gone(self):
+        from vaws_coordinator.task_client import TaskClient
+        empty = RuntimePool(self.root / "manager-empty", self.backend)
+        client = TaskClient(self.context["context_file"], pool=empty, user="alice")
+        client.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+        queued = client.run("true")
+        self.assertEqual(queued["state"], "waiting_for_runtime")
+        execution_id = queued["execution_id"]
+        self._seed(empty, "runtime-late", runtime_spec(1, user="alice", recipe="rc"))
+        client.coordinator.reconcile()
+        advanced = client.observe(execution_id)
+        self.assertEqual(advanced["state"], "running")
+        self.assertTrue(advanced["target"]["live"])
+
+    def test_two_role_request_runs_both_or_neither(self):
+        self._seed(self.pool, "runtime-b-host", runtime_spec(3, user="alice", host="192.0.2.8", recipe="rc"))
+        topology = {"roles": [{"name": "prefill", "npu_count": 1, "command": "run-prefill"},
+                              {"name": "decode", "npu_count": 1, "command": "run-decode"}]}
+        both = self.client.run("unused", topology=topology)
+        self.assertEqual(both["state"], "running")
+        self.assertEqual(len(both["roles"]), 2)
+        self.assertEqual({row["name"] for row in both["roles"]}, {"prefill", "decode"})
+        self.assertEqual({row["state"] for row in both["roles"]}, {"running"})
+        hosts = {row["host"] for row in both["assignment"]["roles"]}
+        self.assertEqual(len(hosts), 2)
+        lone = RuntimePool(self.root / "manager-one-host", self.backend)
+        self._seed(lone, "only-a", runtime_spec(1, user="alice", recipe="rc"))
+        from vaws_coordinator.task_client import TaskClient
+        other_ctx = self.store.attach("codex", "native-alice-group", str(self.root))
+        self.store.bind_sources(other_ctx, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
+        client = TaskClient(other_ctx["context_file"], pool=lone, user="alice")
+        client.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+        neither = client.run("unused", topology={**topology, "distinct_hosts": True})
+        self.assertNotEqual(neither["state"], "running")
+        self.assertTrue(neither["state"] in {"waiting_for_runtime", "waiting", "queued"})
+        self.assertIsNone(neither.get("roles"))
+
+    def test_incompatible_environment_is_not_silently_used(self):
+        missed = self.client.run("true", environment={"recipe": "stable"})
+        self.assertEqual(missed["state"], "waiting_for_runtime")
+        self.assertIn("environment", missed.get("reason") or "")
+
+    def test_named_service_reconnects_same_spec_and_restart_replaces(self):
+        first = self.client.run("serve-vllm", service="vllm", timeout_seconds=None)
+        self.assertEqual(first["state"], "running")
+        again = self.client.run("serve-vllm", service="vllm", timeout_seconds=None)
+        self.assertEqual(again["execution_id"], first["execution_id"])
+        with self.assertRaisesRegex(ValueError, "different command"):
+            self.client.run("serve-other", service="vllm", timeout_seconds=None)
+        replaced = self.client.run("serve-other", service="vllm", timeout_seconds=None, restart=True)
+        self.assertNotEqual(replaced["execution_id"], first["execution_id"])
+        self.assertEqual(replaced["state"], "running")
+        same = self.client.run("serve-other", service="vllm", timeout_seconds=None, restart=True)
+        self.assertNotEqual(same["execution_id"], replaced["execution_id"])
+        self.assertEqual(same["state"], "running")
+
+    def test_target_refreshes_owned_job_after_pool_finishes(self):
+        reply = self.client.run("true")
+        self.assertTrue(reply["target"]["live"])
+        job_id = self.store.executions(self.context["session"]["id"])[0]["roles"][0]["observation"]["job_id"]
+        self.backend.jobs[job_id].update(state="succeeded", quiet=True, result={"state": "succeeded", "exit_code": 0})
+        target = self.client.target(reply["execution_id"])
+        self.assertEqual(target["state"], "succeeded")
+        self.assertFalse(target["live"])
+
+    def test_finishing_attach_does_not_reopen_admission(self):
+        first = self.client.run("true")
+        self.assertEqual(first["state"], "running")
+        with self.store.transaction() as db:
+            session = self.store.get(db, "session", self.context["session"]["id"])
+            session["state"] = "finishing"
+            self.store.put(db, "session", session)
+        with self.assertRaisesRegex(ValueError, "wait for the coordinator to complete cleanup"):
+            self.store.attach("codex", "native-alice", str(self.root))
+        retry = self.client.finish()
+        self.assertIn(retry["state"], {"finished", "finishing"})
+        if retry["state"] == "finished":
+            reopened = self.store.attach("codex", "native-alice", str(self.root))
+            self.assertEqual(reopened["session"]["state"], "open")
+
+    def test_register_empty_root_is_rejected_when_prepared_boundary_enforced(self):
+        with self.assertRaisesRegex(ValueError, "ready-profile"):
+            self.pool.register("empty-root", runtime_spec(9, user="alice", root="/empty/unprepared"))
+
+    def test_prepare_creates_isolated_interpreter_not_donor_python(self):
+        first = self.client.run("true")
+        donor_python = first["target"]["python"]
+        other_context = self.store.attach("codex", "native-alice-prep", str(self.root))
+        self.store.bind_sources(other_context, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
+        from vaws_coordinator.task_client import TaskClient
+        other = TaskClient(other_context["context_file"], pool=self.pool, user="alice")
+        other.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+        prepared = other.run("true")
+        self.assertEqual(prepared["state"], "running")
+        self.assertNotEqual(prepared["target"]["python"], donor_python)
+        self.assertTrue(str(prepared["target"]["python"]).endswith("/.venv/bin/python"))
+        self.assertIn("/tasks/", prepared["target"]["endpoint"]["cwd"])
+        self.assertNotEqual(prepared["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
+
+    def test_existing_binding_is_reused_for_the_same_task(self):
+        first = self.client.run("true")
+        binding_id = first["target"]["binding_id"]
+        runtime_id = first["target"]["runtime_id"]
+        self.client.observe(first["execution_id"], "stop")
+        second = self.client.run("sleep 1")
+        self.assertEqual(second["state"], "running")
+        self.assertEqual(second["target"]["binding_id"], binding_id)
+        self.assertEqual(second["target"]["runtime_id"], runtime_id)
+
+    def test_role_host_constrains_auto_preparation(self):
+        first = self.client.run("true")
+        self.assertEqual(first["target"]["endpoint"]["host"], "192.0.2.1")
+        missed = self.client.run(
+            "true",
+            topology={"roles": [{"name": "decode", "npu_count": 1, "host": "192.0.2.8"}]},
+        )
+        self.assertEqual(missed["state"], "waiting_for_runtime")
+        self.assertIsNone(missed.get("target"))
+
+    def test_missing_hardware_facts_are_not_a_match(self):
+        missed = self.client.run("true", environment={"cann": "8.0.0"})
+        self.assertEqual(missed["state"], "waiting_for_runtime")
+
+    def test_two_role_success_and_mixed_failure_aggregate(self):
+        self._seed(self.pool, "runtime-b-host", runtime_spec(3, user="alice", host="192.0.2.8", recipe="rc"))
+        topology = {"roles": [{"name": "prefill", "npu_count": 1, "command": "run-prefill"},
+                              {"name": "decode", "npu_count": 1, "command": "run-decode"}]}
+        both = self.client.run("unused", topology=topology)
+        self.assertEqual(both["state"], "running")
+        row = self.store.executions(self.context["session"]["id"])[-1]
+        for role in row["roles"]:
+            self.backend.jobs[role["observation"]["job_id"]].update(
+                state="succeeded", quiet=True, result={"state": "succeeded", "exit_code": 0})
+        succeeded = self.client.observe(both["execution_id"])
+        self.assertEqual(succeeded["state"], "succeeded")
+        again = self.client.run("unused", topology=topology)
+        self.assertEqual(again["state"], "running")
+        row = self.store.executions(self.context["session"]["id"])[-1]
+        jobs = [role["observation"]["job_id"] for role in row["roles"]]
+        self.backend.jobs[jobs[0]].update(state="succeeded", quiet=True, result={"state": "succeeded", "exit_code": 0})
+        self.backend.jobs[jobs[1]].update(state="failed", quiet=True, result={"state": "failed", "exit_code": 1})
+        mixed = self.client.observe(again["execution_id"])
+        self.assertEqual(mixed["state"], "failed")
+
+    def test_same_task_does_not_materialize_concurrently(self):
+        started = threading.Event()
+        release = threading.Event()
+        syncs = []
+        original = self.client.coordinator.sync_binding
+
+        def blocked(*args, **kwargs):
+            syncs.append(threading.current_thread().name)
+            if len(syncs) == 1:
+                started.set()
+                self.assertTrue(release.wait(3))
+            return original(*args, **kwargs)
+
+        self.client.coordinator.sync_binding = blocked
+        first = {}
+
+        def run_first():
+            first["reply"] = self.client.run("true")
+
+        worker = threading.Thread(target=run_first)
+        worker.start()
+        self.assertTrue(started.wait(3))
+        second = self.client.run("sleep 1")
+        self.assertEqual(second["state"], "waiting")
+        self.assertEqual(len(syncs), 1)
+        release.set()
+        worker.join(5)
+        self.assertEqual(first["reply"]["state"], "running")
+
+    def test_restart_does_not_overlap_while_stop_is_stopping(self):
+        first = self.client.run("serve-vllm", service="vllm", timeout_seconds=None)
+        original = self.backend.job
+
+        def sticky(runtime, job_id, action, **params):
+            if action == "stop":
+                self.backend.jobs[job_id].update(state="stopping", quiet=False)
+                return copy.deepcopy(self.backend.jobs[job_id])
+            return original(runtime, job_id, action, **params)
+
+        self.backend.job = sticky
+        from vaws_coordinator import service as service_mod
+        with mock.patch.object(service_mod, "STOP_WAIT_SECONDS", 0.2):
+            reply = self.client.run("serve-vllm", service="vllm", timeout_seconds=None, restart=True)
+        self.assertEqual(reply["execution_id"], first["execution_id"])
+        self.assertEqual(reply["state"], "stopping")
+        live = [row for row in self.store.executions(self.context["session"]["id"]) if row.get("phase") not in {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}]
+        self.assertEqual(len(live), 1)
+
+    def test_stop_during_delayed_preparation_does_not_launch(self):
+        self.client.coordinator._async_progress = True
+        started = threading.Event()
+        release = threading.Event()
+        original = self.client.coordinator.sync_binding
+
+        def delayed(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return original(*args, **kwargs)
+
+        self.client.coordinator.sync_binding = delayed
+        admitted = self.client.run("true")
+        self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+        self.assertEqual(len(admitted["execution_id"]), 64)
+        self.assertTrue(started.wait(3))
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+        stopped = self.client.observe(admitted["execution_id"], "stop")
+        self.assertNotEqual(stopped["state"], "running")
+        self.assertNotEqual(stopped["state"], "cancelled")
+        self.assertTrue(stopped.get("cancel_requested"))
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+        release.set()
+        lock = self.client.coordinator._lock_for("execution", admitted["execution_id"])
+        deadline = time.time() + 5
+        while lock.locked() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(lock.locked())
+        final = self.client.observe(admitted["execution_id"])
+        self.assertEqual(final["state"], "cancelled")
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+        self.assertFalse(any(job.get("state") not in {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
+                             for job in self.pool.status("alice")["jobs"]))
+
+    def test_group_stop_during_delayed_preparation_keeps_gates_closed(self):
+        self._seed(self.pool, "runtime-a2", runtime_spec(2, user="alice", recipe="rc"))
+        self.client.coordinator._async_progress = True
+        started = threading.Event()
+        release = threading.Event()
+        original = self.client.coordinator.sync_binding
+
+        def delayed(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return original(*args, **kwargs)
+
+        self.client.coordinator.sync_binding = delayed
+        admitted = self.client.run(
+            "unused",
+            topology={"roles": [{"name": "prefill", "npu_count": 1, "host": "192.0.2.1"},
+                                {"name": "decode", "npu_count": 1, "host": "192.0.2.1"}]},
+        )
+        self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+        self.assertEqual(len(admitted["execution_id"]), 64)
+        self.assertTrue(started.wait(3))
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+        self.client.observe(admitted["execution_id"], "stop")
+        release.set()
+        lock = self.client.coordinator._lock_for("execution", admitted["execution_id"])
+        deadline = time.time() + 5
+        while lock.locked() and time.time() < deadline:
+            time.sleep(0.02)
+        final = self.client.observe(admitted["execution_id"])
+        self.assertEqual(final["state"], "cancelled")
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+
+    def test_finish_during_delayed_preparation_completes_on_ticker_without_retry(self):
+        from vaws_coordinator import service as service_mod
+
+        self.client.coordinator._async_progress = True
+        started = threading.Event()
+        release = threading.Event()
+        original = self.client.coordinator.sync_binding
+
+        def delayed(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return original(*args, **kwargs)
+
+        self.client.coordinator.sync_binding = delayed
+        with mock.patch.object(service_mod, "TICK_SECONDS", 0.05):
+            ticker = threading.Thread(target=self.client.coordinator._tick_loop, daemon=True)
+            ticker.start()
+            try:
+                admitted = self.client.run("true")
+                self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+                self.assertEqual(len(admitted["execution_id"]), 64)
+                self.assertTrue(started.wait(3))
+                self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+                reply = self.client.finish()
+                self.assertEqual(reply["state"], "finishing")
+                session_id = self.context["session"]["id"]
+                with self.store.transaction() as db:
+                    session = self.store.get(db, "session", session_id)
+                self.assertEqual(session["state"], "finishing")
+                self.assertEqual(session["finish"]["user"], "alice")
+                self.assertFalse(session["finish"]["force"])
+                release.set()
+                lock = self.client.coordinator._lock_for("execution", admitted["execution_id"])
+                deadline = time.time() + 5
+                while lock.locked() and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(lock.locked())
+                state = None
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    with self.store.transaction() as db:
+                        state = self.store.get(db, "session", session_id)["state"]
+                    if state == "finished":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(state, "finished")
+                rows = self.store.executions(session_id)
+                self.assertEqual([row["phase"] for row in rows], ["cancelled"])
+                remote = rows[0]["remote_session"]["id"]
+                self.assertEqual(self.pool.session_bindings("alice", remote), [])
+                self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+            finally:
+                release.set()
+                self.client.coordinator._stopped.set()
+                ticker.join(timeout=2.5)
+
+    def test_persisted_finishing_task_completes_after_coordinator_restart(self):
+        from vaws_coordinator.service import CoordinatorService
+
+        self.client.coordinator._async_progress = True
+        started = threading.Event()
+        release = threading.Event()
+        original = self.client.coordinator.sync_binding
+
+        def delayed(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return original(*args, **kwargs)
+
+        self.client.coordinator.sync_binding = delayed
+        admitted = self.client.run("true")
+        self.assertTrue(started.wait(3))
+        reply = self.client.finish()
+        self.assertEqual(reply["state"], "finishing")
+        release.set()
+        lock = self.client.coordinator._lock_for("execution", admitted["execution_id"])
+        deadline = time.time() + 5
+        while lock.locked() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(lock.locked())
+        session_id = self.context["session"]["id"]
+        with self.store.transaction() as db:
+            session = self.store.get(db, "session", session_id)
+        self.assertEqual(session["state"], "finishing")
+        self.assertEqual(session["finish"]["user"], "alice")
+        rows = self.store.executions(session_id)
+        self.assertEqual(rows[0]["phase"], "cancelled")
+        remote = rows[0]["remote_session"]["id"]
+        self.assertTrue(self.pool.session_bindings("alice", remote))
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+        restarted = CoordinatorService(
+            self.client.coordinator.state_dir, pool=self.pool, backend=self.backend,
+        )
+        self.assertIn(str(self.store.state_dir), restarted._session_dirs)
+        restarted._dispatch_progress()
+        with self.store.transaction() as db:
+            session = self.store.get(db, "session", session_id)
+        self.assertEqual(session["state"], "finished")
+        self.assertEqual(self.pool.session_bindings("alice", remote), [])
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+
+    def test_same_host_roles_keep_separate_roots_and_literal_env(self):
+        self._seed(self.pool, "runtime-a2", runtime_spec(2, user="alice", recipe="rc"))
+        topology = {"roles": [
+            {"name": "prefill", "npu_count": 1, "host": "192.0.2.1", "command": "run-prefill",
+             "env": {"ROLE": "prefill"}},
+            {"name": "decode", "npu_count": 1, "host": "192.0.2.1", "command": "run-decode",
+             "env": {"ROLE": "decode"}},
+        ]}
+        both = self.client.run("unused", topology=topology)
+        self.assertEqual(both["state"], "running")
+        self.assertEqual({row["host"] for row in both["roles"]}, {"192.0.2.1"})
+        self.assertEqual(len({row["root"] for row in both["roles"]}), 2)
+        by_name = {row["name"]: row for row in both["roles"]}
+        self.assertEqual(by_name["prefill"]["env"]["ROLE"], "prefill")
+        self.assertEqual(by_name["decode"]["env"]["ROLE"], "decode")
+        self.assertTrue(by_name["prefill"]["target"]["live"])
+        self.assertNotEqual(by_name["prefill"]["endpoint"]["cwd"], by_name["decode"]["endpoint"]["cwd"])
+        tailed = self.client.observe(both["execution_id"], "tail")
+        self.assertEqual(len(tailed["roles"]), 2)
+        self.assertTrue(all(item.get("tail") or item.get("stdout") for item in tailed["roles"]))
+        decode = self.client.observe(both["execution_id"], "tail", role="decode")
+        self.assertIn("tail", decode)
+        self.assertEqual(decode["roles"][0]["name"], "decode")
+
+    def test_explicit_distinct_hosts_still_require_two_hosts(self):
+        missed = self.client.run(
+            "unused",
+            topology={"distinct_hosts": True,
+                      "roles": [{"name": "prefill", "npu_count": 1}, {"name": "decode", "npu_count": 1}]},
+        )
+        self.assertEqual(missed["state"], "waiting_for_runtime")
+
+    def test_tail_returns_logs_after_the_job_is_terminal(self):
+        reply = self.client.run("true")
+        job_id = self.store.executions(self.context["session"]["id"])[0]["roles"][0]["observation"]["job_id"]
+        self.backend.jobs[job_id]["stdout"] = "finished-log-line"
+        self.backend.jobs[job_id].update(state="succeeded", quiet=True, result={"state": "succeeded", "exit_code": 0})
+        tailed = self.client.observe(reply["execution_id"], "tail")
+        self.assertEqual(tailed["state"], "succeeded")
+        self.assertIn("finished-log-line", tailed.get("tail") or "")
+
+    def test_role_env_cannot_override_reserved_keys(self):
+        with self.assertRaisesRegex(ValueError, "managed"):
+            self.client.run("true", topology={"roles": [{"name": "prefill", "env": {"VAWS_PYTHON": "/x"}}]})
+
+
+class AggregateStateTests(unittest.TestCase):
+    def test_mixed_terminal_is_failed_and_all_succeeded_is_succeeded(self):
+        from vaws_coordinator.service import aggregate_job_states
+        self.assertEqual(aggregate_job_states(["succeeded", "failed"]), "failed")
+        self.assertEqual(aggregate_job_states(["succeeded", "succeeded"]), "succeeded")
+        self.assertEqual(aggregate_job_states(["running", "succeeded"]), "running")
+        self.assertEqual(aggregate_job_states(["uncertain", "running"]), "uncertain")
+
+
+class DaemonProcessTests(unittest.TestCase):
+    def test_short_socket_ping_start_exit_restart_and_session_dirs_persist(self):
+        from vaws_coordinator.agent_session import AgentSessions
+        from vaws_coordinator.service import CoordinatorClient, socket_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "vllm-ascend-workspace" / ".vaws-local" / "closeout" / "daemon-path-check" / "coordinator"
+            state.mkdir(parents=True)
+            sessions = Path(tmp) / "overridden-sessions"
+            AgentSessions(sessions)
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "vaws_coordinator", "daemon", "--state-dir", str(state)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env,
+            )
+            client = CoordinatorClient(state)
+            try:
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    try:
+                        self.assertEqual(client.call("ping"), None)
+                        break
+                    except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+                        time.sleep(0.05)
+                else:
+                    self.fail("daemon did not start")
+                sock = socket_path(state)
+                self.assertLessEqual(len(str(sock)), 80)
+                self.assertTrue(sock.exists())
+                with self.assertRaises(Exception):
+                    client.advance(str(sessions), "alice", "0" * 64)
+                import sqlite3
+                with sqlite3.connect(state / "coordinator.sqlite3") as db:
+                    row = db.execute("SELECT data FROM records WHERE kind='meta' AND id='session_dirs'").fetchone()
+                self.assertIsNotNone(row)
+                self.assertIn(str(sessions), json.loads(row[0])["paths"])
+                proc.terminate()
+                proc.wait(timeout=5)
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "vaws_coordinator", "daemon", "--state-dir", str(state)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env,
+                )
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    try:
+                        client.call("ping")
+                        break
+                    except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+                        time.sleep(0.05)
+                else:
+                    self.fail("daemon did not restart")
+                with sqlite3.connect(state / "coordinator.sqlite3") as db:
+                    row = db.execute("SELECT data FROM records WHERE kind='meta' AND id='session_dirs'").fetchone()
+                self.assertIn(str(sessions), json.loads(row[0])["paths"])
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                sock = socket_path(state)
+                if sock.exists():
+                    sock.unlink()
+
+    def test_admit_returns_queued_while_preparation_runs(self):
+        from vaws_coordinator.agent_session import AgentSessions
+        from vaws_coordinator.ready_runtime import RuntimePool
+        from vaws_coordinator.service import CoordinatorClient, CoordinatorService, socket_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _init_git_workspace(root)
+            for name in ("vllm", "vllm-ascend"):
+                _init_git_workspace(root / name)
+            backend = Backend(root / "host")
+            backend.require_prepared = True
+            pool = RuntimePool(root / "manager", backend)
+            spec = runtime_spec(1, user="alice", recipe="rc")
+            backend.mark_prepared(spec)
+            pool.register("runtime-a", spec)
+            sessions = AgentSessions(root / "sessions")
+            context = sessions.attach("codex", "native-async", str(root))
+            sessions.bind_sources(context, {"vllm": str(root / "vllm"), "vllm-ascend": str(root / "vllm-ascend")})
+            service = CoordinatorService(root / "coordinator", pool=pool, backend=backend, sessions=sessions)
+            started = threading.Event()
+            release = threading.Event()
+
+            def delayed(*args, **kwargs):
+                started.set()
+                self.assertTrue(release.wait(5))
+                return {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+
+            service.sync_binding = delayed
+            worker = threading.Thread(target=service.serve, daemon=True)
+            worker.start()
+            client = CoordinatorClient(root / "coordinator")
+            try:
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    try:
+                        client.call("ping")
+                        break
+                    except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+                        time.sleep(0.05)
+                else:
+                    self.fail("in-process daemon did not listen")
+                spec = {
+                    "command": "true", "env": {}, "environment": {"recipe": "rc"},
+                    "resources": {"npu_count": 1}, "topology": {},
+                    "roles": [{"name": "default", "command": "true", "npu_count": 1}],
+                    "timeout_seconds": 1800, "service": None,
+                }
+                t0 = time.time()
+                admitted = client.admit(str(sessions.state_dir), "alice", context["session"]["id"], spec)
+                self.assertLess(time.time() - t0, 0.8)
+                self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+                self.assertEqual(len(admitted["execution_id"]), 64)
+                t1 = time.time()
+                client.call("ping")
+                self.assertLess(time.time() - t1, 0.5)
+                status = client.advance(str(sessions.state_dir), "alice", admitted["execution_id"], "status")
+                self.assertEqual(status["execution_id"], admitted["execution_id"])
+                self.assertNotEqual(status["state"], "timeout")
+                self.assertTrue(started.wait(3))
+                t2 = time.time()
+                client.call("ping")
+                self.assertLess(time.time() - t2, 0.5)
+                release.set()
+                lock = service._lock_for("execution", admitted["execution_id"])
+                deadline = time.time() + 5
+                while lock.locked() and time.time() < deadline:
+                    time.sleep(0.02)
+                completed = client.advance(str(sessions.state_dir), "alice", admitted["execution_id"], "status")
+                self.assertEqual(completed["execution_id"], admitted["execution_id"])
+                self.assertEqual(completed["state"], "running")
+            finally:
+                release.set()
+                service._stopped.set()
+                worker.join(timeout=2.5)
+                sock = socket_path(root / "coordinator")
+                if sock.exists():
+                    sock.unlink()
+
+    def test_startup_with_pending_prepare_stays_responsive(self):
+        from vaws_coordinator.agent_session import AgentSessions
+        from vaws_coordinator.ready_runtime import RuntimePool
+        from vaws_coordinator.service import CoordinatorClient, CoordinatorService, socket_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _init_git_workspace(root)
+            for name in ("vllm", "vllm-ascend"):
+                _init_git_workspace(root / name)
+            backend = Backend(root / "host")
+            backend.require_prepared = True
+            pool = RuntimePool(root / "manager", backend)
+            spec = runtime_spec(1, user="alice", recipe="rc")
+            backend.mark_prepared(spec)
+            pool.register("runtime-a", spec)
+            sessions = AgentSessions(root / "sessions")
+            context = sessions.attach("codex", "native-pending", str(root))
+            sessions.bind_sources(context, {"vllm": str(root / "vllm"), "vllm-ascend": str(root / "vllm-ascend")})
+            run_spec = {
+                "command": "true", "env": {}, "environment": {"recipe": "rc"},
+                "resources": {"npu_count": 1}, "topology": {},
+                "roles": [{"name": "default", "command": "true", "npu_count": 1}],
+                "timeout_seconds": 1800, "service": None,
+            }
+            row = sessions.execution(context, "pending-prep", run_spec)
+            row.update(phase="queued", admitted=True, user="alice")
+            sessions.save_execution(row)
+            service = CoordinatorService(root / "coordinator", pool=pool, backend=backend, sessions=sessions)
+            started = threading.Event()
+            release = threading.Event()
+
+            def delayed(*args, **kwargs):
+                started.set()
+                self.assertTrue(release.wait(5))
+                return {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
+
+            service.sync_binding = delayed
+            worker = threading.Thread(target=service.serve, daemon=True)
+            worker.start()
+            client = CoordinatorClient(root / "coordinator")
+            try:
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    try:
+                        t0 = time.time()
+                        client.call("ping")
+                        self.assertLess(time.time() - t0, 0.5)
+                        break
+                    except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+                        time.sleep(0.05)
+                else:
+                    self.fail("daemon did not listen")
+                self.assertTrue(started.wait(3))
+                t1 = time.time()
+                client.call("ping")
+                self.assertLess(time.time() - t1, 0.5)
+                status = client.advance(str(sessions.state_dir), "alice", row["id"], "status")
+                self.assertEqual(status["execution_id"], row["id"])
+                self.assertNotEqual(status["state"], "timeout")
+            finally:
+                release.set()
+                service._stopped.set()
+                worker.join(timeout=2.5)
+                sock = socket_path(root / "coordinator")
+                if sock.exists():
+                    sock.unlink()
 
 
 class ProfileTests(unittest.TestCase):

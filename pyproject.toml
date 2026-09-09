@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vaws-coordinator"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local VAWS coordinator: task stdio MCP and host NPU allocation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Qi Mao" }]
 dependencies = [
-    "vaws-remote-dev>=0.1.0",
+    "vaws-remote-dev>=0.5.0",
 ]
 
 [project.optional-dependencies]

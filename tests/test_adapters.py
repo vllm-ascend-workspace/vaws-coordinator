@@ -11,7 +11,7 @@ from unittest import mock
 
 from remote_dev.result import RESULT_SCHEMA_VERSION, make_result
 
-from vaws_coordinator.backend import WORKERS, RemoteDev, worker_source
+from vaws_coordinator.backend import RemoteDev
 from vaws_coordinator.git_sources import discover_repo_tree, iter_postorder
 from vaws_coordinator.host_queue import (
     HostQueue,
@@ -67,23 +67,13 @@ class RemoteDevAdapterTests(unittest.TestCase):
         self.assertFalse(bash.call_args.kwargs["runtime_env"])
 
 
-class SupervisorSourceTests(unittest.TestCase):
-    """The execution supervisor is this package's own source text."""
+class ProcessControlBoundaryTests(unittest.TestCase):
+    """Generic process control belongs to remote-dev, not this package."""
 
-    def test_supervisor_source_is_read_from_the_package_without_configuration(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
-            source = worker_source("managed_jobs")
-        self.assertEqual(source, (WORKERS / "managed_jobs.py").read_text(encoding="utf-8"))
-        self.assertIn("Linux remote job receipt protocol", source)
-        self.assertIn("PR_SET_CHILD_SUBREAPER", source)
-
-    def test_the_supervisor_is_shipped_as_text_and_never_on_this_sys_path(self):
-        self.assertNotIn(str(WORKERS), sys.path)
-        self.assertIsNone(sys.modules.get("managed_jobs"))
-
-    def test_a_package_without_the_supervisor_fails_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "missing workers/absent_worker.py"):
-            worker_source("absent_worker")
+    def test_coordinator_does_not_ship_a_container_worker(self):
+        from vaws_coordinator import backend as backend_mod
+        self.assertFalse(hasattr(backend_mod, "worker_source"))
+        self.assertFalse(hasattr(backend_mod, "WORKERS"))
 
 
 class HostQueueAdapterTests(unittest.TestCase):

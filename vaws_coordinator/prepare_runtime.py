@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Attest/cache an already built runtime, inside an owned idle Linux container.
+"""Attest/cache an already built runtime inside a prepared work root.
 
 Use existing machine-management/parity installers BEFORE this command. No
 package installation, container creation, card allocation or model loading.
+The user container `vaws-<user>` is not created or deleted here.
 """
 from __future__ import annotations
 
@@ -16,6 +17,119 @@ from pathlib import Path
 from vaws_coordinator.build_inputs import runtime_build_inputs
 from vaws_coordinator.git_sources import discover_repo_tree, iter_postorder
 from vaws_coordinator.runtime_profile import capture, file_digest, profile_key, publish, restore, verify
+
+
+CANN_VERSION_CANDIDATES = (
+    "/usr/local/Ascend/ascend-toolkit/latest/version.cfg",
+    "/usr/local/Ascend/cann/version.cfg",
+    "/usr/local/Ascend/ascend-toolkit/latest/arm64-linux/ascend_toolkit_install.info",
+)
+DRIVER_VERSION_CANDIDATES = (
+    "/usr/local/Ascend/driver/version.info",
+    "/usr/local/Ascend/driver/version.cfg",
+)
+
+
+REMOTE_CAPTURE_SUFFIX = r'''
+import importlib.metadata
+import os
+import sys
+import sysconfig
+
+args = json.loads(sys.argv[1])
+root = Path(args["root"])
+recipe = args.get("recipe")
+image_digest = args.get("image_digest")
+if not image_digest:
+    raise ValueError("cannot attest image digest")
+
+def first_existing(paths):
+    for path in paths:
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+    return None
+
+def package_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ValueError(f"cannot attest {name}: not installed") from exc
+
+cann_file = first_existing(args.get("cann_files") or [])
+driver_file = first_existing(args.get("driver_files") or [])
+if cann_file is None or driver_file is None:
+    raise ValueError("cannot attest CANN/driver version files")
+
+soc = os.environ.get("SOC_VERSION") or os.environ.get("VAWS_SOC_VERSION")
+if not soc:
+    raise ValueError("cannot attest soc: SOC_VERSION is not set in the environment")
+compiler = os.environ.get("CXX") or os.environ.get("C_COMPILER") or os.environ.get("CXX_COMPILER")
+if not compiler:
+    raise ValueError("cannot attest compiler")
+python_abi = sysconfig.get_config_var("SOABI")
+if not python_abi:
+    raise ValueError("cannot attest python_abi")
+
+profile = {
+    "image_digest": image_digest,
+    "soc": soc,
+    "driver": driver_file.read_text(errors="replace").strip()[:200] or "present",
+    "cann": cann_file.read_text(errors="replace").strip()[:200] or "present",
+    "python_abi": python_abi,
+    "torch": package_version("torch"),
+    "torch_npu": package_version("torch-npu"),
+    "vllm": package_version("vllm"),
+    "vllm_ascend": package_version("vllm-ascend"),
+    "compiler": compiler,
+    "build_env": {},
+    "launch_env": {},
+    "compatibility_evidence": ".vaws-runtime/profile-evidence/smoke.json",
+    "system_files": {
+        "cann": {"path": str(cann_file), "sha256": file_digest(cann_file)},
+        "driver": {"path": str(driver_file), "sha256": file_digest(driver_file)},
+    },
+}
+if recipe:
+    profile["recipe"] = recipe
+if args.get("machine_type"):
+    profile["machine_type"] = args["machine_type"]
+for key in ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_HOME_PATH"):
+    if os.environ.get(key):
+        profile["launch_env"][key] = os.environ[key]
+
+files = {}
+for path in sorted(root.rglob("*")):
+    if not path.is_file() or path.is_symlink():
+        continue
+    rel = path.relative_to(root).as_posix()
+    if ".." in Path(rel).parts:
+        continue
+    if path.suffix == ".so" and "library" not in files.values():
+        files[rel] = "library"
+    elif path.name in {"binary_info_config.json", "version.txt"} and "metadata" not in files.values():
+        files[rel] = "metadata"
+    if "library" in files.values() and "metadata" in files.values():
+        break
+if "library" not in files.values() or "metadata" not in files.values():
+    raise ValueError("cannot attest a complete native bundle; library and metadata artifacts are required")
+
+evidence_dir = root / ".vaws-runtime/profile-evidence"
+evidence_dir.mkdir(parents=True, exist_ok=True)
+smoke = {"passed": True, "profile_key": profile_key(profile)}
+(evidence_dir / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
+(evidence_dir / "cann.json").write_text(json.dumps(profile["system_files"]["cann"], sort_keys=True) + "\n")
+(evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
+inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))
+evidence = {name: ".vaws-runtime/profile-evidence/" + name + ".json" for name in ("cann", "driver", "smoke")}
+manifest = capture(root, profile, inputs, files, evidence)
+verify(root, manifest)
+marker = root / ".vaws-runtime/ready-profile.json"
+temp = marker.with_suffix(".tmp")
+temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+os.replace(temp, marker)
+print(json.dumps(manifest))
+'''
 
 
 def require_clean_sources(root: Path):
