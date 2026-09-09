@@ -1,8 +1,8 @@
 """Task-facing operations exposed identically to every MCP host.
 
-These four names (`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`)
-are coordinator semantics: they create and resume VAWS tasks, bind actual
-worktrees, and drive executions against this user's local pool.
+These four names (`vaws.session`, `vaws.run`, `vaws.execution`, `vaws.finish`)
+are coordinator semantics. Clients pass command and experiment needs; this
+package owns placement, environment, and recovery.
 """
 
 from __future__ import annotations
@@ -14,9 +14,9 @@ from remote_dev.result import make_result as _default_make_result
 
 TOOL_DESCRIPTIONS = {
     "vaws.session": "Inspect this native session's VAWS task and bind actual business worktrees. Local only: no machine is required. Use the context_file supplied by the session hook.",
-    "vaws.run": "Run the task's current source snapshot on a compatible prepared runtime. Automatically sync, acquire devices, launch, renew, observe and release; never install packages or create containers. Keep request_id unchanged on retry.",
-    "vaws.execution": "Observe, tail or stop one execution belonging to this VAWS task. Other tasks cannot be selected accidentally. Stop confirms process and NPU release.",
-    "vaws.finish": "Finish this VAWS task by stopping only its owned executions and releasing resources; preserve worktrees and evidence.",
+    "vaws.run": "Run a business command on this task's isolated root in the user container. Pass environment/resource/topology needs; do not pass request IDs, profile hashes, or runtime IDs. The coordinator places, prepares, launches and recovers.",
+    "vaws.execution": "Observe, tail, stop or read the launch target of one execution belonging to this VAWS task. Stop releases that execution's devices and ports; the container and task root remain.",
+    "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
 }
 
 
@@ -30,13 +30,16 @@ def task_schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
 TOOL_SCHEMAS = {
     "vaws.session": task_schema({"sources": {"type": "object", "additionalProperties": {"type": "string"}}}),
     "vaws.run": task_schema({
-        "request_id": {"type": "string"}, "command": {"type": "string"},
-        "profile_key": {"type": "string"}, "runtime_id": {"type": "string"},
-        "devices": {"type": "array", "items": {"type": "integer"}}, "npu_count": {"type": "integer", "default": 1},
+        "command": {"type": "string"},
         "env": {"type": "object", "additionalProperties": {"type": "string"}},
-        "timeout_seconds": {"type": "integer", "default": 1800},
-    }, ("request_id", "command")),
-    "vaws.execution": task_schema({"execution_id": {"type": "string"}, "action": {"type": "string", "enum": ["status", "tail", "stop"]}, "force": {"type": "boolean"}}, ("execution_id",)),
+        "environment": {"type": "object"},
+        "resources": {"type": "object"},
+        "topology": {"type": "object"},
+        "timeout_seconds": {"type": ["integer", "null"], "default": 1800},
+        "service": {"type": ["string", "null"], "description": "Task-scoped service name; reconnects a live service with this name"},
+        "restart": {"type": "boolean", "description": "Replace a live named service, including one with the same spec"},
+    }, ("command",)),
+    "vaws.execution": task_schema({"execution_id": {"type": "string"}, "action": {"type": "string", "enum": ["status", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "role": {"type": "string", "description": "Optional topology role name for per-role target or tail"}}, ("execution_id",)),
     "vaws.finish": task_schema({"force": {"type": "boolean"}}),
 }
 
@@ -55,17 +58,20 @@ def vaws_call(name, args, *, make_result=None):
             value = client.status()
             status = value["session"]["state"]
         elif name == "vaws.run":
-            value = client.run(**{key: args[key] for key in ("request_id", "command", "profile_key", "runtime_id", "devices", "npu_count", "env", "timeout_seconds") if key in args})
+            keys = ("command", "env", "environment", "resources", "topology",
+                    "timeout_seconds", "service", "restart")
+            value = client.run(**{key: args[key] for key in keys if key in args})
             status = value["state"]
         elif name == "vaws.execution":
-            value = client.observe(args["execution_id"], args.get("action", "status"), args.get("force", False))
+            value = client.observe(args["execution_id"], args.get("action", "status"),
+                                   args.get("force", False), role=args.get("role"))
             status = value["state"]
         elif name == "vaws.finish":
             value = client.finish(args.get("force", False))
             status = value["state"]
         else:
             raise ValueError("unknown VAWS operation")
-        outcome = "blocked" if status in {"uncertain", "waiting_for_runtime"} else "failed" if status == "failed" else "timeout" if status == "timeout" else "success"
+        outcome = "blocked" if status in {"uncertain", "waiting", "waiting_for_runtime", "queued", "preparing"} else "failed" if status == "failed" else "timeout" if status == "timeout" else "success"
         if name == "vaws.finish" and outcome == "success" and status != "finished":
             outcome = "blocked"
         result = make_result(tool=name, target=target, outcome=outcome, status=status,

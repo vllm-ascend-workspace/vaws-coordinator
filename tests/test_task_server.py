@@ -141,7 +141,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"]["data"]["session"]["sources"]["repo"]["path"], str(repo.resolve()))
 
     def test_vaws_run_without_bound_sources_is_blocked_and_never_a_remote_success(self):
-        result = self.call("vaws_run", request_id="req-1", command="true")
+        result = self.call("vaws_run", command="true")
         self.assertTrue(result["isError"])
         self.assertEqual(result["structuredContent"]["tool"], "vaws.run")
         self.assertEqual((result["structuredContent"]["outcome"], result["structuredContent"]["status"]), ("blocked", "unavailable"))

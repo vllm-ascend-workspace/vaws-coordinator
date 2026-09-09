@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,9 +15,11 @@ from pathlib import Path
 from unittest import mock
 
 from vaws_coordinator.host.vaws_npu_coordination import (
+    JOB_TOKEN_ENV,
     NpuCoordinator,
     _confirmed_free_probe,
     parse_npu_smi_info,
+    process_guard_busy,
 )
 
 
@@ -115,6 +120,34 @@ class CoordinationTests(unittest.TestCase):
             self.assertNotEqual(self.coordinator.acquire("retained-waiter", occupancy())["status"], "granted")
             self.assertEqual(self.coordinator.release("retained-task", token, occupancy(), completion_confirmed=True)["status"], "released")
             self.assertEqual(self.coordinator.acquire("retained-waiter", occupancy())["status"], "granted")
+
+    def test_process_guard_source_scans_public_remote_dev_marker(self):
+        from vaws_coordinator.host import vaws_npu_coordination as module
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        self.assertIn('JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"', source)
+        self.assertNotIn("VAWS_REMOTE_JOB_TOKEN", source)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(), "process environ scan is Linux /proc")
+    def test_process_guard_sees_remote_dev_job_token_not_legacy_name(self):
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        marker = os.urandom(16).hex()
+        env = os.environ.copy()
+        env[JOB_TOKEN_ENV] = marker
+        proc = subprocess.Popen(["sleep", "30"], env=env)
+        try:
+            guard = {"marker": marker, "boot_id": boot_id}
+            self.assertTrue(process_guard_busy(guard))
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+        stale = os.environ.copy()
+        stale["VAWS_REMOTE_JOB_TOKEN"] = marker
+        leftover = subprocess.Popen(["sleep", "30"], env=stale)
+        try:
+            self.assertFalse(process_guard_busy({"marker": marker, "boot_id": boot_id}))
+        finally:
+            leftover.kill()
+            leftover.wait(timeout=5)
 
     def activate(self, task_id: str, *, heartbeat_ttl: int = 10) -> int:
         granted = self.coordinator.acquire(task_id, occupancy(), grant_ttl_seconds=10)
@@ -350,7 +383,7 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(parsed['free'], [0])
 
 
-class SessionReservationPathTests(unittest.TestCase):
+class ContainerPortOwnershipTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.clock = FakeClock()
@@ -359,73 +392,56 @@ class SessionReservationPathTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def submit(self, task_id: str, **extra):
-        request = {
-            "task_id": task_id,
-            "agent_id": f"agent-{task_id}",
-            "agent_alias": "team42",
-            "npu_count": 1,
-            "queue_ttl_seconds": 600,
-            "estimated_duration_seconds": 60,
-            **extra,
-        }
-        if "devices" in extra:
-            request.pop("npu_count", None)
-        return self.coordinator.submit(request)
-
-    def test_session_reserve_then_pool_acquire_conflict_and_wrong_owner_release(self) -> None:
-        listening = {"status": "ok", "ports": [22]}
-        reserved = self.coordinator.reserve_session(
-            {
-                "workspace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                "session_id": "sess-path",
-                "container_name": "vaws-sess-path",
-                "npu_count": 1,
-            },
-            occupancy(),
-            listening,
+    def test_user_ssh_reservation_blocks_service_collision_and_survives_release(self) -> None:
+        reserved = self.coordinator.reserve_container_ssh(
+            {"user": "maoxx241", "container_name": "vaws-maoxx241", "port": 46001}
         )
         self.assertEqual(reserved["status"], "reserved")
-        self.assertEqual(reserved["npu_devices"], [0])
-        self.assertIsInstance(reserved["container_ssh_port"], int)
-        self.submit("pool-waiter", devices=[0])
-        self.assertNotEqual(self.coordinator.acquire("pool-waiter", occupancy())["status"], "granted")
-        with self.assertRaisesRegex(Exception, "wrong owner"):
-            self.coordinator.release_session(
-                {
-                    "task_id": reserved["task"]["task_id"],
-                    "fence_token": reserved["task"]["fence_token"],
-                    "workspace_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-                    "session_id": "sess-path",
-                },
-                occupancy(),
-                {"status": "ok", "exists": False, "running": False, "name": "vaws-sess-path"},
+        self.assertEqual(reserved["port"], 46001)
+        again = self.coordinator.reserve_container_ssh(
+            {"user": "maoxx241", "container_name": "vaws-maoxx241", "port": 46001}
+        )
+        self.assertTrue(again["reused"])
+        with self.assertRaisesRegex(Exception, "already has SSH port"):
+            self.coordinator.reserve_container_ssh(
+                {"user": "maoxx241", "container_name": "vaws-maoxx241", "port": 46002}
             )
-        released = self.coordinator.release_session(
+        with self.assertRaisesRegex(Exception, "must be vaws-maoxx241"):
+            self.coordinator.reserve_container_ssh(
+                {"user": "maoxx241", "container_name": "vaws-other", "port": 46001}
+            )
+        self.coordinator.submit(
             {
-                "task_id": reserved["task"]["task_id"],
-                "fence_token": reserved["task"]["fence_token"],
-                "workspace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                "session_id": "sess-path",
-                "container_name": "vaws-sess-path",
-            },
-            occupancy(),
-            {"status": "ok", "exists": False, "running": False, "name": "vaws-sess-path"},
+                "task_id": "exec-1",
+                "agent_id": "maoxx241",
+                "npu_count": 1,
+                "queue_ttl_seconds": 600,
+                "estimated_duration_seconds": 60,
+                "service_port": 0,
+                "service_ports": [46001, 48001],
+            }
+        )
+        listening = {"status": "ok", "ports": [46001]}
+        granted = self.coordinator.acquire("exec-1", occupancy(), listening=listening)
+        self.assertEqual(granted["status"], "granted")
+        self.assertEqual(granted["task"]["granted_service_port"], 48001)
+        self.assertEqual(granted["environment"]["VAWS_SERVICE_PORT"], "48001")
+        token = granted["task"]["fence_token"]
+        busy_port = self.coordinator.release(
+            "exec-1", token, occupancy(), completion_confirmed=True,
+            listening={"status": "ok", "ports": [46001, 48001]},
+        )
+        self.assertEqual(busy_port["status"], "orphaned_busy")
+        released = self.coordinator.release(
+            "exec-1", token, occupancy(), completion_confirmed=True,
+            listening={"status": "ok", "ports": [46001]},
         )
         self.assertEqual(released["status"], "released")
-        self.assertEqual(self.coordinator.acquire("pool-waiter", occupancy())["status"], "granted")
-
-    def test_client_propagates_reserve_failure(self) -> None:
-        from vaws_coordinator.host_queue import HostQueue
-        from vaws_coordinator.session_resources import SessionResourceClient, SessionResourceError
-
-        def run(_target, command):
-            self.assertIn("session-reserve", command)
-            return '{"status":"waiting","reason":"not_enough_devices"}'
-
-        client = SessionResourceClient(HostQueue(run), {"host": "192.0.2.10", "port": 22})
-        with self.assertRaises(SessionResourceError):
-            client.reserve(workspace_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", session_id="sess-fail")
+        snapshot = self.coordinator.snapshot(occupancy())
+        self.assertEqual(
+            [(row["port"], row["kind"]) for row in snapshot["ports"]],
+            [(46001, "container_ssh")],
+        )
 
 
 if __name__ == "__main__":

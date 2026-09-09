@@ -31,16 +31,35 @@ def safe_id(value: str) -> str:
     return value
 
 
+def python_executable(value: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or value.endswith("/") or ".." in PurePosixPath(value).parts:
+        raise ValueError("python must be an absolute executable path")
+    return str(PurePosixPath(value))
+
+
+def user_container_name(user: str) -> str:
+    return "vaws-" + safe_id(user)
+
+
+def posix_roots_overlap(left: str, right: str) -> bool:
+    a, b = PurePosixPath(left), PurePosixPath(right)
+    return a == b or a in b.parents or b in a.parents
+
+
 def endpoint(value: dict[str, Any], *, container: bool = False) -> dict[str, Any]:
     host, user, port = value.get("host", ""), value.get("user", "root"), int(value.get("port", 22))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.:-]*", host) or not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*", user) or not 0 < port < 65536:
         raise ValueError("invalid endpoint")
     result = {"host": host, "port": port, "user": user}
     if container:
-        root = value.get("root", "")
+        root = value.get("root") or value.get("cwd") or ""
         if not root.startswith("/") or root == "/" or ".." in PurePosixPath(root).parts:
             raise ValueError("a dedicated absolute runtime root is required")
-        result.update(root=str(PurePosixPath(root)), cwd=str(PurePosixPath(root)))
+        root = str(PurePosixPath(root))
+        cwd = value.get("cwd")
+        if cwd not in {None, "", root} and str(PurePosixPath(str(cwd))) != root:
+            raise ValueError("prepared runtime root and cwd must be the same path")
+        result.update(root=root, cwd=root)
     return result
 
 
@@ -122,11 +141,19 @@ class RuntimePool(ManagedExecution):
             return row
 
     def register(self, runtime_id: str, spec: dict[str, Any]):
-        """Administrator adopts a prepared idle container; never provisions it."""
+        """Adopt a prepared work root in the caller's fixed user container."""
         safe_id(runtime_id)
-        spec = {"endpoint": endpoint(spec["endpoint"], container=True),
+        user = safe_id(spec["user"])
+        container_name = user_container_name(user)
+        if spec.get("container_name") not in {None, "", container_name}:
+            raise ValueError(f"container_name must be {container_name}")
+        spec = {"user": user,
+                "python": python_executable(spec["python"]),
+                "recipe": spec.get("recipe"),
+                "endpoint": endpoint(spec["endpoint"], container=True),
                 "host_endpoint": endpoint(spec["host_endpoint"]),
-                "container_name": safe_id(spec["container_name"]), "service_ports": spec.get("service_ports", [])}
+                "container_name": container_name,
+                "service_ports": spec.get("service_ports", [])}
         ports = spec["service_ports"]
         if not isinstance(ports, list) or any(type(port) is not int or not 0 < port < 65536 for port in ports) or len(set(ports)) != len(ports):
             raise ValueError("service_ports must contain distinct TCP ports")
@@ -136,24 +163,44 @@ class RuntimePool(ManagedExecution):
             with self.lock, self.transaction() as db:
                 self._check_registration(db, runtime_id, spec)
             # The probe runs outside the global lock; conflicts are re-checked
-            # against fresh state before committing, so concurrent registrations
-            # of the same container under different ids still fail closed.
+            # against fresh state before committing. Sibling roots in the same
+            # user container are allowed; overlapping mutable roots are not.
             observed = self.backend.inspect(spec, idle=True)
-            row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed}
+            self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
+                                      "container_name": container_name, "port": spec["endpoint"]["port"]})
+            row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed, "draining": False}
             with self.lock, self.transaction() as db:
-                self._check_registration(db, runtime_id, spec)
+                self._check_registration(db, runtime_id, spec, container_id=observed.get("container_id"))
                 self.put(db, "runtime", row)
             return row
 
-    def _check_registration(self, db, runtime_id: str, spec: dict[str, Any]):
-        ports = spec["service_ports"]
+    def _check_registration(self, db, runtime_id: str, spec: dict[str, Any], container_id: str | None = None):
+        ports = set(spec["service_ports"])
+        ssh = (spec["endpoint"]["host"], spec["endpoint"]["port"], spec["endpoint"]["user"])
+        identity = (spec["host_endpoint"]["host"], spec["user"], spec["container_name"])
+        root = spec["endpoint"]["cwd"]
         for other in self.rows(db, "runtime"):
+            other_ssh = (other["endpoint"]["host"], other["endpoint"]["port"], other["endpoint"]["user"])
+            other_identity = (other["host_endpoint"]["host"], other.get("user"), other["container_name"])
             if other["id"] == runtime_id:
                 if other["state"] == "bound":
                     raise ValueError("runtime is still bound; return it first")
-            elif (other["endpoint"]["host"], other["endpoint"]["port"]) == (spec["endpoint"]["host"], spec["endpoint"]["port"]) or (other["host_endpoint"], other["container_name"]) == (spec["host_endpoint"], spec["container_name"]):
-                raise ValueError("container/endpoint already registered")
-            elif other["host_endpoint"] == spec["host_endpoint"] and (set(other.get("service_ports", [])) | {other["endpoint"]["port"]}) & (set(ports) | {spec["endpoint"]["port"]}):
+                if other_identity != identity or other_ssh != ssh:
+                    raise ValueError("cannot change the user container or SSH endpoint of a registered root")
+                continue
+            if other_identity == identity:
+                if other["host_endpoint"] != spec["host_endpoint"] or other_ssh != ssh:
+                    raise ValueError("prepared roots for one user on a host must share one SSH endpoint")
+                if container_id and other.get("attestation", {}).get("container_id") not in {None, container_id}:
+                    raise ValueError("container identity does not match the registered user container")
+                if posix_roots_overlap(other["endpoint"]["cwd"], root):
+                    raise ValueError("prepared roots overlap; concurrent materialization would overwrite an active tree")
+                continue
+            if other["host_endpoint"]["host"] == spec["host_endpoint"]["host"] and other_ssh == ssh:
+                raise ValueError("SSH endpoint already registered for another user container")
+            if other["host_endpoint"]["host"] == spec["host_endpoint"]["host"] and (
+                    {other["endpoint"]["port"]} & (ports | {spec["endpoint"]["port"]})
+                    or set(other.get("service_ports", [])) & {spec["endpoint"]["port"]}):
                 raise ValueError("runtime ports overlap another registered runtime")
 
     def checkout(self, owner: str, session: str, profile_key: str, request_id: str, runtime_id: str = ""):
@@ -171,13 +218,15 @@ class RuntimePool(ManagedExecution):
                             raise ValueError("this checkout request id belongs to a returned binding; use a new request id")
                         return binding
                 candidates = [row["id"] for row in self.rows(db, "runtime") if row["state"] == "ready"
+                              and row.get("user") == owner
                               and row["attestation"]["profile_key"] == profile_key
                               and (not runtime_id or row["id"] == runtime_id)]
             for candidate in candidates:
                 with self._entity_lock("runtime", candidate):
                     with self.lock, self.transaction() as db:
                         runtime = self.get(db, "runtime", candidate)
-                        if runtime["state"] != "ready" or runtime["attestation"]["profile_key"] != profile_key:
+                        if (runtime["state"] != "ready" or runtime.get("user") != owner
+                                or runtime["attestation"]["profile_key"] != profile_key):
                             continue
                     # Probes stay outside the global lock: a hung host blocks
                     # only this candidate, never other principals' runtimes.
@@ -195,6 +244,10 @@ class RuntimePool(ManagedExecution):
                         continue
                     row = {"id": key, "owner": owner, "intent": intent, "runtime_id": runtime["id"],
                            "state": "bound", "endpoint": runtime["endpoint"],
+                           "host_endpoint": runtime["host_endpoint"],
+                           "user": runtime["user"], "python": runtime["python"],
+                           "container_name": runtime["container_name"],
+                           "container_id": observed.get("container_id"),
                            "profile_key": profile_key, "build_key": observed["build_key"],
                            "service_ports": runtime["service_ports"],
                            "environment": {"VAWS_ENVIRONMENT_FINGERPRINT": profile_key},
@@ -271,7 +324,7 @@ class RuntimePool(ManagedExecution):
 
     def request_run(self, owner: str, binding_id: str, request_id: str, snapshots: dict[str, str],
                     expected_build_key: str, devices: list[int], npu_count: int,
-                    priority: int = 0, queue_seconds: int = 1800):
+                    priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None):
         try:
             safe_id(request_id)
         except ValueError as exc:
@@ -280,6 +333,8 @@ class RuntimePool(ManagedExecution):
             raise ExecutionRequestError("supply distinct physical devices OR a positive npu_count")
         if not 1 <= queue_seconds <= 86400:
             raise ExecutionRequestError("queue_seconds must be between 1 and 86400")
+        if service_port is not None and (type(service_port) is not int or service_port < 0):
+            raise ExecutionRequestError("service_port must be 0 or a positive declared runtime service port")
         if not {"vllm", "vllm-ascend"}.issubset(snapshots) or any(not re.fullmatch(r"[0-9a-f]{40,64}", commit) for commit in snapshots.values()):
             raise ExecutionRequestError("pin the complete parity snapshot map before requesting cards")
         for name in snapshots:
@@ -287,7 +342,8 @@ class RuntimePool(ManagedExecution):
                 raise ExecutionRequestError("unsafe snapshot path")
         key = digest([owner, binding_id, request_id])
         intent = {"snapshots": snapshots, "build_key": expected_build_key, "devices": devices,
-                  "npu_count": npu_count, "priority": priority, "queue_seconds": queue_seconds}
+                  "npu_count": npu_count, "priority": priority, "queue_seconds": queue_seconds,
+                  "service_port": service_port}
         with self._entity_lock("binding", binding_id):
             with self.lock, self.transaction() as db:
                 binding = self.owned(db, "binding", binding_id, owner)
@@ -423,6 +479,9 @@ class RuntimePool(ManagedExecution):
                               "priority": intent["priority"], "latest_start": run["deadline"],
                               "estimated_duration_seconds": 1800}
                     submit.update({"devices": intent["devices"]} if intent["devices"] else {"npu_count": intent["npu_count"]})
+                    if intent.get("service_port") is not None:
+                        submit["service_port"] = intent["service_port"]
+                        submit["service_ports"] = runtime.get("service_ports", [])
                     reply = self.backend.host(runtime, submit)
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run["submitted"] = True
@@ -451,6 +510,10 @@ class RuntimePool(ManagedExecution):
                 else:
                     raise ValueError(reply.get("error", "host probe did not return a task"))
                 run["environment"] = {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, run["task"].get("granted_devices", [])))}
+                service_port = run["task"].get("granted_service_port")
+                if service_port is not None:
+                    run["environment"]["VAWS_SERVICE_PORT"] = str(int(service_port))
+                    run["service_port"] = int(service_port)
             except Exception as exc:
                 # No host epoch means no mutating host request was sent yet.
                 run["state"] = "uncertain" if run["epoch"] is not None else "pending"
@@ -539,6 +602,12 @@ class RuntimePool(ManagedExecution):
             return {kind + "s": [row for row in self.rows(db, kind) if row["owner"] == owner]
                     for kind in ("session", "binding", "run", "job")}
 
+    def session_bindings(self, owner: str, session: str):
+        with self.transaction() as db:
+            self.owned(db, "session", session, owner)
+            return [row for row in self.rows(db, "binding")
+                    if row["owner"] == owner and row["intent"]["session"] == session and row["state"] == "bound"]
+
     def peers(self):
         with self.transaction() as db:
             return [{"run": row["id"], "owner": row["owner"], "state": row["state"],
@@ -547,12 +616,49 @@ class RuntimePool(ManagedExecution):
 
     def catalog(self):
         with self.transaction() as db:
-            return [{"runtime_id": row["id"], "state": row["state"],
-                     "draining": row.get("draining", False),
-                     "profile_key": row["attestation"]["profile_key"],
-                     "build_key": row["attestation"]["build_key"], "service_ports": row.get("service_ports", []),
-                     "error": row.get("error")}
-                    for row in self.rows(db, "runtime")]
+            rows = []
+            for row in self.rows(db, "runtime"):
+                profile = (row.get("attestation") or {}).get("profile") or {}
+                rows.append({
+                    "runtime_id": row["id"], "state": row["state"],
+                    "draining": row.get("draining", False),
+                    "user": row.get("user"), "python": row.get("python"),
+                    "recipe": row.get("recipe") or profile.get("recipe"),
+                    "python_abi": profile.get("python_abi"),
+                    "cann": profile.get("cann"), "soc": profile.get("soc"),
+                    "machine_type": profile.get("machine_type") or row.get("machine_type"),
+                    "profile": profile,
+                    "host": row["host_endpoint"]["host"],
+                    "host_endpoint": row["host_endpoint"],
+                    "endpoint": row["endpoint"],
+                    "ssh_port": row["endpoint"]["port"],
+                    "container_name": row.get("container_name"),
+                    "container_id": (row.get("attestation") or {}).get("container_id"),
+                    "root": row["endpoint"]["cwd"],
+                    "profile_key": row["attestation"]["profile_key"],
+                    "build_key": row["attestation"]["build_key"],
+                    "service_ports": row.get("service_ports", []),
+                    "error": row.get("error"),
+                })
+            return rows
+
+    def runtime_busy(self, runtime_id: str, *, except_job: str | None = None) -> bool:
+        with self.transaction() as db:
+            from vaws_coordinator.managed_execution import JOB_TERMINAL
+            bindings = [row for row in self.rows(db, "binding")
+                        if row["runtime_id"] == runtime_id and row["state"] == "bound"]
+            for binding in bindings:
+                for job in self.rows(db, "job"):
+                    if job["binding_id"] != binding["id"] or job["state"] in JOB_TERMINAL:
+                        continue
+                    if except_job and job["id"] == except_job:
+                        continue
+                    return True
+            return False
+
+    def donor_runtime(self, user: str) -> dict | None:
+        catalog = [row for row in self.catalog() if row.get("user") == user and row.get("host")]
+        return catalog[0] if catalog else None
 
     def message(self, owner: str, target_run: str, text: str):
         if not text.strip() or len(text) > 4000:

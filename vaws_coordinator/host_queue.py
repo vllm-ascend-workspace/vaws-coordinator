@@ -24,14 +24,17 @@ from vaws_coordinator.host.vaws_npu_coordination import (  # noqa: F401
     SCHEMA_VERSION,
     CoordinationError,
     NpuCoordinator,
+    container_ssh_task_id,
     handle_request,
     parse_npu_smi_hbm,
     parse_npu_smi_info,
     probe_listening_ports,
     probe_named_container,
+    JOB_TOKEN_ENV,
     process_guard_busy,
     probe_npu_occupancy,
     resolve_host_state_dir,
+    user_container_name,
 )
 
 HOST_QUEUE_MODULE_ENV = "VAWS_HOST_QUEUE_MODULE"

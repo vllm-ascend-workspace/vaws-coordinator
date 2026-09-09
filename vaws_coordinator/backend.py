@@ -1,14 +1,16 @@
 """Adapters to the remote-dev package and host NPU device authority.
 
 remote-dev is imported as the `remote_dev` package. The host queue remains
-the single device-allocation authority. The child-subreaper supervisor is
-owned here in `workers/` and read as source text.
+the single device-allocation authority. Generic process control is
+`remote_dev.processes.control`.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import subprocess
 from pathlib import Path
 
 from remote_dev.core.endpoint import resolve_endpoint
@@ -17,8 +19,6 @@ from remote_dev.core.shell_ops import remote_bash
 from vaws_coordinator.host_queue import HostQueue
 from vaws_coordinator.machine_directory import MachineDirectory
 from vaws_coordinator.runtime_profile import launch_preamble
-
-WORKERS = Path(__file__).resolve().parent / "workers"
 
 
 def _package_file(relative: str) -> Path:
@@ -30,17 +30,6 @@ class RemoteDev:
 
     def run(self, target: dict, command: str, *, timeout_ms: int = 45000) -> dict:
         return remote_shell(target, command, timeout_ms=timeout_ms)
-
-
-def worker_source(name="managed_jobs"):
-    """Read a supervisor this process ships into a runtime container.
-
-    `workers/` is Linux process-management source, never imported here.
-    """
-    path = _package_file(f"workers/{name}.py")
-    if not path.is_file():
-        raise RuntimeError(f"this install is missing workers/{name}.py")
-    return path.read_text(encoding="utf-8")
 
 
 def remote_shell(target: dict, command: str, *, timeout_ms: int = 45000) -> dict:
@@ -62,12 +51,10 @@ class RemoteBackend:
         self.host_queue = host_queue or HostQueue(self.bash, module_path=host_queue_module)
 
     def job(self, runtime, job_id, action, **parameters):
-        source = worker_source("managed_jobs")
-        request = {"root": runtime["endpoint"]["root"], "job_id": job_id, "action": action, **parameters}
-        command = ("python3 - " + shlex.quote(json.dumps(request)) + " <<'VAWS_MANAGED_JOB'\n"
-                   + "WORKER_SOURCE = " + repr(source)
-                   + "\nexec(compile(WORKER_SOURCE, '<vaws-managed-job>', 'exec'))\nVAWS_MANAGED_JOB\n")
-        return json.loads(self.bash(runtime["endpoint"], command))
+        from remote_dev.processes import control
+
+        endpoint = dict(runtime["endpoint"])
+        return control(resolve_endpoint(endpoint), job_id, action, **parameters)
 
     def job_host_pid(self, runtime, receipt):
         code = '''
@@ -107,9 +94,13 @@ print(json.dumps({'pid':matches[0]}))
         if "machine" not in spec:
             return spec
         host = self.machines.host(spec["machine"])
-        return {"host_endpoint": {"host": host["ip"], "port": host.get("port", 22), "user": host.get("user", "root")},
-                "endpoint": {"host": host["ip"], "port": spec["port"], "root": spec["root"], "user": spec.get("user", "root")},
-                "container_name": spec["container_name"], "service_ports": spec.get("service_ports", [])}
+        user = spec["user"]
+        return {"user": user, "python": spec["python"],
+                "host_endpoint": {"host": host["ip"], "port": host.get("port", 22), "user": host.get("user", "root")},
+                "endpoint": {"host": host["ip"], "port": spec["port"], "root": spec["root"],
+                             "cwd": spec.get("cwd") or spec["root"], "user": spec.get("ssh_user", "root")},
+                "container_name": spec.get("container_name") or ("vaws-" + user),
+                "service_ports": spec.get("service_ports", [])}
 
     def host(self, runtime, request):
         return self.host_queue.request(runtime["host_endpoint"], request)
@@ -124,26 +115,20 @@ print(json.dumps({'pid':matches[0]}))
         return Path(result["refs"]["stdout"]).read_text()
 
     def inspect(self, runtime, *, idle=False, snapshots=None):
+        # idle remains an inspect of the selected prepared root and container
+        # identity. It must not require the whole user container to be empty:
+        # sibling roots may have authorized executions.
+        del idle
         host = {**runtime["host_endpoint"], "root": "/", "cwd": "/"}
         name = shlex.quote(runtime["container_name"])
         fields = shlex.quote('{"Id":{{json .Id}},"State":{{json .State}}}')
         info = json.loads(self.bash(host, f"docker inspect --format {fields} {name}"))
         if not info["State"]["Running"] or info["State"].get("Paused") or info["State"].get("Restarting"):
             raise RuntimeError("prepared container is not running normally")
-        if idle:
-            rows = self.bash(host, f"docker top {name} -eo pid,stat,comm").splitlines()[1:]
-            allowed = {"bash", "sh", "sshd", "sshd-session", "sshd-auth", "sleep", "tini", "tail", "cat", "init", "systemd"}
-            processes = [row.split(None, 2) for row in rows]
-            if not processes or any(len(row) != 3 or not row[0].isdigit() or
-                                    (not row[1].startswith("Z") and row[2].strip() not in allowed) for row in processes):
-                raise RuntimeError("container is not an idle prepared runtime; inspect its workers")
-            if runtime.get("service_ports"):
-                listeners = self.bash(host, "ss -H -ltn").splitlines()
-                occupied = {int(row.split()[3].rsplit(":", 1)[1]) for row in listeners if len(row.split()) >= 4}
-                if occupied.intersection(runtime["service_ports"]):
-                    raise RuntimeError("a reserved service port is still listening; resolve its owner before launch")
+        python = runtime.get("python") or "python3"
         module = _package_file("runtime_profile.py").read_text()
-        request = json.dumps({"root": runtime["endpoint"]["root"], "snapshots": snapshots or {}})
+        request = json.dumps({"root": runtime["endpoint"].get("cwd") or runtime["endpoint"]["root"],
+                              "snapshots": snapshots or {}})
         build_source = _package_file("build_inputs.py").read_text()
         runner = "\n_build_namespace = {}\nexec(" + repr(build_source) + ", _build_namespace)\n" + '''
 import subprocess
@@ -165,6 +150,89 @@ for name, expected in args["snapshots"].items():
         raise ValueError("runtime source differs from pinned snapshot: " + name)
 print(json.dumps(manifest))
 '''
-        command = "python3 - " + shlex.quote(request) + " <<'VAWS_READY_PROBE'\n" + module + runner + "\nVAWS_READY_PROBE\n"
+        command = (shlex.quote(python) + " - " + shlex.quote(request)
+                   + " <<'VAWS_READY_PROBE'\n" + module + runner + "\nVAWS_READY_PROBE\n")
         manifest = json.loads(self.bash(runtime["endpoint"], command))
-        return {**manifest, "container_id": info["Id"], "launch_preamble": launch_preamble(manifest["profile"])}
+        return {**manifest, "container_id": info["Id"],
+                "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
+
+    def prepare_task_root(self, spec, *, sources, environment, donor_python=None, workspace_root=None):
+        """First-install isolated sources + task venv + editables + verified profile.
+
+        Does not mutate ``donor_python`` site-packages. Image packages may be
+        reused via ``venv --system-site-packages``.
+        """
+        from vaws_coordinator.parity import (
+            DEFAULT_MARKER_DIRNAME,
+            materialize_command,
+            prepare_isolated_root_script,
+            run_runtime_install_step,
+        )
+        from vaws_coordinator.parity_support import SshEndpoint, ssh_exec
+        from vaws_coordinator.provision.task_environment import INSTALL_STEPS, create_venv_script
+
+        endpoint = spec["endpoint"]
+        root = endpoint["root"]
+        python = spec["python"]
+        if donor_python and python == donor_python:
+            raise ValueError("task-owned interpreter must not be the donor interpreter")
+        if not {"vllm", "vllm-ascend"}.issubset(sources or {}):
+            raise ValueError("bind the actual vllm and vllm-ascend worktrees before preparation")
+        container = SshEndpoint(host=endpoint["host"], port=int(endpoint["port"]), user=endpoint["user"])
+        ssh_exec(container, prepare_isolated_root_script(root))
+        ssh_exec(container, create_venv_script(root, python, donor_python))
+        identity = spec.get("container_name") or ("vaws-" + spec["user"])
+        args = materialize_command(
+            workspace_id=identity,
+            runtime_id=identity,
+            endpoint=endpoint,
+            sources={name: sources[name] for name in ("vllm", "vllm-ascend")},
+            workspace_root=workspace_root,
+        )
+        env = {key: value for key, value in os.environ.items()}
+        result = subprocess.run(args, env=env, timeout=3600, check=False, capture_output=True, text=True)
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "")[-500:]
+            raise RuntimeError(f"source materialization failed: {detail}")
+        for step in INSTALL_STEPS:
+            run_runtime_install_step(
+                container=container,
+                runtime_root=root,
+                marker_dirname=DEFAULT_MARKER_DIRNAME,
+                container_identity=identity,
+                step=step,
+                stream_progress=False,
+                python=python,
+            )
+        self._write_ready_profile(spec, environment)
+        return self.inspect(spec)
+
+    def _write_ready_profile(self, spec, environment):
+        from vaws_coordinator.prepare_runtime import (
+            CANN_VERSION_CANDIDATES,
+            DRIVER_VERSION_CANDIDATES,
+            REMOTE_CAPTURE_SUFFIX,
+        )
+
+        python = spec["python"]
+        root = spec["endpoint"]["root"]
+        host = {**spec["host_endpoint"], "root": "/", "cwd": "/"}
+        name = shlex.quote(spec["container_name"])
+        digest = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
+        if not digest:
+            raise ValueError("cannot attest image digest")
+        recipe = (environment or {}).get("recipe") or (environment or {}).get("image") or spec.get("recipe")
+        module = _package_file("runtime_profile.py").read_text()
+        build_source = _package_file("build_inputs.py").read_text()
+        request = json.dumps({
+            "root": root,
+            "recipe": recipe,
+            "image_digest": digest,
+            "machine_type": (environment or {}).get("machine_type") or spec.get("machine_type"),
+            "cann_files": list(CANN_VERSION_CANDIDATES),
+            "driver_files": list(DRIVER_VERSION_CANDIDATES),
+        })
+        runner = "\n_build_namespace = {}\nexec(" + repr(build_source) + ", _build_namespace)\n" + REMOTE_CAPTURE_SUFFIX
+        command = (shlex.quote(python) + " - " + shlex.quote(request)
+                   + " <<'VAWS_CAPTURE_PROBE'\n" + module + runner + "\nVAWS_CAPTURE_PROBE\n")
+        self.bash(spec["endpoint"], command)

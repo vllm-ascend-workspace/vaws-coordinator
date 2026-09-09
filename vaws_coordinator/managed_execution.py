@@ -21,20 +21,24 @@ class ExecutionRequestError(ValueError):
 class ManagedExecution:
     def managed_start(self, owner, binding_id, request_id, snapshots, expected_build_key,
                       devices, npu_count, command, env, timeout_seconds=1800,
-                      priority=0, queue_seconds=1800):
+                      priority=0, queue_seconds=1800, service_port=None, hold_go=False):
         if not isinstance(command, str) or not command.strip() or len(command) > 200000:
             raise ValueError("a bounded nonempty shell command is required")
         if not isinstance(env, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
-                                           or key.startswith("VAWS_REMOTE_JOB_") or key == "ASCEND_RT_VISIBLE_DEVICES"
+                                           or key.startswith("REMOTE_DEV_JOB_")
+                                           or key in {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON"}
                                            or not isinstance(value, str) for key, value in env.items()):
-            raise ValueError("invalid environment or attempted override of managed device ownership")
-        if not 1 <= timeout_seconds <= 86400:
-            raise ValueError("timeout_seconds must be 1..86400")
+            raise ValueError("invalid environment or attempted override of managed device or service-port ownership")
+        if timeout_seconds is not None and (type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 86400):
+            raise ValueError("timeout_seconds must be None or 1..86400")
+        if service_port is not None and (type(service_port) is not int or service_port < 0):
+            raise ValueError("service_port must be None, 0, or a positive declared runtime service port")
         key = digest([owner, binding_id, request_id])
         request = {"binding_id": binding_id, "request_id": request_id, "snapshots": snapshots,
                    "expected_build_key": expected_build_key, "devices": devices, "npu_count": npu_count,
-                   "priority": priority, "queue_seconds": queue_seconds}
-        specification = {"command": command, "env": env, "timeout_seconds": timeout_seconds}
+                   "priority": priority, "queue_seconds": queue_seconds, "service_port": service_port}
+        specification = {"command": command, "env": env, "timeout_seconds": timeout_seconds,
+                         "requested_service_port": service_port}
         with self.lock, self.transaction() as db:
             binding = self.owned(db, "binding", binding_id, owner)
             existing = [row for row in self.rows(db, "job") if row["id"] == key]
@@ -42,13 +46,15 @@ class ManagedExecution:
                 job = existing[0]
                 if job["request"] != request or job["spec"] != specification:
                     raise ValueError("managed execution request id reused with different arguments")
+                if bool(job.get("hold_go")) != bool(hold_go):
+                    raise ValueError("managed execution request id reused with different arguments")
                 return job
             if binding["state"] != "bound":
                 raise ValueError("cannot start a managed job on a returned runtime")
             job = {"id": key, "owner": owner, "binding_id": binding_id,
                    "session": binding["intent"]["session"], "request": request, "spec": specification,
                    "job_id": "vaws-" + key, "state": "pending", "last_poll": 0,
-                   "cancel_requested": False, "force": False}
+                   "cancel_requested": False, "force": False, "hold_go": bool(hold_go)}
             self.put(db, "job", job)  # intent survives a crash before lease creation
             self.event(db, owner, "managed-job-created", run=key, job_id=job["job_id"])
         return self.managed_advance(key)
@@ -67,6 +73,13 @@ class ManagedExecution:
             return {**job, "remote": self.backend.job(runtime, job["job_id"], "tail")}
         return self.managed_advance(job_id) if job["state"] not in JOB_TERMINAL else job
 
+    def managed_release_gate(self, owner, job_id):
+        with self.lock, self.transaction() as db:
+            job = self.owned(db, "job", job_id, owner)
+            job["hold_go"] = False
+            self.put(db, "job", job)
+        return self.managed_advance(job_id)
+
     def managed_advance(self, key):
         # Per-job lock: remote probes/supervision for one job never block
         # another job's advancement; the global lock guards only DB sections.
@@ -81,14 +94,17 @@ class ManagedExecution:
             try:
                 if not runs:
                     if job["cancel_requested"]:
-                        self.return_runtime(job["owner"], binding["id"])
                         job["state"] = "cancelled"
-                        job["runtime_returned"] = True
+                        job["runtime_returned"] = False
                         return self._save_managed(job)
                     run = self.request_run(job["owner"], **job["request"])
                 else:
                     run = self.control(job["owner"], key, "poll", _managed=True)
                 job["lease_state"] = run["state"]
+                if run.get("environment"):
+                    job["environment"] = run["environment"]
+                if run.get("service_port") is not None:
+                    job["service_port"] = run["service_port"]
                 observed = self.backend.job(runtime, job["job_id"], "status")
                 job["had_receipt"] = bool(job.get("had_receipt") or observed.get("receipt")
                                           or (job.get("remote") or {}).get("receipt"))
@@ -132,14 +148,24 @@ class ManagedExecution:
                 if run["state"] == "queued":
                     job["state"] = "queued"
                     return self._save_managed(job)
+                if job.get("hold_go") and run["state"] == "granted" and not job.get("cancel_requested"):
+                    job.update(state="waiting", lease_state="granted")
+                    return self._save_managed(job)
                 if run["state"] == "granted":
                     run = self.control(job["owner"], key, "preflight", _managed=True)
                 if run["state"] == "starting":
-                    command = (binding.get("launch_preamble", "") + "\nexport ASCEND_RT_VISIBLE_DEVICES="
-                               + shlex.quote(run["environment"]["ASCEND_RT_VISIBLE_DEVICES"])
-                               + "\n" + job["spec"]["command"])
+                    python = binding.get("python")
+                    command = binding.get("launch_preamble", "")
+                    if python:
+                        command += "\nexport VAWS_PYTHON=" + shlex.quote(python)
+                    command += ("\nexport ASCEND_RT_VISIBLE_DEVICES="
+                                + shlex.quote(run["environment"]["ASCEND_RT_VISIBLE_DEVICES"]))
+                    if run["environment"].get("VAWS_SERVICE_PORT"):
+                        command += "\nexport VAWS_SERVICE_PORT=" + shlex.quote(run["environment"]["VAWS_SERVICE_PORT"])
+                    command += "\n" + job["spec"]["command"]
                     specification = {**job["spec"], "command": command, "cwd": binding["endpoint"]["cwd"],
                                      "env": {**job["spec"]["env"], **run["environment"]}}
+                    job["service_port"] = run.get("service_port")
                     observed = self.backend.job(runtime, job["job_id"], "prepare", spec=specification)
                     job["remote"] = observed
                     if observed["state"] != "prepared":
@@ -201,23 +227,13 @@ class ManagedExecution:
         if run["state"] not in LEASE_TERMINAL:
             job.update(state="releasing", error=run.get("error"))
             return self._save_managed(job)
-        self.return_runtime(job["owner"], binding["id"])
-        # Re-verify the returned runtime before another client can receive it.
-        # Cleaning consists only of the owned process family; code/records stay.
-        # This automatic re-registration is verification-equivalent to the
-        # administrator path named by runtime_return: register() re-runs the
-        # same idle-container inspection plus full profile/source verification,
-        # and any failure leaves the runtime quarantined in needs_repair.
-        try:
-            if not runtime.get("draining"):
-                self.register(runtime["id"], {key: runtime[key] for key in ("host_endpoint", "endpoint", "container_name", "service_ports")})
-        except Exception as exc:
-            job["runtime_reuse_error"] = str(exc)[:500]
+        # Execution owns the process family, NPU lease and service port.
+        # The task keeps its mutable work root until vaws_finish.
         state = ("cancelled" if job["cancel_requested"] else "timeout" if job.get("timed_out")
                  else observed.get("state", "lost_outcome"))
         job["state"] = state if state in JOB_TERMINAL else "inconclusive"
         job["remote"] = observed
-        job["runtime_returned"] = True
+        job["runtime_returned"] = False
         job.pop("error", None)
         return self._save_managed(job)
 

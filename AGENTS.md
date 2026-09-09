@@ -12,7 +12,9 @@ NPU allocation. It is not a hosted service. Code identity is Git.
 | Working-tree → remote parity | `vaws_coordinator.parity` |
 | Machine directory | `vaws_coordinator.machine_directory` |
 | Host NPU queue | `vaws_coordinator.host_queue`, `vaws_coordinator.host` |
-| Task pool / stdio MCP | `vaws_coordinator.task_server` (`vaws-coordinator task-server`) |
+| Persistent coordinator | `vaws_coordinator.service` (`vaws-coordinator daemon`) |
+| Task facade / stdio MCP | `vaws_coordinator.task_client`, `vaws_coordinator.task_server` |
+| User-container provision | `vaws_coordinator.provision` |
 
 A consumer passes data. This package does not locate a consumer tree by
 path or environment variable.
@@ -32,7 +34,7 @@ that named its git URL would pin every consumer to that tag.
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.4.0"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.5.0"
 uv pip install pytest
 uv pip install -e . --no-deps
 ```

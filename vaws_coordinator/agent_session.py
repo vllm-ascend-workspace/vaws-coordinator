@@ -134,10 +134,9 @@ class AgentSessions:
                     # join a task whose finish has already started.
                     if session["state"] != "open":
                         raise ValueError("task is finished; explicitly reopen it before attaching")
-                elif session["state"] in {"finished", "finishing"}:
-                    # Root or explicit-association resume reopens the task. A
-                    # crashed vaws_finish wedges the session in "finishing";
-                    # resuming clears that wedge.
+                elif session["state"] == "finishing":
+                    raise ValueError("task is finishing; wait for the coordinator to complete cleanup")
+                elif session["state"] == "finished":
                     session["state"] = "open"
                     self.put(db, "session", session)
                 old.update(state="attached", resumed_at=now)
@@ -181,9 +180,17 @@ class AgentSessions:
         # Detaching a frontend never stops a job or releases a lease.
         return self.context(attachment["id"])
 
+    def sessions(self) -> list[dict]:
+        with self.transaction() as db:
+            return self.rows(db, "session")
+
     def executions(self, session_id: str) -> list[dict]:
         with self.transaction() as db:
             return [row for row in self.rows(db, "execution") if row["session_id"] == session_id]
+
+    def all_executions(self) -> list[dict]:
+        with self.transaction() as db:
+            return self.rows(db, "execution")
 
     def execution(self, context: dict, request_id: str, spec: dict) -> dict:
         key = hashlib.sha256(json.dumps([context["session"]["id"], request_id]).encode()).hexdigest()
@@ -202,6 +209,14 @@ class AgentSessions:
 
     def save_execution(self, row):
         with self.transaction() as db:
+            try:
+                current = self.get(db, "execution", row["id"])
+            except ValueError:
+                current = {}
+            if current.get("cancel_requested"):
+                row["cancel_requested"] = True
+            if current.get("force"):
+                row["force"] = True
             self.put(db, "execution", row)
 
 

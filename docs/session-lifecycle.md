@@ -1,32 +1,41 @@
-# Task and reusable runtime lifecycle
+# Task lifecycle in a persistent user container
 
-Status: current
+Status: current control-plane contract. The persistent
+daemon owns admitted execution progression, multi-role reservation, and
+task-owned roots. Actual NPU/recipe evidence still requires remote runs.
 
-This is the target contract for the breaking lifecycle change. It guides the
-remaining implementation; it does not claim that the candidate already meets
-every requirement. Task completion preserves the container and its prepared
-environments. Reuse the existing ready-runtime pool and managed executions.
+This is the contract for the breaking lifecycle change. Task completion
+preserves the container and its prepared
+environments. Each user has one persistent container on each host, named
+`vaws-<user>` (for example, `vaws-alice` on every host). Business file work,
+builds, services and tests run in that container. Host operations are limited
+to device/port coordination and container maintenance. Reuse the existing
+ready-runtime registry and managed executions.
 
 ## Ownership
 
 | Object | Owns | Lifetime |
 |---|---|---|
 | Local task | Worktree references, run history, evidence | Independent of remote execution |
-| Prepared runtime | Container identity, SSH endpoint, installed environment directories | Reused across tasks |
-| Runtime binding | One task's permission to use the runtime | Checkout through return |
+| User container | Stable container identity and SSH endpoint on one host | Independent of tasks |
+| Prepared runtime | A task's isolated work/environment root and its Python/CANN/build selection inside the user container | Stable until task finish; immutable caches may be shared |
+| Runtime binding | One task's use of that prepared work/environment root | Checkout through return |
 | Execution | Managed process family, NPU lease, service-port use | Admission through confirmed cleanup |
 
 A container's existence and device mounts do not reserve NPUs. The host
 coordinator is the only NPU and host-port authority. SSH endpoint reservations
-belong to the runtime; they survive task completion. Service-port use and NPU
+belong to the user container; they survive task completion. Service-port use and NPU
 leases belong to executions. Port ownership must prevent overlap with runtime
 SSH endpoints. The scaffold stores receipts and workflow inputs, not a second
 allocation table.
 
-Keep the pool's existing exclusive runtime checkout rule for this change.
-Different task environments can coexist on disk. Concurrent bindings within
-one container are a separate scheduling extension and are not required for
-container reuse.
+The container is not exclusively checked out by one task. Different prepared
+roots in the same user container may have concurrent bindings and executions;
+their NPU and service-port leases remain disjoint. Keep exclusive use of a root
+that source materialization or build refresh can modify. The existing runtime
+rows can represent these prepared roots; no second container scheduler is needed.
+Multiple rows may share one SSH endpoint only for the same host, user and actual
+container identity, and must not independently allocate that SSH endpoint.
 
 ## Environment selection
 
@@ -57,8 +66,8 @@ maintenance and explicit deletion are separate from task completion.
 **Open task.** Create local task identity and bind actual business worktrees.
 This does not create a container or reserve NPUs.
 
-**Prepare and borrow.** Select a compatible prepared runtime through the existing
-pool. If preparation is necessary, install into a separate environment/build
+**Prepare and borrow.** Select a compatible prepared root in the user's fixed
+container through the existing registry. If preparation is necessary, install into a separate environment/build
 directory while no execution uses that directory, then verify it. A cache miss
 is reported as such; it is not permission to overwrite an active environment.
 
@@ -72,21 +81,27 @@ path; an interactive NPU command also needs an execution lease.
 **Stop or finish.** Stop only this execution's managed process family, including
 children. Confirm it is terminal, its assigned devices are observable and free,
 and its service ports are no longer listening before releasing its resources.
-Return and verify the runtime for reuse through the existing pool path. Keep
+Return and verify the prepared root for reuse through the existing pool path. Keep
 the container, SSH endpoint, prepared environments, worktrees and evidence.
 Thus stopping a model releases that model execution's NPUs; an idle local task
 does not keep cards reserved.
 
-**Close task.** Close admission under the existing binding lock, finish/cancel
-its admitted executions, release their leases, then return the binding. Close
-must serialize with launch: admitted work remains owned until cleanup completes,
-and a returned binding cannot launch new work. Use the existing pool/run states
-and managed supervisor; do not add a parallel session lease state machine.
+**Close task.** Close admission under the existing binding lock, persist the
+finish intent (owner/`force`), and stop/cancel admitted executions. The
+daemon's existing tick/reconcile path returns remaining bindings and marks
+the task finished once execution stop has drained. A frontend exit does not
+require a second finish; the same pending finish continues after daemon
+restart through the existing session-dir registry. Close must serialize with
+launch: admitted work remains owned until cleanup completes, and a returned
+binding cannot launch new work. Use the existing pool/run states and managed
+supervisor; do not add a parallel session lease state machine.
 
 **Failure and retry.** Unknown process/device state or cleanup failure keeps the
-execution's ownership. A failed runtime verification leaves it unavailable for
-checkout. Retry the existing stop/finish operation after the condition clears.
-GC reports unresolved ownership; age, local PID death and missing local metadata
+execution's ownership. A failed runtime verification leaves that prepared root unavailable for
+checkout. An admitted finish continues on the daemon; do not require the
+frontend to retry finish. Unknown or still-running processes keep the task
+`finishing` until the existing return path can complete. GC reports unresolved
+ownership; age, local PID death and missing local metadata
 are not release evidence. Request retries are idempotent; new executions use
 new request identities. No container deletion is required to prove completion.
 
@@ -111,8 +126,9 @@ CI execution per suite and distinct package installation checks.
    container and SSH endpoint remain available.
 3. Wrong/stale ownership and close-versus-launch cannot mutate another run or
    release ahead of admitted work.
-4. Unknown probes or failed cleanup retain ownership; retry completes when the
-   condition clears. A failed runtime check prevents reuse.
+4. Unknown probes or failed cleanup retain ownership; an admitted finish
+   completes on the daemon when the condition clears. A failed runtime check
+   prevents reuse.
 5. Existing host allocation prevents device/port conflicts. Environment switching
    does not overwrite an active environment or reuse mismatched native artifacts.
 
