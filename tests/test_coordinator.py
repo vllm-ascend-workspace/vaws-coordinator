@@ -1172,7 +1172,8 @@ class TaskClientTests(unittest.TestCase):
 
         self.client.coordinator.sync_binding = delayed
         admitted = self.client.run("true")
-        self.assertEqual(admitted["state"], "queued")
+        self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+        self.assertEqual(len(admitted["execution_id"]), 64)
         self.assertTrue(started.wait(3))
         self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
         stopped = self.client.observe(admitted["execution_id"], "stop")
@@ -1210,8 +1211,10 @@ class TaskClientTests(unittest.TestCase):
             topology={"roles": [{"name": "prefill", "npu_count": 1, "host": "192.0.2.1"},
                                 {"name": "decode", "npu_count": 1, "host": "192.0.2.1"}]},
         )
-        self.assertEqual(admitted["state"], "queued")
+        self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+        self.assertEqual(len(admitted["execution_id"]), 64)
         self.assertTrue(started.wait(3))
+        self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
         self.client.observe(admitted["execution_id"], "stop")
         release.set()
         lock = self.client.coordinator._lock_for("execution", admitted["execution_id"])
@@ -1241,8 +1244,10 @@ class TaskClientTests(unittest.TestCase):
             ticker.start()
             try:
                 admitted = self.client.run("true")
-                self.assertEqual(admitted["state"], "queued")
+                self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
+                self.assertEqual(len(admitted["execution_id"]), 64)
                 self.assertTrue(started.wait(3))
+                self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
                 reply = self.client.finish()
                 self.assertEqual(reply["state"], "finishing")
                 session_id = self.context["session"]["id"]

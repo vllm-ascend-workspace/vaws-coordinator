@@ -127,27 +127,103 @@ class CoordinationTests(unittest.TestCase):
         self.assertIn('JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"', source)
         self.assertNotIn("VAWS_REMOTE_JOB_TOKEN", source)
 
+    def _job_child_env(self, *, public: str | None, legacy: str | None) -> dict[str, str]:
+        env = os.environ.copy()
+        if public is None:
+            env.pop(JOB_TOKEN_ENV, None)
+        else:
+            env[JOB_TOKEN_ENV] = public
+        if legacy is None:
+            env.pop("VAWS_REMOTE_JOB_TOKEN", None)
+        else:
+            env["VAWS_REMOTE_JOB_TOKEN"] = legacy
+        return env
+
+    def _wait_proc(self, pid: int) -> Path:
+        root = Path("/proc") / str(pid)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                (root / "stat").read_text()
+                (root / "environ").read_bytes()
+                return root
+            except (FileNotFoundError, ProcessLookupError):
+                time.sleep(0.01)
+        self.fail(f"/proc/{pid} stat/environ was not readable")
+
+    def _iter_only_pids(self, *pids: int):
+        entries = [Path("/proc") / str(pid) for pid in pids]
+        original = Path.iterdir
+
+        def iterdir(self_path):
+            if os.fspath(self_path) == "/proc":
+                yield from entries
+                return
+            yield from original(self_path)
+
+        return mock.patch.object(Path, "iterdir", iterdir)
+
     @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(), "process environ scan is Linux /proc")
     def test_process_guard_sees_remote_dev_job_token_not_legacy_name(self):
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         marker = os.urandom(16).hex()
-        env = os.environ.copy()
-        env[JOB_TOKEN_ENV] = marker
-        proc = subprocess.Popen(["sleep", "30"], env=env)
+        public_token = f"{JOB_TOKEN_ENV}={marker}".encode()
+        legacy_token = f"VAWS_REMOTE_JOB_TOKEN={marker}".encode()
+        guard = {"marker": marker, "boot_id": boot_id}
+        proc = subprocess.Popen(["sleep", "30"], env=self._job_child_env(public=marker, legacy=None))
         try:
-            guard = {"marker": marker, "boot_id": boot_id}
-            self.assertTrue(process_guard_busy(guard))
+            root = self._wait_proc(proc.pid)
+            pairs = (root / "environ").read_bytes().split(b"\0")
+            self.assertIn(public_token, pairs)
+            self.assertNotIn(legacy_token, pairs)
+            self.assertNotEqual((root / "stat").read_text().rsplit(") ", 1)[1].split()[0], "Z")
+            with self._iter_only_pids(proc.pid):
+                self.assertTrue(process_guard_busy(guard))
         finally:
             proc.kill()
             proc.wait(timeout=5)
-        stale = os.environ.copy()
-        stale["VAWS_REMOTE_JOB_TOKEN"] = marker
-        leftover = subprocess.Popen(["sleep", "30"], env=stale)
+        leftover = subprocess.Popen(["sleep", "30"], env=self._job_child_env(public=None, legacy=marker))
         try:
-            self.assertFalse(process_guard_busy({"marker": marker, "boot_id": boot_id}))
+            root = self._wait_proc(leftover.pid)
+            pairs = (root / "environ").read_bytes().split(b"\0")
+            self.assertNotIn(public_token, pairs)
+            self.assertIn(legacy_token, pairs)
+            self.assertNotEqual((root / "stat").read_text().rsplit(") ", 1)[1].split()[0], "Z")
+            with self._iter_only_pids(leftover.pid):
+                self.assertFalse(process_guard_busy(guard))
         finally:
             leftover.kill()
             leftover.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(), "process environ scan is Linux /proc")
+    def test_process_guard_permission_error_keeps_busy(self):
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        marker = os.urandom(16).hex()
+        blocked = Path("/proc") / "1"
+        original_iterdir = Path.iterdir
+        original_read_text = Path.read_text
+        original_read_bytes = Path.read_bytes
+
+        def iterdir(self_path):
+            if os.fspath(self_path) == "/proc":
+                yield blocked
+                return
+            yield from original_iterdir(self_path)
+
+        def read_text(self_path, *args, **kwargs):
+            if self_path.name == "stat" and self_path.parent == blocked:
+                raise PermissionError
+            return original_read_text(self_path, *args, **kwargs)
+
+        def read_bytes(self_path, *args, **kwargs):
+            if self_path.name == "environ" and self_path.parent == blocked:
+                raise PermissionError
+            return original_read_bytes(self_path, *args, **kwargs)
+
+        with mock.patch.object(Path, "iterdir", iterdir), \
+                mock.patch.object(Path, "read_text", read_text), \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            self.assertTrue(process_guard_busy({"marker": marker, "boot_id": boot_id}))
 
     def activate(self, task_id: str, *, heartbeat_ttl: int = 10) -> int:
         granted = self.coordinator.acquire(task_id, occupancy(), grant_ttl_seconds=10)
