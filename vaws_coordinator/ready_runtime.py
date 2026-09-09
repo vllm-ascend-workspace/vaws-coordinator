@@ -19,6 +19,7 @@ from typing import Any
 
 from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMINAL, ManagedExecution
 from vaws_coordinator.runtime_profile import digest
+from vaws_coordinator.code_identity import identity_workspace, manifest_code
 from vaws_coordinator.run_manifest import new_manifest, utc_now, write_manifest
 
 TERMINAL = {"released", "cancelled", "expired"}
@@ -320,10 +321,19 @@ class RuntimePool(ManagedExecution):
             return self.control(owner, key, "poll")
 
     def export_manifest(self, run, binding, job=None):
-        if job is None:
-            with self.transaction() as db:
+        session_key = (binding.get("intent") or {}).get("session")
+        if not session_key:
+            raise ValueError("binding has no session; cannot resolve code identity")
+        with self.transaction() as db:
+            session = self.get(db, "session", session_key)
+            if job is None:
                 job = next((row for row in self.rows(db, "job") if row["id"] == run["id"]), None)
+        # Session sources are the business trees (vllm, vllm-ascend); their
+        # commits already live on workspace_snapshot. code is the containing
+        # workspace — see identity_workspace.
+        code = manifest_code(identity_workspace(session["sources"]))
         manifest = new_manifest(run_type="debug", run_id="pool-" + run["id"], created_at=run["created_at"],
+                                code=code,
                                 workspace_snapshot=run["intent"]["snapshots"],
                                 environment={"profile_key": binding["profile_key"], "build_key": binding["build_key"],
                                              "endpoint": binding["endpoint"]},

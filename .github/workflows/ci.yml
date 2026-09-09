@@ -20,6 +20,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install the package and run tests
+        # remote-dev is a git package; its source URL belongs to the consumer
+        # (or this CI job), not to this library's published metadata.
         run: |
-          uv pip install -e ".[test]"
-          uv run python -m pytest -q
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.2.0"
+          uv pip install pytest
+          uv pip install -e . --no-deps
+          python -m pytest -q

@@ -1,0 +1,4 @@
+# Checkout-local only. Consumers do not read this file; they pin
+# vaws-remote-dev themselves. Do not move these sources into pyproject.toml.
+[sources]
+vaws-remote-dev = { git = "https://github.com/vllm-ascend-workspace/remote-dev", tag = "v0.2.0" }

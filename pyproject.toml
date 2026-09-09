@@ -11,7 +11,7 @@ license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Qi Mao" }]
 dependencies = [
-    "vaws-remote-dev",
+    "vaws-remote-dev>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -25,9 +25,6 @@ Homepage = "https://github.com/vllm-ascend-workspace/vaws-coordinator"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vaws_coordinator"]
-
-[tool.uv.sources]
-vaws-remote-dev = { git = "https://github.com/vllm-ascend-workspace/remote-dev", tag = "v0.1.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

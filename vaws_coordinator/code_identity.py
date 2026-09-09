@@ -12,6 +12,7 @@ module; this never locates a consumer skill script by filesystem path.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping
@@ -138,6 +139,56 @@ def manifest_code(workspace_root: Path | str) -> dict[str, Any]:
         "snapshot_commit": identity["snapshot_commit"],
         "dirty": identity["dirty"],
     }
+
+
+def identity_workspace(sources: Mapping[str, str]) -> Path:
+    """Choose the worktree whose Git identity goes on Run Manifest ``code``.
+
+    Session ``sources`` are the bound business trees (typically ``vllm`` and
+    ``vllm-ascend``). Their commits already populate ``workspace_snapshot``.
+    ``code`` answers which containing workspace produced the run.
+
+    When more than one source is bound, that workspace is the nearest git
+    worktree that contains every source path — the session or scaffold
+    checkout. This function does not pick ``vllm`` or ``vllm-ascend`` by
+    name. A single source with no containing parent uses that source's own
+    worktree. Multiple sources that share no containing worktree are an error.
+    """
+    if not sources:
+        raise CodeIdentityError(
+            "session has no source worktrees; cannot resolve code identity"
+        )
+    paths = [Path(path).expanduser().resolve() for path in sources.values()]
+    try:
+        common = Path(os.path.commonpath([str(path) for path in paths]))
+    except ValueError as exc:
+        raise CodeIdentityError(
+            "session source worktrees do not share a filesystem root"
+        ) from exc
+    cursor = common
+    while True:
+        if (cursor / ".git").exists() and all(
+            path == cursor or cursor in path.parents for path in paths
+        ):
+            return cursor
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    if len(paths) == 1:
+        cursor = paths[0]
+        while True:
+            if (cursor / ".git").exists():
+                return cursor
+            if cursor.parent == cursor:
+                break
+            cursor = cursor.parent
+        raise CodeIdentityError(f"not a git worktree: {paths[0]}")
+    raise CodeIdentityError(
+        f"session has {len(sources)} source worktrees "
+        f"({', '.join(sorted(sources))}) with no common containing git "
+        "worktree; code identity is that containing workspace, not a "
+        "business tree picked by name"
+    )
 
 
 def collect_referenced_snapshot_commits(workspace_root: Path) -> set[str]:

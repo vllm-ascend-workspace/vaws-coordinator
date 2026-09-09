@@ -43,11 +43,7 @@ STATUS_TRANSITIONS = {
 SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RFC3339_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
-DEFAULT_CODE = {
-    "source_head": "0" * 40,
-    "snapshot_commit": "0" * 40,
-    "dirty": False,
-}
+ZERO_SHA = "0" * 40
 SECRET_ENV_RE = re.compile(
     r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|"
     r"PASS(?:WD|WORD)?|SECRET|TOKEN|KEY)(?:_|$)",
@@ -85,7 +81,10 @@ def _resolve_code(
         from vaws_coordinator.code_identity import manifest_code
 
         return manifest_code(workspace_root)
-    return dict(DEFAULT_CODE)
+    raise RunManifestError(
+        "code identity is required: pass code= or workspace_root=; "
+        "a fabricated all-zero SHA is not an identity"
+    )
 
 
 def new_manifest(
@@ -194,6 +193,10 @@ def _validate_code(value: Any, errors: list[str]) -> None:
         sha = item.get(field)
         if not isinstance(sha, str) or not GIT_SHA_RE.fullmatch(sha):
             errors.append(f"code.{field} must be 40 lowercase hex characters")
+        elif sha == ZERO_SHA:
+            errors.append(
+                f"code.{field} is the all-zero sentinel, not a Git commit"
+            )
     if type(item.get("dirty")) is not bool:
         errors.append("code.dirty must be a boolean")
     unknown = sorted(set(item) - {"source_head", "snapshot_commit", "dirty"})

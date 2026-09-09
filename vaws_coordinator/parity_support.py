@@ -1,9 +1,12 @@
 """Private helpers for the coordinator-owned parity implementation.
 
 Git, state, and the current SSH transport used by materialization live here so
-the package does not reach into a consumer working tree. The SSH option set
-is a private copy of the scaffold's ``vaws_ssh.base_ssh_options``; P1/P18
-replace this transport with remote-dev.
+the package does not reach into a consumer working tree.
+
+``base_ssh_options`` is a provisional private copy of the scaffold's
+``vaws_ssh.base_ssh_options``. Do not grow this copy. P1/P18 replace the
+raw-SSH transport with the ``vaws-remote-dev`` package, which then owns
+endpoint option knowledge.
 """
 from __future__ import annotations
 

@@ -21,8 +21,10 @@ uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main va
 Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
 is the same entry as `vaws-coordinator`.
 
-The package depends on `vaws-remote-dev` (import `remote_dev`), pinned to
-tag `v0.1.0` via `[tool.uv.sources]`.
+The package depends on `vaws-remote-dev>=0.1.0` (import `remote_dev`). It
+does not pin that package's git source; the workspace that installs this
+library chooses the tag. This checkout's `uv.toml` is local-only so `uv sync`
+here can resolve remote-dev.
 
 ## Start the task server
 
