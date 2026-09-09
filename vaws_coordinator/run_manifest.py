@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Shared Run Manifest v1 helpers for workspace domain workflows."""
+"""Run Manifest v1: Git-identity evidence records for workspace workflows.
+
+Owned by vaws-coordinator. ``code`` is required and is Git identity
+(``source_head``, ``snapshot_commit``), never a content hash of source files.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -37,10 +41,16 @@ STATUS_TRANSITIONS = {
     "cancelled": frozenset(),
 }
 SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RFC3339_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+DEFAULT_CODE = {
+    "source_head": "0" * 40,
+    "snapshot_commit": "0" * 40,
+    "dirty": False,
+}
 SECRET_ENV_RE = re.compile(
-    r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|PASS(?:WORD)?|SECRET|TOKEN)(?:_|$)",
+    r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|"
+    r"PASS(?:WD|WORD)?|SECRET|TOKEN|KEY)(?:_|$)",
     re.IGNORECASE,
 )
 
@@ -61,11 +71,30 @@ def generate_run_id(run_type: str, *, now: str | None = None) -> str:
     return f"{run_type}-{timestamp}-{uuid.uuid4().hex[:8]}"
 
 
+def _resolve_code(
+    code: Mapping[str, Any] | None,
+    workspace_root: Path | str | None,
+) -> dict[str, Any]:
+    if code is not None:
+        return {
+            "source_head": code["source_head"],
+            "snapshot_commit": code["snapshot_commit"],
+            "dirty": bool(code["dirty"]),
+        }
+    if workspace_root is not None:
+        from vaws_coordinator.code_identity import manifest_code
+
+        return manifest_code(workspace_root)
+    return dict(DEFAULT_CODE)
+
+
 def new_manifest(
     *,
     run_type: str,
     run_id: str | None = None,
     parent_run_id: str | None = None,
+    code: Mapping[str, Any] | None = None,
+    workspace_root: Path | str | None = None,
     workspace_snapshot: Mapping[str, Any] | None = None,
     environment: Mapping[str, Any] | None = None,
     model: Mapping[str, Any] | None = None,
@@ -80,6 +109,7 @@ def new_manifest(
         "run_id": run_id or generate_run_id(run_type, now=timestamp),
         "parent_run_id": parent_run_id,
         "run_type": run_type,
+        "code": _resolve_code(code, workspace_root),
         "workspace_snapshot": dict(workspace_snapshot or {}),
         "environment": dict(environment or {}),
         "model": dict(model or {}),
@@ -100,6 +130,31 @@ def _require_mapping(value: Any, path: str, errors: list[str]) -> Mapping[str, A
         errors.append(f"{path} must be an object")
         return {}
     return value
+
+
+def _is_json_native(value: Any) -> bool:
+    """True when ``value`` survives JSON dump/load without coercion.
+
+    The published schema is the contract; this check is a strict subset
+    so integer keys, NaN/Inf, tuples and other non-JSON values cannot
+    validate and then round-trip as something else.
+    """
+    if value is None or isinstance(value, str):
+        return True
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_json_native(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _is_json_native(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _validate_safe_id(value: Any, path: str, errors: list[str], *, nullable: bool = False) -> None:
@@ -124,16 +179,32 @@ def _validate_artifacts(value: Any, errors: list[str]) -> None:
             if name in names:
                 errors.append(f"artifact name is duplicated: {name!r}")
             names.add(name)
-        sha256 = item.get("sha256")
-        if sha256 is not None and (
-            not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256)
-        ):
-            errors.append(f"artifacts[{index}].sha256 must be 64 lowercase hex characters")
+        unknown = sorted(set(item) - {"name", "kind", "uri"})
+        if unknown:
+            errors.append(
+                f"artifacts[{index}] has unknown fields: {', '.join(unknown)}"
+            )
+
+
+def _validate_code(value: Any, errors: list[str]) -> None:
+    item = _require_mapping(value, "code", errors)
+    if not item:
+        return
+    for field in ("source_head", "snapshot_commit"):
+        sha = item.get(field)
+        if not isinstance(sha, str) or not GIT_SHA_RE.fullmatch(sha):
+            errors.append(f"code.{field} must be 40 lowercase hex characters")
+    if type(item.get("dirty")) is not bool:
+        errors.append("code.dirty must be a boolean")
+    unknown = sorted(set(item) - {"source_head", "snapshot_commit", "dirty"})
+    if unknown:
+        errors.append(f"code has unknown fields: {', '.join(unknown)}")
 
 
 def validate_manifest(manifest: Mapping[str, Any]) -> None:
     errors: list[str] = []
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    version = manifest.get("schema_version")
+    if type(version) is not int or version != SCHEMA_VERSION:
         errors.append(f"schema_version must be {SCHEMA_VERSION}")
     _validate_safe_id(manifest.get("run_id"), "run_id", errors)
     _validate_safe_id(manifest.get("parent_run_id"), "parent_run_id", errors, nullable=True)
@@ -146,7 +217,13 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         errors.append(f"status must be one of: {', '.join(sorted(RUN_STATUSES))}")
 
     for field in ("workspace_snapshot", "environment", "model", "topology"):
-        _require_mapping(manifest.get(field), field, errors)
+        mapping = _require_mapping(manifest.get(field), field, errors)
+        if mapping and not _is_json_native(
+            mapping if isinstance(mapping, dict) else dict(mapping)
+        ):
+            errors.append(
+                f"{field} must be JSON-native (string keys, no NaN/Inf)"
+            )
 
     command = manifest.get("command")
     if not isinstance(command, list) or any(not isinstance(part, str) for part in command):
@@ -160,6 +237,7 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         if SECRET_ENV_RE.search(key):
             errors.append(f"environment_variables must not contain secret-like key: {key}")
 
+    _validate_code(manifest.get("code"), errors)
     _validate_artifacts(manifest.get("artifacts"), errors)
 
     for field in ("created_at", "updated_at"):
@@ -172,6 +250,7 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         "run_id",
         "parent_run_id",
         "run_type",
+        "code",
         "workspace_snapshot",
         "environment",
         "model",
@@ -214,26 +293,14 @@ def add_artifact(
     name: str,
     kind: str,
     uri: str,
-    sha256: str | None = None,
     updated_at: str | None = None,
 ) -> dict[str, Any]:
     validate_manifest(manifest)
-    artifact = {"name": name, "kind": kind, "uri": uri}
-    if sha256 is not None:
-        artifact["sha256"] = sha256
     updated = deepcopy(dict(manifest))
-    updated["artifacts"].append(artifact)
+    updated["artifacts"].append({"name": name, "kind": kind, "uri": uri})
     updated["updated_at"] = updated_at or utc_now()
     validate_manifest(updated)
     return updated
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -256,7 +323,14 @@ def write_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(
+                manifest,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())

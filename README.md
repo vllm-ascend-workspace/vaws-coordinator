@@ -70,7 +70,9 @@ from vaws_coordinator.host_queue import (
 ```
 
 `host/vaws_npu_coordination.py` stays stdlib-only. It is shipped over SSH and
-executed on the physical host. Durable host state is `/tmp/vaws-npu-coordinator/v1/`.
+executed on the physical host. Durable host state defaults to
+`/tmp/vaws-npu-coordinator/v1/` and is overridden by
+`VAWS_NPU_COORDINATOR_STATE_DIR` or `request["state_dir"]`.
 `VAWS_HOST_QUEUE_MODULE` overrides the bundled file.
 
 ## Layout
@@ -84,7 +86,10 @@ executed on the physical host. Durable host state is `/tmp/vaws-npu-coordinator/
 | `vaws_coordinator/backend.py` | Container/host probes via `remote_dev` |
 | `vaws_coordinator/prepare_runtime.py` | In-container attest / publish / restore |
 | `vaws_coordinator/workers/` | Linux supervisor source, shipped into a container |
-| `vaws_coordinator/vendor/vaws_run_manifest.py` | Scaffold Run Manifest v1 copy (git-pinned) |
+| `vaws_coordinator/run_manifest.py` | Run Manifest v1 (Git identity in `code`) |
+| `vaws_coordinator/code_identity.py` | Git snapshot identity for manifests |
+| `vaws_coordinator/parity.py` | Working-tree snapshot and remote materialization |
+| `vaws_coordinator/machine_directory.py` | Coordinator-owned machine directory |
 
 ## Development
 

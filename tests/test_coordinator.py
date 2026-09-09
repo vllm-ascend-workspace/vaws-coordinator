@@ -243,7 +243,7 @@ class PoolTests(unittest.TestCase):
         recovered = self.pool.control("alice", run["id"], "poll")
         self.assertEqual(recovered["state"], "granted")
         self.assertEqual(recovered["task_id"], run["task_id"])
-        from vaws_coordinator.vendor.vaws_run_manifest import load_manifest
+        from vaws_coordinator.run_manifest import load_manifest
         manifest = load_manifest(self.root / "manager/runs" / (run["id"] + ".json"))
         self.assertEqual(manifest["status"], "planned")
         self.assertEqual(manifest["environment"]["coordination"]["state"], "granted")
