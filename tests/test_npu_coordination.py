@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import select
 import subprocess
 import sys
 import tempfile
@@ -139,17 +140,105 @@ class CoordinationTests(unittest.TestCase):
             env["VAWS_REMOTE_JOB_TOKEN"] = legacy
         return env
 
-    def _wait_proc(self, pid: int) -> Path:
-        root = Path("/proc") / str(pid)
-        deadline = time.time() + 2
-        while time.time() < deadline:
+    def _spawn_ready_child(self, env: dict[str, str]) -> subprocess.Popen:
+        script = (
+            "import sys, time\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+        return subprocess.Popen(
+            [sys.executable, "-u", "-c", script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _stop_child(self, proc: subprocess.Popen | None) -> None:
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.kill()
             try:
-                (root / "stat").read_text()
-                (root / "environ").read_bytes()
-                return root
-            except (FileNotFoundError, ProcessLookupError):
-                time.sleep(0.01)
-        self.fail(f"/proc/{pid} stat/environ was not readable")
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+    def _proc_diag(self, proc: subprocess.Popen) -> str:
+        root = Path("/proc") / str(proc.pid)
+        try:
+            stat = (root / "stat").read_text()
+            state = stat.rsplit(") ", 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, IndexError) as exc:
+            stat, state = f"<unreadable {type(exc).__name__}: {exc}>", "?"
+        try:
+            environ = (root / "environ").read_bytes()
+            env_note = f"{len(environ)} bytes"
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError) as exc:
+            environ, env_note = b"", f"unreadable {type(exc).__name__}: {exc}"
+        stderr = b""
+        if proc.stderr is not None:
+            try:
+                if proc.poll() is None:
+                    os.set_blocking(proc.stderr.fileno(), False)
+                stderr = proc.stderr.read() or b""
+            except (OSError, ValueError, BlockingIOError, TypeError):
+                pass
+        return (
+            f"pid={proc.pid} returncode={proc.poll()} stat_state={state} "
+            f"environ={env_note} stat={stat[:200]!r} stderr={stderr[:500]!r}"
+        )
+
+    def _await_live_environ(self, proc: subprocess.Popen, expected: bytes) -> Path:
+        stdout = proc.stdout
+        if stdout is None:
+            self.fail(f"child {self._proc_diag(proc)} has no stdout ready pipe")
+        deadline = time.time() + 5
+        buf = b""
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            readable, _, _ = select.select([stdout], [], [], remaining)
+            if readable:
+                chunk = os.read(stdout.fileno(), 64)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"ready\n" in buf:
+                    break
+            if proc.poll() is not None:
+                self.fail(f"child died before ready signal {self._proc_diag(proc)}")
+        else:
+            self.fail(f"child never emitted ready signal stdout={buf!r} {self._proc_diag(proc)}")
+        if b"ready\n" not in buf:
+            self.fail(
+                f"child closed stdout without ready signal stdout={buf!r} {self._proc_diag(proc)}"
+            )
+        deadline = time.time() + 2
+        last = "no /proc snapshot"
+        while time.time() < deadline:
+            root = Path("/proc") / str(proc.pid)
+            try:
+                stat = (root / "stat").read_text()
+                state = stat.rsplit(") ", 1)[1].split()[0]
+                environ = (root / "environ").read_bytes()
+                last = f"stat_state={state} environ_bytes={len(environ)} returncode={proc.poll()}"
+                if state != "Z" and expected in environ.split(b"\0"):
+                    return root
+            except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, IndexError) as exc:
+                last = f"{type(exc).__name__}: {exc} returncode={proc.poll()}"
+            if proc.poll() is not None:
+                self.fail(
+                    f"child died after ready before /proc showed expected token "
+                    f"{last} {self._proc_diag(proc)}"
+                )
+            time.sleep(0.01)
+        self.fail(
+            f"child ready but /proc never showed expected token {last} {self._proc_diag(proc)}"
+        )
 
     def _iter_only_pids(self, *pids: int):
         entries = [Path("/proc") / str(pid) for pid in pids]
@@ -170,9 +259,11 @@ class CoordinationTests(unittest.TestCase):
         public_token = f"{JOB_TOKEN_ENV}={marker}".encode()
         legacy_token = f"VAWS_REMOTE_JOB_TOKEN={marker}".encode()
         guard = {"marker": marker, "boot_id": boot_id}
-        proc = subprocess.Popen(["sleep", "30"], env=self._job_child_env(public=marker, legacy=None))
+        proc = None
+        leftover = None
         try:
-            root = self._wait_proc(proc.pid)
+            proc = self._spawn_ready_child(self._job_child_env(public=marker, legacy=None))
+            root = self._await_live_environ(proc, public_token)
             pairs = (root / "environ").read_bytes().split(b"\0")
             self.assertIn(public_token, pairs)
             self.assertNotIn(legacy_token, pairs)
@@ -180,11 +271,10 @@ class CoordinationTests(unittest.TestCase):
             with self._iter_only_pids(proc.pid):
                 self.assertTrue(process_guard_busy(guard))
         finally:
-            proc.kill()
-            proc.wait(timeout=5)
-        leftover = subprocess.Popen(["sleep", "30"], env=self._job_child_env(public=None, legacy=marker))
+            self._stop_child(proc)
         try:
-            root = self._wait_proc(leftover.pid)
+            leftover = self._spawn_ready_child(self._job_child_env(public=None, legacy=marker))
+            root = self._await_live_environ(leftover, legacy_token)
             pairs = (root / "environ").read_bytes().split(b"\0")
             self.assertNotIn(public_token, pairs)
             self.assertIn(legacy_token, pairs)
@@ -192,8 +282,7 @@ class CoordinationTests(unittest.TestCase):
             with self._iter_only_pids(leftover.pid):
                 self.assertFalse(process_guard_busy(guard))
         finally:
-            leftover.kill()
-            leftover.wait(timeout=5)
+            self._stop_child(leftover)
 
     @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(), "process environ scan is Linux /proc")
     def test_process_guard_permission_error_keeps_busy(self):
