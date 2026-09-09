@@ -155,6 +155,31 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"]["outcome"], "blocked")
         self.assertIn("invalid local execution id", result["structuredContent"]["summary"])
 
+    def test_vaws_execution_rejects_another_task_before_the_coordinator(self):
+        other = self.registry.store.attach("codex", "native-other", str(self.root))
+        row = self.registry.store.execution(self.registry.context, "owned-fixture", {"command": "true"})
+        row.update(phase="cancelled", user="alice", roles=[])
+        self.registry.store.save_execution(row)
+        with mock.patch("vaws_coordinator.service.ensure_daemon",
+                        side_effect=AssertionError("coordinator must not start for a foreign execution")):
+            for action in ("status", "tail", "stop", "target"):
+                with self.subTest(action=action):
+                    response = handle({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "vaws_execution",
+                                   "arguments": {"context_file": other["context_file"],
+                                                 "execution_id": row["id"], "action": action}},
+                    })
+                    result = response["result"]
+                    self.assertTrue(result["isError"], result)
+                    self.assertEqual(result["structuredContent"]["tool"], "vaws.execution")
+                    self.assertEqual(result["structuredContent"]["outcome"], "blocked")
+                    self.assertIn("another VAWS task", result["structuredContent"]["summary"])
+        with self.registry.store.transaction() as db:
+            latest = self.registry.store.get(db, "execution", row["id"])
+        self.assertEqual(latest["phase"], "cancelled")
+        self.assertFalse(latest.get("cancel_requested"))
+
     def test_vaws_finish_completes_locally_and_the_dotted_name_is_still_accepted(self):
         result = self.call("vaws.finish")
         self.assertFalse(result["isError"])
