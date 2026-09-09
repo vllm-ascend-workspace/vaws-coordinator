@@ -96,8 +96,15 @@ executed on the physical host. Durable host state defaults to
 
 ## Development
 
-remote-dev is a git package. Install its source first, then this tree
-without resolving dependencies from an index:
+`uv sync` is not the setup path. This library declares
+`vaws-remote-dev>=0.1.0` without a git source: remote-dev is not on PyPI,
+so `uv sync` / `uv lock` fail with an unsatisfiable-dependency error.
+That is intentional. A library that pinned remote-dev's git URL would
+take the upgrade decision away from every consumer, and
+`constraint-dependencies` cannot carry a git URL.
+
+Install the git source first, then this tree without resolving
+dependencies from an index:
 
 ```bash
 uv venv
