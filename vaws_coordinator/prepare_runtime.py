@@ -33,6 +33,7 @@ DRIVER_VERSION_CANDIDATES = (
 REMOTE_CAPTURE_SUFFIX = r'''
 import importlib.metadata
 import os
+import subprocess
 import sys
 import sysconfig
 
@@ -66,6 +67,14 @@ if not soc:
     raise ValueError("cannot attest soc: SOC_VERSION is not set in the environment")
 compiler = os.environ.get("CXX") or os.environ.get("C_COMPILER") or os.environ.get("CXX_COMPILER")
 if not compiler:
+    # Use the actual custom-op build selection when no compiler was exported.
+    cache = root / "vllm-ascend/csrc/build/CMakeCache.txt"
+    if cache.is_file():
+        for line in cache.read_text().splitlines():
+            if line.startswith("CMAKE_CXX_COMPILER:FILEPATH="):
+                compiler = line.partition("=")[2].strip()
+                break
+if not compiler:
     raise ValueError("cannot attest compiler")
 python_abi = sysconfig.get_config_var("SOABI")
 if not python_abi:
@@ -94,30 +103,21 @@ if recipe:
     profile["recipe"] = recipe
 if args.get("machine_type"):
     profile["machine_type"] = args["machine_type"]
-for key in ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_HOME_PATH"):
-    if os.environ.get(key):
-        profile["launch_env"][key] = os.environ[key]
+profile["launch_env"] = capture_launch_environment(dict(os.environ))
 
-files = {}
-for path in sorted(root.rglob("*")):
-    if not path.is_file() or path.is_symlink():
-        continue
-    rel = path.relative_to(root).as_posix()
-    if ".." in Path(rel).parts:
-        continue
-    if path.suffix == ".so" and "library" not in files.values():
-        files[rel] = "library"
-    elif path.name in {"binary_info_config.json", "version.txt"} and "metadata" not in files.values():
-        files[rel] = "metadata"
-    if "library" in files.values() and "metadata" in files.values():
-        break
-if "library" not in files.values() or "metadata" not in files.values():
-    raise ValueError("cannot attest a complete native bundle; library and metadata artifacts are required")
+files = installed_native_files(root)
 
 evidence_dir = root / ".vaws-runtime/profile-evidence"
 evidence_dir.mkdir(parents=True, exist_ok=True)
-smoke = {"passed": True, "profile_key": profile_key(profile)}
+result = subprocess.run(
+    [sys.executable, "-c", "import torch_npu, vllm, vllm_ascend, acl; import vllm_ascend.vllm_ascend_C"],
+    capture_output=True, text=True, timeout=30,
+)
+smoke = {"passed": result.returncode == 0, "profile_key": profile_key(profile),
+         "stdout": result.stdout[-4000:], "stderr": result.stderr[-8000:]}
 (evidence_dir / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
+if not smoke["passed"]:
+    raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
 (evidence_dir / "cann.json").write_text(json.dumps(profile["system_files"]["cann"], sort_keys=True) + "\n")
 (evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
 inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))

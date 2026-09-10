@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,31 @@ class IsolatedPrepareScriptTests(unittest.TestCase):
         self.assertIn("/tmp/task root/.venv/bin/python", after_preamble)
         self.assertNotIn("ls -1d /usr/local/python", after_preamble)
         self.assertIn('"$PYTHON" -m pip uninstall', after_preamble)
+
+    def test_venv_uses_prepared_image_python_instead_of_ssh_path(self):
+        from vaws_coordinator.provision.task_environment import create_venv_script
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad_bin = root / "system-bin"
+            bad_bin.mkdir()
+            bad = bad_bin / "python3"
+            bad.write_text("#!/bin/sh\necho missing-ensurepip >&2\nexit 97\n")
+            bad.chmod(0o755)
+            task = root / "task root"
+            python = task / ".venv/bin/python"
+            image_python = getattr(sys, "_base_executable", sys.executable)
+            preamble = ("export PYTHON=" + shlex.quote(image_python),)
+            with mock.patch("vaws_coordinator.parity.DEFAULT_ENV_PREAMBLE", preamble):
+                script = create_venv_script(str(task), str(python))
+            result = subprocess.run(["bash", "-c", script], text=True,
+                                    capture_output=True, timeout=30,
+                                    env={**os.environ, "PATH": str(bad_bin) + os.pathsep + os.environ["PATH"]})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(python.is_file())
+            actual = subprocess.check_output([str(python), "-c", "import sys; print(sys.base_prefix)"], text=True)
+            expected = subprocess.check_output([image_python, "-c", "import sys; print(sys.base_prefix)"], text=True)
+            self.assertEqual(actual, expected)
+            self.assertIn("include-system-site-packages = true", (task / ".venv/pyvenv.cfg").read_text())
 
     def test_git_clean_preserves_venv_and_build_without_gitignore(self):
         preserve = resolved_root_preserve_paths(DEFAULT_MARKER_DIRNAME, [])

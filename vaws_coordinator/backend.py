@@ -232,7 +232,12 @@ print(json.dumps(manifest))
             "cann_files": list(CANN_VERSION_CANDIDATES),
             "driver_files": list(DRIVER_VERSION_CANDIDATES),
         })
+        from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE, task_python_exports
+
         runner = "\n_build_namespace = {}\nexec(" + repr(build_source) + ", _build_namespace)\n" + REMOTE_CAPTURE_SUFFIX
-        command = (shlex.quote(python) + " - " + shlex.quote(request)
+        preamble = "\n".join([
+            "set -euo pipefail", *DEFAULT_ENV_PREAMBLE, *task_python_exports(python),
+        ])
+        command = (preamble + "\n" + shlex.quote(python) + " - " + shlex.quote(request)
                    + " <<'VAWS_CAPTURE_PROBE'\n" + module + runner + "\nVAWS_CAPTURE_PROBE\n")
         self.bash(spec["endpoint"], command)

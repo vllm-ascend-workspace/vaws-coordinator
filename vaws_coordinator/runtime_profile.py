@@ -21,6 +21,24 @@ PROFILE_FIELDS = ("image_digest", "soc", "driver", "cann", "python_abi",
                   "torch", "torch_npu", "vllm", "vllm_ascend", "compiler")
 PACKAGES = {"torch": "torch", "torch_npu": "torch-npu", "vllm": "vllm",
             "vllm_ascend": "vllm-ascend"}
+LAUNCH_PATH_KEYS = (
+    "PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_HOME_PATH",
+    "ASCEND_OPP_PATH", "ASCEND_AICPU_PATH", "ASCEND_TOOLKIT_HOME",
+    "ASCEND_CUSTOM_OPP_PATH", "ATB_HOME_PATH", "TOOLCHAIN_HOME", "SOC_VERSION",
+)
+
+
+def capture_launch_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Carry CANN discovery paths into the clean managed-worker environment.
+
+    Device assignment belongs to the host lease. A temporary Python shim is
+    removed by the preparation shell and must not become profile identity.
+    """
+    captured = {key: environment[key] for key in LAUNCH_PATH_KEYS if environment.get(key)}
+    shim = environment.get("VAWS_PYTHON_SHIM_DIR")
+    if shim and "PATH" in captured:
+        captured["PATH"] = os.pathsep.join(part for part in captured["PATH"].split(os.pathsep) if part != shim)
+    return captured
 
 
 def digest(value: Any) -> str:
@@ -49,6 +67,51 @@ def checked_file(root: Path, relative: str) -> Path:
     if path.name == "CMakeCache.txt":
         raise ValueError("CMakeCache.txt is not a reusable runtime artifact")
     return path
+
+
+def installed_native_files(root: Path) -> dict[str, str]:
+    """Enumerate the installed editable extension and complete custom-op tree.
+
+    Build intermediates and unrelated venv libraries cannot attest an install.
+    Keep every vendor binary/configuration instead of sampling the first file.
+    Flatten internal file aliases so the bundle also contains loadable aliases;
+    external links and directory links are not portable installed artifacts.
+    """
+    root = root.resolve()
+    for name in ("vllm-ascend", "vllm-ascend/vllm_ascend", "vllm-ascend/vllm_ascend/_cann_ops_custom"):
+        if (root / name).is_symlink():
+            raise ValueError("symlinked installed bundle directory: " + name)
+    package = root / "vllm-ascend/vllm_ascend"
+    extensions = sorted(package.glob("*.so"))
+    if not any(path.name.startswith("vllm_ascend_C") for path in extensions):
+        raise ValueError("cannot attest installed vllm_ascend_C extension")
+    vendor = package / "_cann_ops_custom"
+    for path in sorted(vendor.rglob("*")):
+        if not path.is_symlink():
+            continue
+        target = path.resolve()
+        if not path.is_file() or not target.is_relative_to(vendor.resolve()):
+            raise ValueError("external or directory symlink in installed bundle: " + str(path))
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".attest-", delete=False) as stream:
+            temporary = Path(stream.name)
+        try:
+            shutil.copy2(target, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    outputs = sorted(path for path in vendor.rglob("*") if path.is_file())
+    binaries = [path for path in outputs if path.suffix in {".so", ".o"} or ".so." in path.name]
+    configs = [path for path in outputs if path.suffix in {".json", ".ini"}]
+    if not binaries or not configs:
+        raise ValueError("cannot attest complete installed custom-op binaries and metadata")
+    files = {}
+    for path in [*extensions, *outputs]:
+        if path.name == ".gitkeep":
+            continue
+        relative = path.relative_to(root).as_posix()
+        checked_file(root, relative)
+        files[relative] = "library" if path in extensions or path in binaries else "metadata"
+    return files
 
 
 def profile_key(profile: dict[str, Any]) -> str:
