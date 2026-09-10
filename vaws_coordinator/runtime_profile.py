@@ -51,6 +51,51 @@ def checked_file(root: Path, relative: str) -> Path:
     return path
 
 
+def installed_native_files(root: Path) -> dict[str, str]:
+    """Enumerate the installed editable extension and complete custom-op tree.
+
+    Build intermediates and unrelated venv libraries cannot attest an install.
+    Keep every vendor binary/configuration instead of sampling the first file.
+    Flatten internal file aliases so the bundle also contains loadable aliases;
+    external links and directory links are not portable installed artifacts.
+    """
+    root = root.resolve()
+    for name in ("vllm-ascend", "vllm-ascend/vllm_ascend", "vllm-ascend/vllm_ascend/_cann_ops_custom"):
+        if (root / name).is_symlink():
+            raise ValueError("symlinked installed bundle directory: " + name)
+    package = root / "vllm-ascend/vllm_ascend"
+    extensions = sorted(package.glob("*.so"))
+    if not any(path.name.startswith("vllm_ascend_C") for path in extensions):
+        raise ValueError("cannot attest installed vllm_ascend_C extension")
+    vendor = package / "_cann_ops_custom"
+    for path in sorted(vendor.rglob("*")):
+        if not path.is_symlink():
+            continue
+        target = path.resolve()
+        if not path.is_file() or not target.is_relative_to(vendor.resolve()):
+            raise ValueError("external or directory symlink in installed bundle: " + str(path))
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".attest-", delete=False) as stream:
+            temporary = Path(stream.name)
+        try:
+            shutil.copy2(target, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    outputs = sorted(path for path in vendor.rglob("*") if path.is_file())
+    binaries = [path for path in outputs if path.suffix in {".so", ".o"} or ".so." in path.name]
+    configs = [path for path in outputs if path.suffix in {".json", ".ini"}]
+    if not binaries or not configs:
+        raise ValueError("cannot attest complete installed custom-op binaries and metadata")
+    files = {}
+    for path in [*extensions, *outputs]:
+        if path.name == ".gitkeep":
+            continue
+        relative = path.relative_to(root).as_posix()
+        checked_file(root, relative)
+        files[relative] = "library" if path in extensions or path in binaries else "metadata"
+    return files
+
+
 def profile_key(profile: dict[str, Any]) -> str:
     if any(not isinstance(profile.get(key), str) or not profile[key].strip() for key in PROFILE_FIELDS):
         raise ValueError("profile requires exact versions: " + ", ".join(PROFILE_FIELDS))
