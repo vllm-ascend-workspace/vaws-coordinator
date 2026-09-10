@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from pathlib import PurePosixPath
 
 from vaws_coordinator.runtime_profile import digest
 
@@ -158,6 +159,11 @@ class ManagedExecution:
                     command = binding.get("launch_preamble", "")
                     if python:
                         command += "\nexport VAWS_PYTHON=" + shlex.quote(python)
+                    # The task root contains repository directories which can
+                    # shadow editable packages as namespace packages.
+                    source_paths = ":".join(str(PurePosixPath(binding["endpoint"]["cwd"]) / name)
+                                            for name in ("vllm", "vllm-ascend"))
+                    command += "\nexport PYTHONPATH=" + shlex.quote(source_paths) + '"${PYTHONPATH:+:$PYTHONPATH}"'
                     command += ("\nexport ASCEND_RT_VISIBLE_DEVICES="
                                 + shlex.quote(run["environment"]["ASCEND_RT_VISIBLE_DEVICES"]))
                     if run["environment"].get("VAWS_SERVICE_PORT"):

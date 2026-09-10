@@ -64,6 +64,17 @@ the daemon places, prepares, launches and observes it. Pass the `context_file` s
 native session hook; never guess a task from cwd or history. Do not pass
 request IDs, profile hashes, or runtime IDs.
 
+Managed launches prepend their verified task-local `vllm` and `vllm-ascend`
+source directories to Python's import path. This prevents repository directories
+in the task cwd from shadowing editable packages, while preserving the CANN
+and other support paths already supplied by the environment.
+
+For serving, `service_port=0` asks the host coordinator to select a free port.
+If a task runtime has no declared service ports, automatic selection uses the
+host's default serving range (30000–45999). A nonempty declaration restricts
+selection to those ports; an explicit port must be declared. Both paths check
+listening sockets and existing leases, and release ports with the execution.
+
 ## Host NPU queue (Python API)
 
 The scaffold imports the public allocation surface from one place:

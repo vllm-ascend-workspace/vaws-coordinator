@@ -853,6 +853,43 @@ class PoolTests(unittest.TestCase):
         self.assertIn((46001, "container_ssh", "ssh.alice"), ports)
         self.assertFalse(any(kind == "service" for _, kind, _ in ports))
 
+    def test_managed_launch_imports_bound_sources_from_task_root(self):
+        import shlex
+
+        root = self.root / "prepared role 空格"
+        for repo, package, body in (
+            ("vllm", "vllm", "SamplingParams = 'bound-vllm'\n"),
+            ("vllm-ascend", "vllm_ascend", "marker = 'bound-ascend'\n"),
+            ("support", "runtime_support", "marker = 'kept-support'\n"),
+        ):
+            package_dir = root / repo / package
+            package_dir.mkdir(parents=True)
+            (package_dir / "__init__.py").write_text(body)
+        self.backend.attestation["launch_preamble"] = "export PYTHONPATH=" + shlex.quote(str(root / "support"))
+        self.pool.register("runtime-a", runtime_spec(1, root=str(root), python=sys.executable))
+        binding = self.bind("alice", self.root / "a")
+        prepared = {}
+        original_job = self.backend.job
+
+        def record_spec(runtime, job_id, action, **params):
+            if action == "prepare":
+                prepared.update(params["spec"])
+            return original_job(runtime, job_id, action, **params)
+
+        code = ("import json; from vllm import SamplingParams; import vllm_ascend, runtime_support; "
+                "print(json.dumps([SamplingParams, vllm_ascend.marker, runtime_support.marker]))")
+        with mock.patch.object(self.backend, "job", side_effect=record_spec):
+            job = self.pool.managed_start(
+                "alice", binding["id"], "source-import", {"vllm": "a" * 40, "vllm-ascend": "b" * 40},
+                "native-a", [0], 0, shlex.join([sys.executable, "-c", code]), {}, 60,
+            )
+        self.assertEqual(job["state"], "running")
+        output = subprocess.check_output(
+            ["bash", "-c", prepared["command"]], cwd=prepared["cwd"],
+            env={**os.environ, **prepared["env"]}, text=True,
+        )
+        self.assertEqual(json.loads(output), ["bound-vllm", "bound-ascend", "kept-support"])
+
     def test_two_roots_in_one_container_run_concurrently_and_stop_is_scoped(self):
         second_root = self.pool.register("runtime-a2", runtime_spec(2, user="alice", python="/opt/alice/venvs/root-2/bin/python"))
         alice = self.bind("alice", self.root / "a")
@@ -1003,6 +1040,25 @@ class TaskClientTests(unittest.TestCase):
         observed = self.client.observe(reply["execution_id"], "target")
         self.assertEqual(observed["target"]["runtime_id"], "runtime-a")
         self.assertEqual(self.client.target(reply["execution_id"])["container_id"], "cid-vaws-alice")
+
+    def test_running_execution_stays_running_during_background_probe(self):
+        started = self.client.run("true")
+        self.assertEqual(started["state"], "running")
+        states = []
+        managed_control = self.pool.managed_control
+
+        def observe_during_probe(user, job_id, action, **kwargs):
+            if action == "status":
+                states.append(self.client.observe(started["execution_id"])["state"])
+            return managed_control(user, job_id, action, **kwargs)
+
+        with mock.patch.object(self.pool, "managed_control", side_effect=observe_during_probe):
+            advanced = self.client.coordinator.advance(
+                str(self.store.state_dir), "alice", started["execution_id"], action="progress")
+
+        self.assertTrue(states)
+        self.assertEqual(set(states), {"running"})
+        self.assertEqual(advanced["state"], "running")
 
     def test_finish_closes_admission_before_a_new_run(self):
         first = self.client.run("true")

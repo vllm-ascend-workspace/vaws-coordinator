@@ -447,8 +447,9 @@ class CoordinatorService:
         halted = self._halt_if_cancelled(store, user, row)
         if halted is not None:
             return halted
-        row["phase"] = "launch_pending"
-        store.save_execution(row)
+        if any(not role.get("managed_job") for role in row["roles"]):
+            row["phase"] = "launch_pending"
+            store.save_execution(row)
         halted = self._halt_if_cancelled(store, user, row)
         if halted is not None:
             return halted

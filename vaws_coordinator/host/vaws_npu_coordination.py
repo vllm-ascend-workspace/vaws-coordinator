@@ -743,8 +743,6 @@ class NpuCoordinator:
             raise CoordinationError("service_ports must contain distinct TCP ports")
         if requested_service_port is not None and requested_service_port != 0 and requested_service_port not in service_port_choices:
             raise CoordinationError("requested service_port is not in declared service_ports")
-        if requested_service_port is not None and not service_port_choices:
-            raise CoordinationError("service port requested but no declared runtime service ports")
         duration = int(request.get("estimated_duration_seconds") or DEFAULT_ESTIMATED_DURATION_SECONDS)
         if duration < 1:
             raise CoordinationError("estimated_duration_seconds must be >= 1")
@@ -1180,7 +1178,12 @@ class NpuCoordinator:
                 listening.get("error") or "host listening ports are unavailable"
             )
         if not choices:
-            raise CoordinationError("service port requested but no declared runtime service ports")
+            if requested != 0:
+                raise CoordinationError("service port requested but no declared runtime service ports")
+            # Prepared task roots can share a host-managed automatic port pool.
+            # The port is claimed below only after checking live and leased ports.
+            first, last = parse_port_range(DEFAULT_SERVING_PORT_RANGE)
+            choices = list(range(first, last + 1))
         live = {int(item) for item in listening.get("ports", [])}
         allocated = self._allocated_ports(connection, exclude_task=task_id)
         preferred = None if requested == 0 else requested

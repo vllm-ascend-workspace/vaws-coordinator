@@ -16,10 +16,13 @@ from pathlib import Path
 from unittest import mock
 
 from vaws_coordinator.host.vaws_npu_coordination import (
+    CoordinationError,
+    DEFAULT_SERVING_PORT_RANGE,
     JOB_TOKEN_ENV,
     NpuCoordinator,
     _confirmed_free_probe,
     parse_npu_smi_info,
+    parse_port_range,
     process_guard_busy,
 )
 
@@ -89,7 +92,7 @@ class CoordinationTests(unittest.TestCase):
         token = granted["task"]["fence_token"]
         self.coordinator.preflight("guarded-task", token, occupancy())
         guard = {"marker": "a" * 32, "boot_id": "test"}
-        with mock.patch("vaws_npu_coordination.process_guard_busy", return_value=True):
+        with mock.patch("vaws_coordinator.host.vaws_npu_coordination.process_guard_busy", return_value=True):
             self.coordinator.activate("guarded-task", token, pid=1234, process_guard=guard, heartbeat_ttl_seconds=1)
             import sqlite3
             with sqlite3.connect(Path(self.temp.name) / "coordinator.sqlite3") as old_client:
@@ -100,7 +103,7 @@ class CoordinationTests(unittest.TestCase):
             self.assertEqual(self.coordinator.release("guarded-task", token, occupancy())["status"], "orphaned_busy")
             self.submit("waiting-task", devices=[0])
             self.assertNotEqual(self.coordinator.acquire("waiting-task", occupancy())["status"], "granted")
-        with mock.patch("vaws_npu_coordination.process_guard_busy", return_value=False):
+        with mock.patch("vaws_coordinator.host.vaws_npu_coordination.process_guard_busy", return_value=False):
             self.assertEqual(self.coordinator.acquire("waiting-task", occupancy())["status"], "granted")
 
     def test_subreaper_lease_requires_completion_even_after_supervisor_disappears(self):
@@ -108,12 +111,12 @@ class CoordinationTests(unittest.TestCase):
         token = self.coordinator.acquire("retained-task", occupancy())["task"]["fence_token"]
         self.coordinator.preflight("retained-task", token, occupancy())
         guard = {"marker": "b" * 32, "boot_id": "test", "retain_until_release": True}
-        with mock.patch("vaws_npu_coordination.process_guard_busy", return_value=True):
+        with mock.patch("vaws_coordinator.host.vaws_npu_coordination.process_guard_busy", return_value=True):
             self.coordinator.activate("retained-task", token, pid=1234, process_guard=guard, heartbeat_ttl_seconds=1)
         # No marked process is left, but GC lacks a descendant completion receipt.
         def retained(value, *, completion_confirmed=False):
             return bool(value) and not completion_confirmed
-        with mock.patch("vaws_npu_coordination.process_guard_busy", side_effect=retained):
+        with mock.patch("vaws_coordinator.host.vaws_npu_coordination.process_guard_busy", side_effect=retained):
             self.clock.advance(2)
             self.assertEqual(self.coordinator.snapshot(occupancy())["tasks"][0]["state"], "orphaned_busy")
             self.assertEqual(self.coordinator.release("retained-task", token, occupancy())["status"], "orphaned_busy")
@@ -556,6 +559,40 @@ class ContainerPortOwnershipTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_automatic_service_ports_without_runtime_declarations(self) -> None:
+        first_port, _ = parse_port_range(DEFAULT_SERVING_PORT_RANGE)
+        listening = {"status": "ok", "ports": [first_port]}
+        grants = []
+        for index in range(2):
+            task_id = f"automatic-{index}"
+            self.coordinator.submit({
+                "task_id": task_id, "agent_id": "test-agent", "npu_count": 1,
+                "service_port": 0, "service_ports": [],
+            })
+            grant = self.coordinator.acquire(task_id, occupancy(), listening=listening)
+            self.assertEqual(grant["status"], "granted")
+            self.assertEqual(grant["task"]["granted_service_port"], first_port + index + 1)
+            self.assertEqual(grant["environment"]["VAWS_SERVICE_PORT"], str(first_port + index + 1))
+            grants.append(grant)
+        released = self.coordinator.release(
+            "automatic-0", grants[0]["task"]["fence_token"], occupancy(),
+            completion_confirmed=True, listening=listening,
+        )
+        self.assertEqual(released["status"], "released")
+        self.coordinator.submit({
+            "task_id": "automatic-reuse", "agent_id": "test-agent", "npu_count": 1,
+            "service_port": 0,
+        })
+        reused = self.coordinator.acquire("automatic-reuse", occupancy(), listening=listening)
+        self.assertEqual(reused["task"]["granted_service_port"], first_port + 1)
+
+    def test_explicit_service_port_still_requires_runtime_declaration(self) -> None:
+        with self.assertRaisesRegex(CoordinationError, "not in declared"):
+            self.coordinator.submit({
+                "task_id": "undeclared", "agent_id": "test-agent", "npu_count": 1,
+                "service_port": 30000, "service_ports": [],
+            })
 
     def test_user_ssh_reservation_blocks_service_collision_and_survives_release(self) -> None:
         reserved = self.coordinator.reserve_container_ssh(
