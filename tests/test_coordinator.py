@@ -1041,6 +1041,25 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(observed["target"]["runtime_id"], "runtime-a")
         self.assertEqual(self.client.target(reply["execution_id"])["container_id"], "cid-vaws-alice")
 
+    def test_running_execution_stays_running_during_background_probe(self):
+        started = self.client.run("true")
+        self.assertEqual(started["state"], "running")
+        states = []
+        managed_control = self.pool.managed_control
+
+        def observe_during_probe(user, job_id, action, **kwargs):
+            if action == "status":
+                states.append(self.client.observe(started["execution_id"])["state"])
+            return managed_control(user, job_id, action, **kwargs)
+
+        with mock.patch.object(self.pool, "managed_control", side_effect=observe_during_probe):
+            advanced = self.client.coordinator.advance(
+                str(self.store.state_dir), "alice", started["execution_id"], action="progress")
+
+        self.assertTrue(states)
+        self.assertEqual(set(states), {"running"})
+        self.assertEqual(advanced["state"], "running")
+
     def test_finish_closes_admission_before_a_new_run(self):
         first = self.client.run("true")
         self.assertEqual(first["state"], "running")
