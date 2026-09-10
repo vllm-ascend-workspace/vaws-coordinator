@@ -6,10 +6,25 @@ from pathlib import Path
 from unittest import mock
 
 from vaws_coordinator.backend import RemoteBackend
-from vaws_coordinator.runtime_profile import installed_native_files
+from vaws_coordinator.runtime_profile import capture_launch_environment, installed_native_files
 
 
 class PreparedProfileTests(unittest.TestCase):
+    def test_preserves_cann_paths_without_device_assignment_or_temporary_shim(self):
+        result = capture_launch_environment({
+            "ASCEND_OPP_PATH": "/image/cann/opp", "ASCEND_AICPU_PATH": "/image/cann",
+            "ASCEND_TOOLKIT_HOME": "/image/cann", "ATB_HOME_PATH": "/image/atb",
+            "SOC_VERSION": "ascend910_9391", "ASCEND_RT_VISIBLE_DEVICES": "7",
+            "VAWS_PYTHON_SHIM_DIR": "/tmp/owned-shim",
+            "PATH": "/tmp/owned-shim:/task/.venv/bin:/tmp/owned-shim:/usr/bin",
+            "API_TOKEN": "must-not-be-captured",
+        })
+        self.assertEqual(result, {
+            "ASCEND_OPP_PATH": "/image/cann/opp", "ASCEND_AICPU_PATH": "/image/cann",
+            "ASCEND_TOOLKIT_HOME": "/image/cann", "ATB_HOME_PATH": "/image/atb",
+            "SOC_VERSION": "ascend910_9391", "PATH": "/task/.venv/bin:/usr/bin",
+        })
+
     def test_enumerates_complete_installed_tree_without_venv_or_build_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

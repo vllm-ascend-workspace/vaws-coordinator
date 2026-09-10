@@ -21,6 +21,24 @@ PROFILE_FIELDS = ("image_digest", "soc", "driver", "cann", "python_abi",
                   "torch", "torch_npu", "vllm", "vllm_ascend", "compiler")
 PACKAGES = {"torch": "torch", "torch_npu": "torch-npu", "vllm": "vllm",
             "vllm_ascend": "vllm-ascend"}
+LAUNCH_PATH_KEYS = (
+    "PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_HOME_PATH",
+    "ASCEND_OPP_PATH", "ASCEND_AICPU_PATH", "ASCEND_TOOLKIT_HOME",
+    "ASCEND_CUSTOM_OPP_PATH", "ATB_HOME_PATH", "TOOLCHAIN_HOME", "SOC_VERSION",
+)
+
+
+def capture_launch_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Carry CANN discovery paths into the clean managed-worker environment.
+
+    Device assignment belongs to the host lease. A temporary Python shim is
+    removed by the preparation shell and must not become profile identity.
+    """
+    captured = {key: environment[key] for key in LAUNCH_PATH_KEYS if environment.get(key)}
+    shim = environment.get("VAWS_PYTHON_SHIM_DIR")
+    if shim and "PATH" in captured:
+        captured["PATH"] = os.pathsep.join(part for part in captured["PATH"].split(os.pathsep) if part != shim)
+    return captured
 
 
 def digest(value: Any) -> str:

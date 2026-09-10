@@ -103,9 +103,7 @@ if recipe:
     profile["recipe"] = recipe
 if args.get("machine_type"):
     profile["machine_type"] = args["machine_type"]
-for key in ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_HOME_PATH"):
-    if os.environ.get(key):
-        profile["launch_env"][key] = os.environ[key]
+profile["launch_env"] = capture_launch_environment(dict(os.environ))
 
 files = installed_native_files(root)
 
