@@ -18,13 +18,14 @@ import uuid
 from pathlib import Path
 
 from vaws_coordinator.state_paths import agent_sessions_root
+from vaws_coordinator.client_paths import client_path
 
 CLIENTS = {"claude", "grok", "kimi", "codex", "cursor"}
 
 
 def worktree_reference(path: str) -> dict:
     """Inspect an actual repository; never materialize a second source copy."""
-    source = Path(path).expanduser().resolve(strict=True)
+    source = Path(client_path(path)).expanduser().resolve(strict=True)
     result = subprocess.run(
         ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
@@ -39,7 +40,7 @@ def worktree_reference(path: str) -> dict:
 
 class AgentSessions:
     def __init__(self, state_dir: Path | None = None):
-        self.state_dir = (state_dir or agent_sessions_root()).expanduser().resolve()
+        self.state_dir = Path(client_path(state_dir or agent_sessions_root())).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db_path = self.state_dir / "sessions.sqlite3"
         with self.transaction() as db:
@@ -122,7 +123,7 @@ class AgentSessions:
                     "native_session_id": native_session_id, "agent_id": agent_id or None,
                     "parent_id": parent["attachment"]["id"] if parent_context else None,
                     "association": "child" if parent_context else "explicit" if association else "new-task",
-                    "cwd": str(Path(cwd).expanduser().resolve()), "state": "attached", "created_at": now,
+                    "cwd": str(Path(client_path(cwd)).expanduser().resolve()), "state": "attached", "created_at": now,
                 })
             else:
                 old = existing[0]
@@ -163,12 +164,9 @@ class AgentSessions:
             session = self.get(db, "session", context["session"]["id"])
             if session["state"] != "open":
                 raise ValueError("resume the task before binding sources")
-            if any(row["session_id"] == session["id"] and row["phase"] not in
-                   {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
-                   for row in self.rows(db, "execution")):
-                if any(session["sources"].get(name, {}).get("path") != ref["path"] for name, ref in references.items()):
-                    raise ValueError("finish pending executions before changing source worktree references")
-            session["sources"].update(references)
+            # Defaults apply only to future submissions. Replace the mapping
+            # so {} can deliberately clear it and removed repos do not linger.
+            session["sources"] = references
             self.put(db, "session", session)
         return self.context(context["attachment"]["id"])
 
@@ -245,7 +243,7 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
                 pass
         return store.attach("codex", native, str(Path.cwd()),
                             parent_context=parent, association=association)
-    path = Path(filename).expanduser().resolve(strict=True)
+    path = Path(client_path(filename)).expanduser().resolve(strict=True)
     reference = json.loads(path.read_text())
     if reference.get("schema_version") != "vaws.agent-context.v1":
         raise ValueError("not a VAWS agent context")

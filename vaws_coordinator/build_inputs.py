@@ -11,9 +11,10 @@ from pathlib import Path
 VLLM_REINSTALL_PATTERNS = (
     'requirements*', 'pyproject.toml', 'setup.py', 'setup.cfg', 'CMakeLists.txt',
     'cmake/**', 'csrc/**', '**/*.cu', '**/*.cuh', '**/*.cpp', '**/*.cc', '**/*.h', '**/*.hpp',
+    'vllm/envs.py', 'tools/build/**', 'tools/codegen/**',
     '*.c', '*.cc', '*.cpp', '*.cxx', '*.cu', '*.cuh', '*.h', '*.hpp', '*.hxx', '*.s', '*.S', '*.cmake', '*.proto',
 )
-VLLM_ASCEND_REINSTALL_PATTERNS = VLLM_REINSTALL_PATTERNS + ('vllm_ascend/_cann_ops_custom/**',)
+VLLM_ASCEND_REINSTALL_PATTERNS = VLLM_REINSTALL_PATTERNS + ('vllm_ascend/_cann_ops_custom/**', 'vllm_ascend/envs.py')
 DEPENDENCY_INSTALL_PATTERNS = ('requirements*', 'pyproject.toml', 'setup.py', 'setup.cfg')
 BUILD_INPUT_ENV_KEYS = (
     'CMAKE_BUILD_TYPE', 'SOC_VERSION', 'VAWS_SOC_VERSION',

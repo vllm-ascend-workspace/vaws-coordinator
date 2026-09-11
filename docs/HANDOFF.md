@@ -1,5 +1,8 @@
 # Handoff: coordinator as a local installable package
 
+Status: current package ownership, 2026-09-12. Execution behavior is defined
+by README.md and session-lifecycle.md.
+
 This repository is the VAWS coordinator extracted from
 `vllm-ascend-workspace`. It is a **local process**: it coordinates the current
 user's own remote containers and NPU allocation. It does not host a manager
@@ -22,7 +25,7 @@ implemented in [task_client.py](../vaws_coordinator/task_client.py).
 | Run Manifest v1 | this package, `vaws_coordinator.run_manifest` | `code` is Git identity (`source_head`, `snapshot_commit`). |
 | Code identity | this package, `vaws_coordinator.code_identity` | Dirty trees get a parentless snapshot commit. |
 | Code parity | this package, `vaws_coordinator.parity` | In-package CLI; no consumer script path. |
-| Isolated task prep | `prepare_isolated_root_script` + task venv + explicit source snapshot | No image `pip uninstall`. `.venv`/`build` preserved. Bound vllm + vllm-ascend worktrees, no Git parent. |
+| Execution preparation | Fixed execution snapshot, isolated source root, verified dependency/native cache | Generic commands use an available interpreter without a new venv. Native builds and reuse remain package-owned. |
 | Machine directory | this package, `vaws_coordinator.machine_directory` | Consumers pass a document; store is coordinator-owned. |
 | Persistent daemon | `vaws_coordinator.service` | Short `/tmp/vc-<user>-<sha>.sock`; lock/sqlite in state dir. |
 
@@ -44,15 +47,16 @@ The source suite covers the control plane, local daemon, and shared transport.
 The Linux `/proc` worker/guard test is skipped on macOS. Tests using fake
 resources do not establish real NPU or container preparation behavior.
 
-| Item | Production path | Discriminating test |
-| --- | --- | --- |
-| Isolated prep before register | `provision/task_environment.py` + `RemoteBackend.prepare_task_root`: first_install → task venv → materialize sources → pinned-python install steps → capture `ready-profile.json` → `register`. Fake backend `inspect` raises `missing ready-profile.json` unless the root was prepared with a distinct interpreter. | `test_register_empty_root_is_rejected_when_prepared_boundary_enforced`, `test_prepare_creates_isolated_interpreter_not_donor_python`, `test_remote_prepare_refuses_donor_python_and_requires_sources` |
-| Process-guard marker | `host/vaws_npu_coordination.py` `JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"`; `managed_execution` / `TaskClient` reject `REMOTE_DEV_JOB_*`. | `test_process_guard_source_scans_public_remote_dev_marker`; `test_process_guard_sees_remote_dev_job_token_not_legacy_name` (skip off Linux) |
-| Binding / host-scoped ids | Reuse bound objects; `checkout_identity(runtime_id, role)`; runtime id `t{session}-h{host}-{role}`. `role.host` constrains `can_prepare`. Post-prep `runtime_matches`; missing facts ≠ match. Same-task active root waits, does not re-register the deterministic path. | `test_existing_binding_is_reused_for_the_same_task`, `test_role_host_constrains_auto_preparation`, `test_missing_hardware_facts_are_not_a_match`, `test_same_task_does_not_materialize_concurrently` |
-| restart=True / serialized progress | `CoordinatorService.admit` owns named-service reconnect/restart. Same-spec restart replaces after `_stop_and_wait`. `stopping` does not admit overlap. Per-execution and per-root locks; tick dispatches independent threads. | `test_named_service_reconnects_same_spec_and_restart_replaces`, `test_restart_does_not_overlap_while_stop_is_stopping` |
-| Daemon on this Mac | `socket_path` → `/tmp/vc-<user>-<16-hex>.sock` (~43 bytes). Session dirs in pool `meta/session_dirs`. Ticker records bounded `failed`/`uncertain` instead of swallowing. Idle client sockets time out and close. | `test_short_socket_ping_start_exit_restart_and_session_dirs_persist` |
-| Multi-role aggregate | `aggregate_job_states`: succeeded+failed → failed; all succeeded → succeeded; a succeeded role does not fail the group. `hold_go` still reserves all leases before `go`. | `test_two_role_success_and_mixed_failure_aggregate`, `AggregateStateTests` |
-| Admitted finish cleanup | Persist `session["finish"]` (`user`, `force`). Tick/reconcile resume finishing tasks after execution stop drains; return bindings and mark `finished`. No second `vaws_finish`. Restart uses `meta/session_dirs`. | `test_finish_during_delayed_preparation_completes_on_ticker_without_retry`, `test_persisted_finishing_task_completes_after_coordinator_restart` |
+Behavioral tests cover immutable execution inputs, independent source defaults,
+service replacement, multi-role gate activation and lease renewal, CPU-only
+resource claims, process/port cleanup, daemon restart and native Windows/WSL
+ownership. Preparation tests reject changed build inputs, damaged native
+artifacts and identity collisions; copied artifacts must match their donor
+proof. Platform-specific cases are skipped when their OS primitives are absent.
+
+Use the installed-wheel and real-container evidence for claims about remote
+execution. Unit fixtures alone cannot establish successful native builds or
+NPU imports.
 
 No-donor first machine: `_ensure_user_container` calls coordinator-owned
 `provision_user_container` with HostQueue `container-ssh-reserve`, then

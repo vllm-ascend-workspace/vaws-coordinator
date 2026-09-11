@@ -5,9 +5,7 @@ reader, deadline, capture, and on_output callback still run.
 """
 from __future__ import annotations
 
-import shlex
 import shutil
-import base64
 import sys
 import time
 import unittest
@@ -22,14 +20,12 @@ TARGET = host_ops.SshTarget(host="192.0.2.10", user="root", port=22)
 
 def _local_bash(_endpoint, script, *, timeout_ms=None):
     del _endpoint, timeout_ms
-    # Sending bytes avoids Windows Bash/WSL command-line quote translation.
-    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    # remote-dev streams the script through this process's binary stdin.
+    assert script is None
     # Resolve PATH ourselves: CreateProcess searches System32 before PATH and
     # can otherwise select its unconfigured WSL alias instead of Git Bash.
     bash = shutil.which("bash") or "bash"
-    source = ("import base64,subprocess,sys; "
-              f"sys.exit(subprocess.run([{bash!r},'-s'],input=base64.b64decode({encoded!r})).returncode)")
-    return [sys.executable, "-c", source]
+    return [bash, "-s"]
 
 
 def _local_python(source: str):
@@ -99,20 +95,10 @@ printf '%s\n' "$3"
 printf '%s\n' "$4"
 echo '__VAWS_JSON__={"success":true,"n":4}'
 """
-        captured: dict[str, str] = {}
-
-        def standin(endpoint, script, *, timeout_ms=None):
-            captured["script"] = script
-            return _local_bash(endpoint, script, timeout_ms=timeout_ms)
-
-        with patch.object(ssh_transport, "stream_ssh_command", standin):
+        with patch.object(ssh_transport, "stream_ssh_command", _local_bash):
             result = host_ops.run_remote_script(
                 TARGET, script, args=args, stream_progress=False
             )
-        composed = captured["script"]
-        self.assertTrue(composed.startswith("set -- "))
-        for item in args:
-            self.assertIn(shlex.quote(item), composed)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(result.timed_out)
         lines = result.stdout.splitlines()

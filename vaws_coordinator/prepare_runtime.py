@@ -73,8 +73,12 @@ if not compiler:
                 compiler = line.partition("=")[2].strip()
                 break
 toolchain = build_toolchain_from_logs(root) if not soc or not compiler else {}
+reuse_file = root / '.vaws-runtime/reuse.json'
+reuse = json.loads(reuse_file.read_text()) if reuse_file.is_file() else {}
 soc = soc or toolchain.get("soc")
 compiler = compiler or "; ".join(toolchain.get("compilers") or [])
+soc = soc or reuse.get('soc')
+compiler = compiler or reuse.get('compiler')
 if not soc:
     raise ValueError("cannot attest soc from environment or completed build evidence")
 if not compiler:
@@ -94,7 +98,7 @@ profile = {
     "vllm": package_version("vllm"),
     "vllm_ascend": package_version("vllm-ascend"),
     "compiler": compiler,
-    "build_env": {},
+    "build_env": dict(args.get('build_env') or {}),
     "launch_env": {},
     "compatibility_evidence": ".vaws-runtime/profile-evidence/smoke.json",
     "system_files": {
@@ -107,13 +111,24 @@ if recipe:
 if args.get("machine_type"):
     profile["machine_type"] = args["machine_type"]
 profile["launch_env"] = capture_launch_environment(dict(os.environ))
+profile['launch_env']['PYTHONPATH'] = ':'.join([str(root / '.vaws-runtime/metadata'), str(root / 'vllm'), str(root / 'vllm-ascend'), profile['launch_env'].get('PYTHONPATH', '')]).rstrip(':')
+if args.get('source_versions'):
+    profile['source_versions'] = args['source_versions']
 
 files = installed_native_files(root)
 
 evidence_dir = root / ".vaws-runtime/profile-evidence"
 evidence_dir.mkdir(parents=True, exist_ok=True)
 result = subprocess.run(
-    [sys.executable, "-c", "import torch_npu, vllm, vllm_ascend, acl; import vllm_ascend.vllm_ascend_C"],
+    [sys.executable, "-c", """import json, pathlib, sys, importlib.metadata
+import torch_npu, vllm, vllm_ascend, acl
+import vllm_ascend.vllm_ascend_C as extension
+root = pathlib.Path(sys.argv[1]).resolve()
+paths = {'vllm': pathlib.Path(vllm.__file__).resolve(), 'vllm_ascend': pathlib.Path(vllm_ascend.__file__).resolve(), 'extension': pathlib.Path(extension.__file__).resolve()}
+if not all(path.is_relative_to(root) for path in paths.values()):
+    raise ValueError('imports escaped the execution source view: ' + str(paths))
+print(json.dumps({'python': sys.executable, 'imports': {k: str(v) for k,v in paths.items()}, 'vllm': importlib.metadata.version('vllm'), 'vllm_ascend': importlib.metadata.version('vllm-ascend')}))
+""", str(root)],
     capture_output=True, text=True, encoding="utf-8", timeout=30,
 )
 smoke = {"passed": result.returncode == 0, "profile_key": profile_key(profile),
@@ -127,12 +142,40 @@ inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(pro
 evidence = {name: ".vaws-runtime/profile-evidence/" + name + ".json" for name in ("cann", "driver", "smoke")}
 if toolchain:
     evidence["toolchain_log"] = toolchain["path"]
+if reuse:
+    evidence['reuse'] = '.vaws-runtime/reuse.json'
 manifest = capture(root, profile, inputs, files, evidence)
+manifest['preparation'] = verified_preparation(args.get('preparation', {}), profile)
 verify(root, manifest)
 marker = root / ".vaws-runtime/ready-profile.json"
 temp = marker.with_suffix(".tmp")
 temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 os.replace(temp, marker)
+print(json.dumps(manifest))
+'''
+
+
+REMOTE_COMMAND_CAPTURE_SUFFIX = r'''
+import sys
+args = json.loads(sys.argv[1])
+root = Path(args['root'])
+profile = {'kind': 'command', 'image_digest': args['image_digest'],
+           'python_abi': sysconfig.get_config_var('SOABI'),
+           'build_env': {}, 'launch_env': command_launch_environment(dict(os.environ), roots=args.get('excluded_roots', []))}
+for key in ('recipe', 'machine_type'):
+    if args.get(key):
+        profile[key] = args[key]
+manifest = {'schema_version': 2, 'profile': profile, 'profile_key': profile_key(profile),
+            'build_key': digest({'profile': profile, 'sources': args.get('source_id')}),
+            'source_id': args.get('source_id'),
+            'runtime_root': str(root.resolve()), 'build_inputs': {}, 'files': {}, 'evidence': {},
+            'preparation': args.get('preparation', {})}
+verify(root, manifest)
+marker = root / '.vaws-runtime/ready-profile.json'
+marker.parent.mkdir(parents=True, exist_ok=True)
+temporary = marker.with_suffix('.tmp')
+temporary.write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+os.replace(temporary, marker)
 print(json.dumps(manifest))
 '''
 

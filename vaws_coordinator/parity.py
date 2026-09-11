@@ -63,14 +63,15 @@ def materialize_command(
     endpoint: dict,
     sources: dict[str, str],
     workspace_root: Path | str | None = None,
+    source_snapshot: dict | None = None,
 ) -> list[str]:
     """Build the in-package parity CLI that materializes explicit source repos.
 
     Bound ``sources`` are the worktrees to snapshot. A Git parent of those
     trees is not required. ``workspace_root`` is only optional local state.
     """
-    if not {"vllm", "vllm-ascend"}.issubset(sources or {}):
-        raise ValueError("bind the actual vllm and vllm-ascend worktrees before materialization")
+    if not sources and not (source_snapshot or {}).get("records"):
+        raise ValueError("materialization requires at least one fixed source")
     command = [
         sys.executable,
         "-m",
@@ -97,6 +98,19 @@ def materialize_command(
         command.extend(["--workspace-root", str(Path(workspace_root).expanduser())])
     for name, path in sources.items():
         command.extend(["--source", name + "=" + path])
+    if source_snapshot is not None:
+        # The durable descriptor is already captured by submission. This file
+        # transports that data; parity must not capture a newer working tree.
+        state = Path(workspace_root or tempfile.gettempdir()) / ".vaws-local" / "fixed-inputs"
+        state.mkdir(parents=True, exist_ok=True)
+        transport_key = hashlib.sha256(json.dumps(source_snapshot, sort_keys=True).encode()).hexdigest()[:20]
+        descriptor = state / (source_snapshot["id"] + '-' + transport_key + ".json")
+        if not descriptor.exists():
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=state, delete=False) as out:
+                json.dump(source_snapshot, out)
+                temporary = Path(out.name)
+            os.replace(temporary, descriptor)
+        command.extend(["--snapshot-file", str(descriptor)])
     return command
 
 
@@ -309,6 +323,7 @@ class SnapshotRecord:
     submodules: list[dict[str, str]]
     build_inputs: dict[str, str] = field(default_factory=dict)
     source_path: str | None = None
+    scm_version: str | None = None
 
 
 def normalize_workspace_id(value: str) -> str:
@@ -1214,6 +1229,24 @@ def runtime_install_step_script(
     lines.extend(DEFAULT_ENV_PREAMBLE)
     if python:
         lines.extend(task_python_exports(python))
+    if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-requirements', 'check-build-compat'}:
+        source_name = 'vllm' if step == 'install-vllm' else 'vllm-ascend'
+        # Only package-created fixed input data enters the build shell. Never
+        # derive versions from the synthetic commit's truncated history.
+        lines.extend([
+            'if [ -f "$VAWS_RUNTIME_ROOT/.vaws-runtime/build-source.json" ]; then',
+            '  eval "$("$PYTHON" - ' + quoted(source_name) + ' "$VAWS_RUNTIME_ROOT/.vaws-runtime/build-source.json" <<\'VAWS_BUILD_INPUTS\'',
+            'import json, shlex, sys',
+            'spec = json.load(open(sys.argv[2]))',
+            'for key, value in spec.get("build_env", {}).items():',
+            '    if not __import__("re").fullmatch(r"[A-Z_][A-Z0-9_]*", key): raise ValueError("invalid build environment key")',
+            '    print("export " + key + "=" + shlex.quote(value))',
+            'version = spec["versions"][sys.argv[1]]["version"]',
+            'print("export SETUPTOOLS_SCM_PRETEND_VERSION=" + shlex.quote(version))',
+            'VAWS_BUILD_INPUTS',
+            ')"',
+            'fi',
+        ])
     if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-requirements'}:
         lines.extend(
             [
@@ -1541,6 +1574,7 @@ def run_runtime_install_step(
     python: str | None = None,
     on_progress=None,
     log_path=None,
+    process=None,
 ) -> None:
     script = runtime_install_step_script(
         runtime_root=runtime_root,
@@ -1550,9 +1584,9 @@ def run_runtime_install_step(
         uninstall_packages=uninstall_packages,
         python=python,
     )
-    if stream_progress or on_progress is not None or log_path is not None:
+    if stream_progress or on_progress is not None or log_path is not None or process is not None:
         ssh_exec_stream(container, script, stream_progress=stream_progress,
-                        on_progress=on_progress, log_path=log_path)
+                        on_progress=on_progress, log_path=log_path, process=process)
     else:
         ssh_exec(container, script)
 
@@ -1798,8 +1832,8 @@ def parse_sources(values: list[str]) -> dict[str, Path]:
     sources = {}
     for value in values:
         name, separator, path = value.partition('=')
-        if not separator or name not in ('vllm', 'vllm-ascend') or name in sources:
-            raise ValueError('--source must be a unique vllm=/actual/worktree or vllm-ascend=/actual/worktree')
+        if not separator or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name) or name in sources:
+            raise ValueError('--source must contain unique safe names: name=/actual/worktree')
         candidate = Path(path).expanduser().resolve()
         ensure_populated_worktree(candidate, name)
         sources[name] = candidate
@@ -1865,6 +1899,12 @@ def build_snapshot_records(
                     continue
                 patterns = VLLM_REINSTALL_PATTERNS if record.relpath == 'vllm' else VLLM_ASCEND_REINSTALL_PATTERNS
                 record.build_inputs = build_input_fingerprints(source, record.commit, patterns)
+                # Synthetic snapshots deliberately have no source history.
+                # Capture setuptools-scm against the actual worktree once,
+                # before transfer, instead of inferring a version remotely.
+                if (source / 'pyproject.toml').exists() or (source / 'setup.py').exists():
+                    from setuptools_scm import get_version
+                    record.scm_version = get_version(root=str(source))
     return ordered_records
 
 
@@ -1919,8 +1959,9 @@ def run_plan(args: argparse.Namespace) -> int:
 
 def run_sync(args: argparse.Namespace) -> int:
     sources = parse_sources(getattr(args, 'source', []))
-    if not {'vllm', 'vllm-ascend'}.issubset(sources):
-        raise ValueError('bind the actual vllm and vllm-ascend worktrees')
+    fixed = json.loads(Path(args.snapshot_file).read_text(encoding="utf-8")) if getattr(args, 'snapshot_file', None) else None
+    if not sources and not fixed:
+        raise ValueError('materialization requires explicit source repositories')
     workspace_root = resolve_state_root(getattr(args, 'workspace_root', None), sources)
     workspace_id = normalize_workspace_id(args.workspace_id)
     runtime_root = validate_absolute_posix_path(args.runtime_root, label='runtime root')
@@ -1932,11 +1973,16 @@ def run_sync(args: argparse.Namespace) -> int:
 
     emit_progress('snapshot-build', workspace_id=workspace_id, snapshot_id=snapshot_id)
     records: list[SnapshotRecord] = []
-    keep_refs = False
+    keep_refs = fixed is not None
     manifest_path = manifest_path_for(container_cache_root, workspace_id, snapshot_id)
     current_phase = 'snapshot-built'
     try:
-        records = build_snapshot_records(workspace_root, workspace_id, snapshot_id, tuple(DEFAULT_DENYLIST), sources, records)
+        if fixed is not None:
+            if fixed.get('schema_version') != 'vaws.execution-sources.v1':
+                raise ValueError('unsupported fixed source descriptor')
+            records = [SnapshotRecord(**record) for record in fixed['records']]
+        else:
+            records = build_snapshot_records(workspace_root, workspace_id, snapshot_id, tuple(DEFAULT_DENYLIST), sources, records)
         try:
             record_map = {record.relpath: record for record in records}
             prior_runtime_state = load_runtime_state(workspace_root)
@@ -2558,6 +2604,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync = subparsers.add_parser('sync', help='Publish container-local mirrors, materialize runtime state, and reinstall when required.')
     add_shared_arguments(sync)
     sync.add_argument('--snapshot-id', default=None)
+    sync.add_argument('--snapshot-file', help='Use a previously captured execution source descriptor without rereading worktrees.')
     sync.add_argument('--container-host', required=True)
     sync.add_argument('--container-port', type=int, required=True)
     sync.add_argument('--container-user', required=True)

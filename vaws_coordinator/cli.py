@@ -48,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     register.add_argument("--host-port", type=int, default=22)
     register.add_argument("--host-user", default="root")
     register.add_argument("--service-ports", default="")
+    register.add_argument("--state-dir", default="", help="Coordinator state directory")
+    register.add_argument("--reuse-only", action="store_true", help="Verify a native artifact donor without making its work root available for execution")
+    register.add_argument("--source", action="append", default=[], metavar="NAME=PATH", help="Local source worktree matching a native artifact donor; repeat for each repository")
     args = parser.parse_args(argv)
     if args.command == "daemon":
         from vaws_coordinator.service import main as daemon_main
@@ -66,10 +69,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "runtime-register":
-        from vaws_coordinator.backend import RemoteBackend
-        from vaws_coordinator.ready_runtime import RuntimePool
+        from pathlib import Path
+        from vaws_coordinator.client_paths import client_path
+        from vaws_coordinator.execution_sources import capture_sources
+        from vaws_coordinator.service import ensure_daemon, require_native_owner
         from vaws_coordinator.state_paths import coordinator_state_dir
 
+        state = Path(client_path(args.state_dir)).expanduser().resolve() if args.state_dir else coordinator_state_dir()
+        require_native_owner(state)
+        sources = {}
+        for item in args.source:
+            name, separator, path = item.partition("=")
+            if not separator or not name or not path or name in sources:
+                parser.error("--source requires distinct NAME=PATH entries")
+            sources[name] = path
+        if args.reuse_only and not {"vllm", "vllm-ascend"}.issubset(sources):
+            parser.error("--reuse-only requires --source vllm=PATH and --source vllm-ascend=PATH")
+        if sources and not args.reuse_only:
+            parser.error("--source is only supported with --reuse-only")
         ports = [int(item) for item in args.service_ports.split(",") if item.strip()]
         spec = {
             "user": args.user,
@@ -77,10 +94,16 @@ def main(argv: list[str] | None = None) -> int:
             "host_endpoint": {"host": args.host, "port": args.host_port, "user": args.host_user},
             "endpoint": {"host": args.host, "port": args.ssh_port, "user": args.ssh_user, "root": args.root},
             "service_ports": ports,
+            "reuse_only": args.reuse_only,
         }
-        row = RuntimePool(coordinator_state_dir(), RemoteBackend()).register(args.runtime_id, spec)
+        if args.reuse_only:
+            spec["source_snapshot"] = capture_sources(sources, state)
+        coordinator = ensure_daemon(state)
+        coordinator.timeout = 300
+        row = coordinator.runtime_register(args.runtime_id, spec)
         print(json.dumps({"runtime_id": row["id"], "user": row["user"], "container_name": row["container_name"],
-                          "python": row["python"], "endpoint": row["endpoint"], "state": row["state"]},
+                          "python": row["python"], "endpoint": row["endpoint"], "state": row["state"],
+                          "reuse_only": row["reuse_only"]},
                          ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     parser.print_help()

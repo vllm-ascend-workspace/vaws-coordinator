@@ -45,7 +45,10 @@ def test_remote_upload_uses_posix_parent_and_exact_bytes(monkeypatch):
     from vaws_coordinator.parity_support import SshEndpoint, ssh_stream_to_file, ssh_stream_bytes_to_file
     calls = []
 
-    def capture(endpoint, script, *, stdin):
+    def capture(endpoint, script, *, stdin, timeout_ms):
+        assert endpoint.keepalive is True
+        assert endpoint.ssh_mux is False
+        assert timeout_ms in (120000, 1800000)
         calls.append((script, stdin))
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 

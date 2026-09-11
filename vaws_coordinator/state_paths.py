@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from vaws_coordinator.client_paths import client_path
 
 STATE_DIRNAME = ".vaws-local"
 COORDINATOR_STATE_ENV = "VAWS_COORDINATOR_STATE_DIR"
@@ -21,7 +22,7 @@ def shared_workspace_root(repo_root: Path | None = None) -> Path:
     Linked Git worktrees share one Git common dir, so they share one local
     task registry. An unrelated clone resolves to itself.
     """
-    repo_root = (repo_root or Path.cwd()).expanduser().resolve()
+    repo_root = Path(client_path(repo_root or Path.cwd())).expanduser().resolve()
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
@@ -49,7 +50,7 @@ def agent_sessions_root(repo_root: Path | None = None) -> Path:
     """
     override = os.environ.get("VAWS_AGENT_SESSIONS_DIR", "")
     if override:
-        return Path(override).expanduser()
+        return Path(client_path(override)).expanduser()
     return shared_workspace_root(repo_root) / STATE_DIRNAME / "agent-sessions"
 
 
@@ -57,6 +58,6 @@ def coordinator_state_dir(sessions_dir: Path | None = None) -> Path:
     """Local runtime-pool state, next to the task registry unless overridden."""
     override = os.environ.get(COORDINATOR_STATE_ENV, "")
     if override:
-        return Path(override).expanduser()
+        return Path(client_path(override)).expanduser()
     base = sessions_dir or agent_sessions_root()
-    return Path(base).expanduser().resolve().parent / "coordinator"
+    return Path(client_path(base)).expanduser().resolve().parent / "coordinator"

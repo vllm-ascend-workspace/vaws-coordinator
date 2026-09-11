@@ -309,6 +309,7 @@ def ssh_exec_stream(
     stream_progress: bool = True,
     on_progress=None,
     log_path=None,
+    process=None,
 ) -> SshStreamingResult:
     from remote_dev.core.ssh_transport import run_stream
 
@@ -334,12 +335,10 @@ def ssh_exec_stream(
             return
         stderr_parts.append(text)
 
-    completed = run_stream(
-        _remote_endpoint(endpoint, long_stream=True),
-        script,
-        merge_stderr=False,
-        on_output=on_output,
-    )
+    completed = (process.run(script, on_output=on_output) if process is not None else run_stream(
+        _remote_endpoint(endpoint, long_stream=True), script,
+        merge_stderr=False, on_output=on_output,
+    ))
     stdout = ''.join(stdout_parts)
     stderr = ''.join(stderr_parts)
     if completed.timed_out:
@@ -362,7 +361,11 @@ def ssh_stream_to_file(endpoint: SshEndpoint, remote_path: str, payload: str) ->
     from remote_dev.core.ssh_transport import run_bytes
 
     script = f'mkdir -p {quoted(str(PurePosixPath(remote_path).parent))} && cat > {quoted(remote_path)}'
-    result = run_bytes(_remote_endpoint(endpoint), script, stdin=payload.encode('utf-8'))
+    try:
+        result = run_bytes(_remote_endpoint(endpoint, long_stream=True), script,
+                           stdin=payload.encode('utf-8'), timeout_ms=120000)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f'SSH upload to {remote_path} timed out; remote outcome is unknown; payload was not replayed') from exc
     stdout = (result.stdout or b'').decode('utf-8', errors='replace')
     stderr = (result.stderr or b'').decode('utf-8', errors='replace')
     if result.returncode != 0:
@@ -378,7 +381,11 @@ def ssh_stream_bytes_to_file(endpoint: SshEndpoint, remote_path: str, payload: b
         f'mkdir -p {quoted(str(PurePosixPath(remote_path).parent))} && '
         f'head -c {len(payload)} > {quoted(remote_path)}'
     )
-    result = run_bytes(_remote_endpoint(endpoint), script, stdin=payload)
+    try:
+        result = run_bytes(_remote_endpoint(endpoint, long_stream=True), script,
+                           stdin=payload, timeout_ms=1800000)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f'SSH binary upload to {remote_path} timed out; remote outcome is unknown; payload was not replayed') from exc
     if result.returncode != 0:
         stdout = (result.stdout or b'').decode('utf-8', errors='replace')
         stderr = (result.stderr or b'').decode('utf-8', errors='replace')

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from vaws_coordinator.agent_session import AgentSessions, load_context
-from vaws_coordinator.placement import normalize_resources, role_plan, validate_user_env
+from vaws_coordinator.placement import normalize_environment, normalize_resources, role_plan, validate_user_env
 from vaws_coordinator.ready_runtime import safe_id
 from vaws_coordinator.state_paths import coordinator_state_dir
 
@@ -59,18 +59,27 @@ class TaskClient:
         self.context = self.store.bind_sources(self.context, sources)
         return self.context
 
-    def run(self, command, *, env=None, environment=None, resources=None, topology=None,
+    def run(self, command, *, sources=None, env=None, environment=None, resources=None, topology=None,
             timeout_seconds=1800, service=None, restart=False, preflight=None):
         if not command or not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
         env = validate_user_env(env)
+        environment = normalize_environment(environment)
         resources = normalize_resources(resources)
         roles = role_plan(topology, resources, command)
         if preflight is not None and (not isinstance(preflight, str) or not preflight.strip()):
             raise ValueError("preflight must be a nonempty shell command")
+        from vaws_coordinator.execution_sources import capture_sources
+        if sources is None:
+            # Resolve defaults once. Accepted work never consults this mutable
+            # session mapping again, even if another attached client changes it.
+            context = self.store.context(self.context["attachment"]["id"])
+            sources = {name: source["path"] for name, source in context["session"].get("sources", {}).items()}
+        source_snapshot = capture_sources(sources, self.store.state_dir)
         spec = {
             "command": command, "env": env, "environment": environment or {},
             "resources": resources, "topology": topology or {}, "roles": roles,
+            "source_snapshot": source_snapshot,
             "timeout_seconds": timeout_seconds, "service": service,
             "preflight": preflight,
         }

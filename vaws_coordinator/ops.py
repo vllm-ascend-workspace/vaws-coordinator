@@ -12,14 +12,15 @@ import time
 from remote_dev.result import make_result
 from remote_dev.runtime import process_identity, runtime_status
 from vaws_coordinator.presentation import present
+from vaws_coordinator.placement import ENVIRONMENT_KEYS
 from vaws_coordinator.state_paths import coordinator_state_dir
 
 LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws-remote-dev")]
 
 TOOL_DESCRIPTIONS = {
-    "vaws.session": "Inspect this native session's VAWS task and bind actual business worktrees. Local only: no machine is required. Use the context_file supplied by the session hook.",
-    "vaws.run": "Run a business command on this task's isolated root in the user container. Pass environment/resource/topology needs; do not pass request IDs, profile hashes, or runtime IDs. The coordinator places, prepares, launches and recovers.",
-    "vaws.execution": "Observe, tail, stop or read the launch target by execution_id or task-scoped service name belonging to this VAWS task. Stop releases that execution's devices and ports; the container and task root remain.",
+    "vaws.session": "Inspect this native session's VAWS task or replace source defaults for future submissions. Local only: no machine is required. Active executions retain their submitted inputs.",
+    "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Sources omitted uses task defaults; sources={} runs without source dependencies. Devices default to zero. The coordinator places, prepares, launches and supervises the execution.",
+    "vaws.execution": "Use action=status (default), tail, stop or target with an execution_id or task-scoped service name belonging to this VAWS task. Status reads current progress; stop releases that execution's devices and ports. The container and execution root remain.",
     "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
 }
 
@@ -32,17 +33,33 @@ def task_schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
             "required": list(required), "additionalProperties": False}
 
 
+RESOURCE_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    "devices": {"type": "array", "items": {"type": "integer", "minimum": 0}, "uniqueItems": True},
+    "npu_count": {"type": "integer", "minimum": 0, "description": "Number of NPUs; defaults to zero. If devices is also supplied, this must equal its length."},
+    "service_port": {"type": "integer", "minimum": 0, "maximum": 65535}}}
+ROLE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["name"], "properties": {
+    **RESOURCE_SCHEMA["properties"], "name": {"type": "string", "minLength": 1},
+    "host": {"type": "string", "minLength": 1}, "command": {"type": "string", "minLength": 1},
+    "preflight": {"type": "string", "minLength": 1},
+    "env": {"type": "object", "additionalProperties": {"type": "string"}}}}
+
+
 TOOL_SCHEMAS = {
     "vaws.session": task_schema({"sources": {"type": "object", "additionalProperties": {"type": "string"}}}),
     "vaws.run": task_schema({
         "command": {"type": "string"},
+        "sources": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Actual worktrees to capture once for this execution. Omit to use task defaults; {} explicitly selects no sources."},
         "preflight": {"type": "string", "description": "Optional validation command in the prepared root before NPU allocation. It must not require devices or start a service."},
         "env": {"type": "object", "additionalProperties": {"type": "string"}},
-        "environment": {"type": "object"},
-        "resources": {"type": "object"},
-        "topology": {"type": "object"},
+        "environment": {"type": "object", "additionalProperties": False, "properties": {
+            key: {"type": "string", "minLength": 1} for key in sorted(ENVIRONMENT_KEYS)}},
+        "resources": RESOURCE_SCHEMA,
+        "topology": {"type": "object", "additionalProperties": False, "properties": {
+            "host": {"type": "string", "minLength": 1, "description": "Host constraint for one default role; use roles[].host for a role group."},
+            "roles": {"type": "array", "minItems": 1, "items": ROLE_SCHEMA},
+            "distinct_hosts": {"type": "boolean"}}, "not": {"required": ["host", "roles"]}},
         "timeout_seconds": {"type": ["integer", "null"], "default": 1800},
-        "service": {"type": ["string", "null"], "description": "Task-scoped service name; reconnects a live service with this name"},
+        "service": {"type": ["string", "null"], "description": "Ensure a task-scoped service with identical fixed sources and configuration. Changed inputs require restart. To connect without capture, use vaws_execution(service=...)."},
         "restart": {"type": "boolean", "description": "Replace a live named service, including one with the same spec"},
     }, ("command",)),
     "vaws.execution": task_schema({"execution_id": {"type": "string"}, "service": {"type": "string", "description": "Task-scoped service name, mutually exclusive with execution_id"}, "action": {"type": "string", "enum": ["status", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name for per-role target or tail"}}),
@@ -59,16 +76,21 @@ def vaws_call(name, args, *, allow_native_context=True):
     target = {"kind": "vaws-task"}
     client = None
     try:
+        if name not in TOOL_SCHEMAS:
+            raise ValueError("unknown VAWS operation")
+        unknown = set(args) - set(TOOL_SCHEMAS[name]["properties"])
+        if unknown:
+            raise ValueError("unsupported fields for " + name + ": " + ", ".join(sorted(unknown)))
         from vaws_coordinator.task_client import TaskClient
         client = TaskClient(args.get("context_file", ""), allow_native_context=allow_native_context)
         target["session_id"] = client.context["session"]["id"]
         if name == "vaws.session":
-            if args.get("sources"):
+            if "sources" in args:
                 client.sources(args["sources"])
             value = client.status()
             status = value["session"]["state"]
         elif name == "vaws.run":
-            keys = ("command", "env", "environment", "resources", "topology",
+            keys = ("command", "sources", "env", "environment", "resources", "topology",
                     "timeout_seconds", "service", "restart", "preflight")
             value = client.run(**{key: args[key] for key in keys if key in args})
             status = value["state"]
@@ -82,7 +104,21 @@ def vaws_call(name, args, *, allow_native_context=True):
             status = value["state"]
         else:
             raise ValueError("unknown VAWS operation")
-        outcome = "blocked" if status in {"uncertain", "waiting", "waiting_for_runtime", "queued", "preparing"} else "failed" if status == "failed" else "timeout" if status == "timeout" else "success"
+        if status in {"failed", "inconclusive"}:
+            outcome = "failed"
+        elif status == "timeout":
+            outcome = "timeout"
+        elif status == "cancelled":
+            outcome = "cancelled"
+        elif status in {"uncertain", "waiting_for_runtime"}:
+            outcome = "blocked"
+        elif status in {"queued", "preparing", "waiting"} and not value.get("execution_id"):
+            outcome = "blocked"
+        else:
+            # Admission and successful observation are completed tool calls.
+            # A durable execution can still be queued or preparing; reporting
+            # that normal progress as an MCP error makes clients retry work.
+            outcome = "success"
         if name == "vaws.finish" and outcome == "success" and status != "finished":
             outcome = "blocked"
         result = make_result(tool=name, target=target, outcome=outcome, status=status,

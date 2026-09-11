@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from vaws_coordinator.agent_session import CLIENTS, AgentSessions, load_context
+from vaws_coordinator.client_paths import client_path
 
 
 # Cross-client payload discriminators, pinned by each client's documented hook
@@ -38,7 +39,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     event = str(payload.get("hook_event_name") or payload.get("hookEventName") or "")
     normalized = re.sub(r"[^a-z]", "", event.lower())
     native = str(payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "")
-    cwd = payload.get("cwd") or payload.get("workspaceRoot") or (payload.get("workspace_roots") or [str(Path.cwd())])[0]
+    cwd = client_path(payload.get("cwd") or payload.get("workspaceRoot") or (payload.get("workspace_roots") or [str(Path.cwd())])[0])
     if not native:
         raise ValueError("hook has no native session identity; no task association was guessed")
 
@@ -53,7 +54,8 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
                 store = AgentSessions(Path(inherited["state_dir"]))
             context = store.attach(client, native, str(cwd), parent_context=parent, association=association)
             try:
-                context = store.bind_sources(context, {Path(cwd).name: str(cwd)})
+                if not context["session"].get("sources"):
+                    context = store.bind_sources(context, {Path(cwd).name: str(cwd)})
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 # A new, non-Git or unborn project still has a usable local task.
                 print(f"VAWS: source reference not yet bound: {type(exc).__name__}", file=sys.stderr)
@@ -104,7 +106,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     if client == "cursor" and normalized == "sessionstart":
         return {"env": {"VAWS_CONTEXT_FILE": context["context_file"]}, "additional_context": hint}
     if client == "claude" and normalized == "sessionstart" and os.environ.get("CLAUDE_ENV_FILE"):
-        with Path(os.environ["CLAUDE_ENV_FILE"]).open("a") as stream:
+        with Path(client_path(os.environ["CLAUDE_ENV_FILE"])).open("a") as stream:
             stream.write("\nexport VAWS_CONTEXT_FILE=" + shlex.quote(context["context_file"]) + "\n")
     if normalized in {"sessionstart", "subagentstart", "userpromptsubmit"}:
         canonical = {"sessionstart": "SessionStart", "subagentstart": "SubagentStart", "userpromptsubmit": "UserPromptSubmit"}[normalized]
@@ -115,14 +117,14 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", choices=sorted(CLIENTS), required=True)
-    parser.add_argument("--project", type=Path, help="Scope a global hook (notably Kimi) to this project")
+    parser.add_argument("--project", help="Scope a global hook (notably Kimi) to this project")
     args = parser.parse_args()
     try:
         payload = json.load(sys.stdin)
         if args.project:
-            cwd = Path(payload.get("cwd") or payload.get("workspaceRoot") or
-                       (payload.get("workspace_roots") or [str(Path.cwd())])[0]).resolve()
-            project = args.project.expanduser().resolve()
+            cwd = Path(client_path(payload.get("cwd") or payload.get("workspaceRoot") or
+                       (payload.get("workspace_roots") or [str(Path.cwd())])[0])).resolve()
+            project = Path(client_path(args.project)).expanduser().resolve()
             if cwd != project and project not in cwd.parents:
                 # Kimi appends stdout to the user prompt; a literal {} would
                 # pollute every prompt outside this project. Stay silent.

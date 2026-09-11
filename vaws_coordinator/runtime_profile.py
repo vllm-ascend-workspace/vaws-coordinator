@@ -43,6 +43,23 @@ def capture_launch_environment(environment: dict[str, str]) -> dict[str, str]:
     return captured
 
 
+def command_launch_environment(environment: dict[str, str], *, roots: list[str] = ()) -> dict[str, str]:
+    """Keep image initialization while excluding previous execution overlays."""
+    def scoped(value: str) -> bool:
+        return (value.startswith('/tmp/vaws-python-shim.') or
+                '/vllm-workspace/executions/' in value or '/vllm-workspace/tasks/' in value or
+                any(value == root or value.startswith(root.rstrip('/') + '/') for root in roots if root and root != '/'))
+    result = {}
+    for key, value in capture_launch_environment(environment).items():
+        if key in {'PATH', 'PYTHONPATH', 'LD_LIBRARY_PATH', 'ASCEND_CUSTOM_OPP_PATH'}:
+            parts = list(dict.fromkeys(part for part in value.split(':') if part and not scoped(part)))
+            if parts:
+                result[key] = ':'.join(parts)
+        elif not scoped(value):
+            result[key] = value
+    return result
+
+
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -53,6 +70,19 @@ def file_digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             result.update(block)
     return result.hexdigest()
+
+
+def verified_preparation(preparation: dict, profile: dict) -> dict:
+    """Resolve cache keys from measured environment facts, not donor guesses."""
+    result = dict(preparation)
+    requested = preparation.get('environment', {})
+    base = {name: profile.get(name) for name in (
+        'image_digest', 'soc', 'driver', 'cann', 'python_abi', 'torch', 'torch_npu', 'compiler', 'system_files')}
+    base.update(environment=requested.get('environment', {}), build_env=requested.get('build_env', {}))
+    result['environment'] = base
+    result['dependency_key'] = digest({'environment': base, 'dependencies': result.get('dependencies', {})})
+    result['native_key'] = digest({'environment': base, 'dependencies': result.get('dependencies', {}), 'native': result.get('native', {})})
+    return result
 
 
 def build_toolchain_from_logs(root: Path) -> dict[str, Any]:
@@ -129,7 +159,8 @@ def installed_native_files(root: Path) -> dict[str, str]:
     if not binaries or not configs:
         raise ValueError("cannot attest complete installed custom-op binaries and metadata")
     files = {}
-    for path in [*extensions, *outputs]:
+    generated = [path for path in (package / '_build_info.py',) if path.is_file()]
+    for path in [*extensions, *outputs, *generated]:
         if path.name == ".gitkeep":
             continue
         relative = path.relative_to(root).as_posix()
@@ -139,7 +170,10 @@ def installed_native_files(root: Path) -> dict[str, str]:
 
 
 def profile_key(profile: dict[str, Any]) -> str:
-    if any(not isinstance(profile.get(key), str) or not profile[key].strip() for key in PROFILE_FIELDS):
+    if profile.get('kind') == 'command':
+        if not all(isinstance(profile.get(key), str) and profile[key] for key in ('image_digest', 'python_abi')):
+            raise ValueError('command profile requires image and Python ABI evidence')
+    elif any(not isinstance(profile.get(key), str) or not profile[key].strip() for key in PROFILE_FIELDS):
         raise ValueError("profile requires exact versions: " + ", ".join(PROFILE_FIELDS))
     for key in ("build_env", "launch_env"):
         if not isinstance(profile.get(key), dict):
@@ -150,6 +184,8 @@ def profile_key(profile: dict[str, Any]) -> str:
             raise ValueError("invalid profile environment variable name")
         if any(re.search(r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|PASS(?:WORD)?|SECRET|TOKEN)(?:_|$)", k) for k in profile[key]):
             raise ValueError("profile environment must not contain secrets")
+    if profile.get('kind') == 'command':
+        return digest(profile)
     if not profile.get("compatibility_evidence"):
         raise ValueError("profile requires an operator-reviewed compatibility evidence reference")
     if not {"cann", "driver"}.issubset(profile.get("system_files", {})):
@@ -208,6 +244,15 @@ def capture(root: Path, profile: dict[str, Any], inputs: dict[str, Any],
 
 
 def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = True) -> None:
+    if manifest.get('schema_version') == 2 and manifest.get('profile', {}).get('kind') == 'command':
+        if profile_key(manifest['profile']) != manifest['profile_key']:
+            raise ValueError('command environment identity mismatch')
+        if digest({'profile': manifest['profile'], 'sources': manifest.get('source_id')}) != manifest.get('build_key'):
+            raise ValueError('command source identity mismatch')
+        if check_environment and (str(root.resolve()) != manifest['runtime_root'] or
+                                  sysconfig.get_config_var('SOABI') != manifest['profile']['python_abi']):
+            raise ValueError('command interpreter or execution root changed')
+        return
     if manifest.get("schema_version") != 1:
         raise ValueError("unsupported runtime manifest")
     if profile_key(manifest["profile"]) != manifest["profile_key"] or build_key(manifest["profile"], manifest["build_inputs"]) != manifest["build_key"]:
@@ -222,6 +267,16 @@ def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = Tr
     for row in manifest["evidence"].values():
         if file_digest(checked_file(root, row["path"])) != row["sha256"]:
             raise ValueError("environment evidence changed")
+    try:
+        smoke = json.loads(checked_file(root, manifest['evidence']['smoke']['path']).read_text(encoding='utf-8'))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError('import-smoke evidence must be a successful structured receipt') from exc
+    if smoke.get('passed') is not True:
+        raise ValueError('import-smoke evidence did not pass')
+    if smoke.get('profile_key') not in (None, manifest['profile_key']):
+        raise ValueError('import-smoke evidence belongs to another profile')
+    if smoke.get('build_inputs') not in (None, manifest['build_inputs']):
+        raise ValueError('import-smoke evidence belongs to different build inputs')
     if check_environment:
         if str(root.resolve()) != manifest["runtime_root"]:
             raise ValueError("runtime relocation needs separate validation")
