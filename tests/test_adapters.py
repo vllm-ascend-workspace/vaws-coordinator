@@ -65,6 +65,7 @@ class RemoteDevAdapterTests(unittest.TestCase):
         self.assertEqual(endpoint.port, 46010)
         self.assertEqual(bash.call_args.kwargs["command"], "true")
         self.assertFalse(bash.call_args.kwargs["runtime_env"])
+        self.assertTrue(bash.call_args.kwargs["wait"])
 
 
 class ProcessControlBoundaryTests(unittest.TestCase):

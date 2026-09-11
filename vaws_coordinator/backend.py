@@ -41,6 +41,7 @@ def remote_shell(target: dict, command: str, *, timeout_ms: int = 45000) -> dict
         command=command,
         timeout_ms=timeout_ms,
         runtime_env=False,
+        wait=True,
     )["result"]
 
 

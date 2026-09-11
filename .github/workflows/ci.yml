@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p "$HOME"
           uv venv
-          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@68ced0cc4fc16e805da8cd46bdf97bc1eccdd2ce"
           uv pip install pytest
           uv pip install -e . --no-deps
           .venv/bin/python -m pytest -q
@@ -60,7 +60,7 @@ jobs:
           cd "${{ runner.temp }}"
           uv venv .venv-wheel
           VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install \
-            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
+            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@68ced0cc4fc16e805da8cd46bdf97bc1eccdd2ce"
           VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install "${{ github.workspace }}"/dist/*.whl
           .venv-wheel/bin/python -c "import vaws_coordinator, pathlib; p=pathlib.Path(vaws_coordinator.__file__).resolve(); assert 'site-packages' in p.parts, p"
           .venv-wheel/bin/vaws-coordinator --help
@@ -88,7 +88,7 @@ jobs:
           $env:PATH = "$gitBin;$env:PATH"
           New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
           uv venv
-          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@68ced0cc4fc16e805da8cd46bdf97bc1eccdd2ce"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv pip install pytest
           uv pip install -e . --no-deps
