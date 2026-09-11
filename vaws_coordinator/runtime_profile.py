@@ -37,7 +37,9 @@ def capture_launch_environment(environment: dict[str, str]) -> dict[str, str]:
     captured = {key: environment[key] for key in LAUNCH_PATH_KEYS if environment.get(key)}
     shim = environment.get("VAWS_PYTHON_SHIM_DIR")
     if shim and "PATH" in captured:
-        captured["PATH"] = os.pathsep.join(part for part in captured["PATH"].split(os.pathsep) if part != shim)
+        # The environment describes the remote Linux container, even when
+        # its preparation plan is built by a Windows client.
+        captured["PATH"] = ":".join(part for part in captured["PATH"].split(":") if part != shim)
     return captured
 
 

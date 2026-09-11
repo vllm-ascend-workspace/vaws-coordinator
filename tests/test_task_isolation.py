@@ -63,6 +63,7 @@ class IsolatedPrepareScriptTests(unittest.TestCase):
         self.assertNotIn("ls -1d /usr/local/python", after_preamble)
         self.assertIn('"$PYTHON" -m pip uninstall', after_preamble)
 
+    @unittest.skipIf(os.name == "nt", "executes the Linux container venv payload locally")
     def test_venv_uses_prepared_image_python_instead_of_ssh_path(self):
         from vaws_coordinator.provision.task_environment import create_venv_script
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,6 +149,7 @@ class ExplicitSourceSnapshotTests(unittest.TestCase):
 
 
 class FakeTaskPythonInvocationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "executes Linux shell fixtures and interpreters locally")
     def test_uninstall_verify_and_editable_invoke_task_python_with_spaces(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -161,9 +163,9 @@ class FakeTaskPythonInvocationTests(unittest.TestCase):
             fake.write_text(
                 "#!/bin/sh\n"
                 f"log={shlex.quote(str(log))}\n"
-                "printf 'CALL\\n' >> \"$log\"\n"
-                "printf 'argv0=%s\\n' \"$0\" >> \"$log\"\n"
-                "for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\" >> \"$log\"; done\n"
+                "record=$(printf 'CALL\\nargv0=%s\\n' \"$0\"; "
+                "for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done)\n"
+                "printf '%s\\n' \"$record\" >> \"$log\"\n"
                 "exit 0\n",
                 encoding="utf-8",
             )

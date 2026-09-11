@@ -220,6 +220,8 @@ def describe() -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from vaws_coordinator._stdio import configure_stdio
+    configure_stdio()
     parser = argparse.ArgumentParser(
         description="Serve the VAWS task tools over stdio (JSON-RPC 2.0, "
                     "Content-Length framed or newline-delimited)."

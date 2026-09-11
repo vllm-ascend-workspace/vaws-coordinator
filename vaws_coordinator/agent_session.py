@@ -27,12 +27,12 @@ def worktree_reference(path: str) -> dict:
     source = Path(path).expanduser().resolve(strict=True)
     result = subprocess.run(
         ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, timeout=5, check=True,
+        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
     )
     root = Path(result.stdout.strip()).resolve()
     info = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--git-common-dir", "HEAD"],
-        capture_output=True, text=True, timeout=5, check=True,
+        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
     ).stdout.splitlines()
     return {"path": str(root), "git_common_dir": str((root / info[0]).resolve()), "head_at_bind": info[1]}
 

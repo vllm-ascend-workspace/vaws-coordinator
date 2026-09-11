@@ -95,7 +95,8 @@ class CoordinationTests(unittest.TestCase):
         with mock.patch("vaws_coordinator.host.vaws_npu_coordination.process_guard_busy", return_value=True):
             self.coordinator.activate("guarded-task", token, pid=1234, process_guard=guard, heartbeat_ttl_seconds=1)
             import sqlite3
-            with sqlite3.connect(Path(self.temp.name) / "coordinator.sqlite3") as old_client:
+            from contextlib import closing
+            with closing(sqlite3.connect(Path(self.temp.name) / "coordinator.sqlite3")) as old_client, old_client:
                 with self.assertRaisesRegex(sqlite3.IntegrityError, "process guard"):
                     old_client.execute("UPDATE tasks SET state='released' WHERE task_id='guarded-task'")
             self.clock.advance(2)

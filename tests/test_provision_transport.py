@@ -6,6 +6,7 @@ reader, deadline, capture, and on_output callback still run.
 from __future__ import annotations
 
 import shlex
+import base64
 import sys
 import time
 import unittest
@@ -20,7 +21,11 @@ TARGET = host_ops.SshTarget(host="192.0.2.10", user="root", port=22)
 
 def _local_bash(_endpoint, script, *, timeout_ms=None):
     del _endpoint, timeout_ms
-    return ["bash", "-c", script]
+    # Sending bytes avoids Windows Bash/WSL command-line quote translation.
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    source = ("import base64,subprocess,sys; "
+              f"sys.exit(subprocess.run(['bash','-s'],input=base64.b64decode({encoded!r})).returncode)")
+    return [sys.executable, "-c", source]
 
 
 def _local_python(source: str):

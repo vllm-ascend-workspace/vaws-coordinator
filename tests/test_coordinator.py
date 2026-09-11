@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +34,10 @@ def _init_git_workspace(path: Path) -> None:
         capture_output=True,
     )
     (path / "README").write_text("pool\n", encoding="utf-8")
+    # Match the consumer contract: runtime state is not a source snapshot.
+    (path / ".git" / "info" / "exclude").write_text(
+        "manager/\ncoordinator/\nsessions/\nhost/\n.vaws-local/\n", encoding="utf-8"
+    )
     subprocess.run(["git", "-C", str(path), "add", "README"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(path), "commit", "-m", "init"], check=True, capture_output=True)
 
@@ -420,7 +425,7 @@ class PoolTests(unittest.TestCase):
         binding = self.bind("alice", self.root / "a")
         run = self.request("alice", binding)
         import sqlite3
-        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
+        with closing(sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3")) as db, db:
             db.execute("UPDATE meta SET value='new-epoch' WHERE key='coordination_epoch'")
         result = self.pool.control("alice", run["id"], "release")
         self.assertEqual(result["state"], "uncertain")
@@ -575,7 +580,7 @@ class PoolTests(unittest.TestCase):
         job = self.managed("alice", binding)
         self.assertEqual(job["state"], "running")
         import sqlite3
-        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
+        with closing(sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3")) as db, db:
             db.execute("UPDATE tasks SET state='orphaned_busy'")
         self.backend.calls.clear()
         recovered = self.pool.managed_control("alice", job["id"])
@@ -608,7 +613,7 @@ class PoolTests(unittest.TestCase):
         binding = self.bind("alice", self.root / "a")
         job = self.managed("alice", binding)
         import sqlite3
-        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
+        with closing(sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3")) as db, db:
             db.execute("UPDATE meta SET value='new-epoch' WHERE key='coordination_epoch'")
         wedged = self.pool.managed_control("alice", job["id"])
         self.assertEqual(wedged["state"], "uncertain")
@@ -625,9 +630,9 @@ class PoolTests(unittest.TestCase):
     def test_task_worktrees_can_change_only_between_returned_bindings(self):
         binding = self.bind("alice", self.root / "a")
         with self.assertRaisesRegex(ValueError, "return task runtimes"):
-            self.pool.session_open("alice", "same-session-name", {"va": "/new/worktree"})
+            self.pool.session_open("alice", "same-session-name", {"va": str(self.root / "new/worktree")})
         self.pool.return_runtime("alice", binding["id"])
-        result = self.pool.session_open("alice", "same-session-name", {"va": "/new/worktree"})
+        result = self.pool.session_open("alice", "same-session-name", {"va": str(self.root / "new/worktree")})
         self.assertEqual(result["id"], binding["intent"]["session"])
 
     def test_drain_waits_for_existing_managed_job_and_disables_automatic_reuse(self):
@@ -812,7 +817,7 @@ class PoolTests(unittest.TestCase):
 
     def _host_ports(self):
         import sqlite3
-        with sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3") as db:
+        with closing(sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3")) as db, db:
             return [(row[0], row[1], row[2]) for row in db.execute("SELECT port, kind, task_id FROM ports ORDER BY port")]
 
     def test_two_successive_managed_jobs_reuse_the_user_container(self):
@@ -853,6 +858,7 @@ class PoolTests(unittest.TestCase):
         self.assertIn((46001, "container_ssh", "ssh.alice"), ports)
         self.assertFalse(any(kind == "service" for _, kind, _ in ports))
 
+    @unittest.skipIf(os.name == "nt", "executes Linux container imports and launch payload locally")
     def test_managed_launch_imports_bound_sources_from_task_root(self):
         import shlex
 
@@ -1587,17 +1593,24 @@ class DaemonProcessTests(unittest.TestCase):
                 else:
                     self.fail("daemon did not start")
                 sock = socket_path(state)
-                self.assertLessEqual(len(str(sock)), 80)
+                if os.name == "nt":
+                    self.assertEqual(sock, state / "coordinator.ipc")
+                else:
+                    self.assertLessEqual(len(str(sock)), 80)
                 self.assertTrue(sock.exists())
                 with self.assertRaises(Exception):
                     client.advance(str(sessions), "alice", "0" * 64)
                 import sqlite3
-                with sqlite3.connect(state / "coordinator.sqlite3") as db:
+                with closing(sqlite3.connect(state / "coordinator.sqlite3")) as db:
                     row = db.execute("SELECT data FROM records WHERE kind='meta' AND id='session_dirs'").fetchone()
                 self.assertIsNotNone(row)
                 self.assertIn(str(sessions), json.loads(row[0])["paths"])
-                proc.terminate()
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
+                else:
+                    proc.terminate()
                 proc.wait(timeout=5)
+                proc.stdout.close()
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "vaws_coordinator", "daemon", "--state-dir", str(state)],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env,
@@ -1611,15 +1624,20 @@ class DaemonProcessTests(unittest.TestCase):
                         time.sleep(0.05)
                 else:
                     self.fail("daemon did not restart")
-                with sqlite3.connect(state / "coordinator.sqlite3") as db:
+                with closing(sqlite3.connect(state / "coordinator.sqlite3")) as db:
                     row = db.execute("SELECT data FROM records WHERE kind='meta' AND id='session_dirs'").fetchone()
                 self.assertIn(str(sessions), json.loads(row[0])["paths"])
             finally:
-                proc.terminate()
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
+                else:
+                    proc.terminate()
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait(timeout=5)
+                proc.stdout.close()
                 sock = socket_path(state)
                 if sock.exists():
                     sock.unlink()
@@ -1694,16 +1712,25 @@ class DaemonProcessTests(unittest.TestCase):
                 self.assertLess(time.time() - t2, 0.5)
                 release.set()
                 lock = service._lock_for("execution", admitted["execution_id"])
-                deadline = time.time() + 5
+                deadline = time.time() + 20
                 while lock.locked() and time.time() < deadline:
                     time.sleep(0.02)
+                self.assertFalse(lock.locked(), "fixture launch did not finish")
                 completed = client.advance(str(sessions.state_dir), "alice", admitted["execution_id"], "status")
                 self.assertEqual(completed["execution_id"], admitted["execution_id"])
-                self.assertEqual(completed["state"], "running")
+                self.assertEqual(completed["state"], "running", completed)
             finally:
                 release.set()
                 service._stopped.set()
                 worker.join(timeout=2.5)
+                self.assertFalse(worker.is_alive())
+                # This fixture forces the private stop event while a simulated
+                # execution is live; drain its already scheduled workers too.
+                deadline = time.monotonic() + 10
+                while (service._active_requests or any(item.locked() for item in service._lock_registry.values())) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(service._active_requests)
+                self.assertFalse(any(item.locked() for item in service._lock_registry.values()))
                 sock = socket_path(root / "coordinator")
                 if sock.exists():
                     sock.unlink()
@@ -1770,8 +1797,21 @@ class DaemonProcessTests(unittest.TestCase):
                 self.assertNotEqual(status["state"], "timeout")
             finally:
                 release.set()
+                lock = service._lock_for("execution", row["id"])
+                deadline = time.monotonic() + 10
+                while lock.locked() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(lock.locked(), "fixture preparation did not finish")
                 service._stopped.set()
                 worker.join(timeout=2.5)
+                self.assertFalse(worker.is_alive())
+                # This fixture forces the private stop event while a simulated
+                # execution is live; drain its already scheduled workers too.
+                deadline = time.monotonic() + 10
+                while (service._active_requests or any(item.locked() for item in service._lock_registry.values())) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(service._active_requests)
+                self.assertFalse(any(item.locked() for item in service._lock_registry.values()))
                 sock = socket_path(root / "coordinator")
                 if sock.exists():
                     sock.unlink()
@@ -1854,8 +1894,10 @@ class ProfileTests(unittest.TestCase):
             from vaws_coordinator.runtime_profile import launch_preamble
             import os, subprocess
             profile["launch_env"]["PYTHONPATH"] = "/scoped/source"
-            result = subprocess.check_output(["bash", "-c", launch_preamble(profile) + '\nprintf "%s" "$PYTHONPATH"'],
-                                              text=True, env={**os.environ, "PYTHONPATH": "/base/acl:/base/native-compat"})
+            script = "export PYTHONPATH=/base/acl:/base/native-compat\n" + launch_preamble(profile) + '\nprintf "%s" "$PYTHONPATH"'
+            result = subprocess.run(["bash", "-s"], input=script.encode("utf-8"), check=True,
+                                    capture_output=True,
+                                    env={**os.environ, "PYTHONPATH": "/base/acl:/base/native-compat"}).stdout.decode("utf-8")
             self.assertEqual(result, "/scoped/source:/base/acl:/base/native-compat")
 
     def test_attest_records_smoke_timeout_as_evidence(self):

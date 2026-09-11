@@ -26,7 +26,7 @@ def shared_workspace_root(repo_root: Path | None = None) -> Path:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, timeout=5, check=False,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", timeout=5, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return repo_root

@@ -72,13 +72,13 @@ class RemoteBackend:
 import json, subprocess
 from pathlib import Path
 request = json.loads(__import__('sys').argv[1])
-info = json.loads(subprocess.check_output(['docker','inspect','--format','{{json .}}',request['container_name']], text=True))
+info = json.loads(subprocess.check_output(['docker','inspect','--format','{{json .}}',request['container_name']], text=True, encoding="utf-8"))
 if info['Id'] != request['container_id']:
     raise RuntimeError('container identity changed before activation')
 receipt = request['receipt']
 if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != receipt['boot_id']:
     raise RuntimeError('host boot identity changed')
-rows = subprocess.check_output(['docker','top',request['container_name'],'-eo','pid'], text=True).splitlines()[1:]
+rows = subprocess.check_output(['docker','top',request['container_name'],'-eo','pid'], text=True, encoding="utf-8").splitlines()[1:]
 matches = []
 for row in rows:
     pid = int(row.strip())
@@ -152,9 +152,9 @@ if _build_namespace["runtime_build_inputs"](root, manifest["profile"], manifest[
     raise ValueError("cache miss: installed native artifacts do not match current source inputs")
 for name, expected in args["snapshots"].items():
     repo = root / name
-    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    dirty = subprocess.check_output(["git", "-C", str(repo), "diff", "HEAD", "--name-only", "--ignore-submodules=dirty"], text=True)
-    untracked = subprocess.check_output(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"], text=True)
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
+    dirty = subprocess.check_output(["git", "-C", str(repo), "diff", "HEAD", "--name-only", "--ignore-submodules=dirty"], text=True, encoding="utf-8")
+    untracked = subprocess.check_output(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"], text=True, encoding="utf-8")
     private = {".vaws-runtime", ".remote-code-parity", "Mooncake"} if name == "." else set()
     extras = [path for path in untracked.split("\\0") if path and path.split("/", 1)[0] not in private]
     if head != expected or dirty.strip() or extras:
@@ -219,7 +219,7 @@ print(json.dumps(manifest))
             with Path(log).open("w") as stream:
                 result = subprocess.run(args, env=env, timeout=3600, check=False, stdout=stream, stderr=stream)
         else:
-            result = subprocess.run(args, env=env, timeout=3600, check=False, capture_output=True, text=True)
+            result = subprocess.run(args, env=env, timeout=3600, check=False, capture_output=True, text=True, encoding="utf-8")
         if result.returncode:
             detail = f"inspect {log}" if log else (result.stderr or result.stdout or "")
             raise RuntimeError(f"source materialization failed: {detail}")

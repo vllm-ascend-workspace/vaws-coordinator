@@ -29,6 +29,8 @@ def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
 
 
 def main():
+    from vaws_coordinator._stdio import configure_stdio
+    configure_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
     attach = sub.add_parser("attach", help="Adapter entry: native root/resume, child, or explicit task association")

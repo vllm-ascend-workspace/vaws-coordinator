@@ -11,6 +11,7 @@ import getpass
 import hashlib
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -55,10 +56,27 @@ LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws
 
 def socket_path(state_dir: Path) -> Path:
     """Short per-user/state socket. macOS AF_UNIX paths cap near 104 bytes."""
+    if os.name == "nt":
+        return Path(state_dir) / IPC_NAME
     resolved = str(Path(state_dir).expanduser().resolve())
     digest = hashlib.sha256(resolved.encode()).hexdigest()[:16]
     user = "".join(ch if ch.isalnum() else "-" for ch in getpass.getuser())[:12] or "user"
     return Path("/tmp") / f"vc-{user}-{digest}.sock"
+
+
+def _lock_daemon(handle, *, release=False):
+    if os.name == "nt":
+        import msvcrt
+
+        if not release and os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b" ")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK if release else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_UN if release else fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def lock_path(state_dir: Path) -> Path:
@@ -117,6 +135,7 @@ class CoordinatorService:
         self._lifecycle_lock = threading.Lock()
         self._active_requests = 0
         self._async_progress = False
+        self._ipc_token: str | None = None
         self._load_session_dirs()
         if sessions is not None:
             self._remember_session_dir(str(sessions.state_dir))
@@ -1071,35 +1090,42 @@ class CoordinatorService:
                 lock.release()
 
     def serve(self) -> int:
-        import fcntl
-
-        lock = lock_path(self.state_dir).open("a+")
+        lock = lock_path(self.state_dir).open("a+b")
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            _lock_daemon(lock)
+        except OSError:
             lock.close()
             raise RuntimeError(f"coordinator already running for {self.state_dir}")
         path = socket_path(self.state_dir)
-        if path.exists():
-            path.unlink()
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server = None
+        marker = self.state_dir / IPC_NAME
+        temporary = marker.with_name(marker.name + "." + uuid.uuid4().hex + ".tmp")
         try:
-            server.bind(str(path))
-        except OSError as exc:
-            lock.close()
-            raise RuntimeError(f"coordinator socket bind failed at {path} ({len(str(path))} bytes): {exc}") from exc
-        os.chmod(path, 0o700)
-        (self.state_dir / IPC_NAME).write_text(
-            json.dumps({"socket": str(path), "state_dir": str(self.state_dir.resolve())}) + "\n"
-        )
-        print(f"vaws-coordinator listening socket={path} state={self.state_dir} lock={lock_path(self.state_dir)}",
-              flush=True)
-        server.listen(16)
-        server.settimeout(1.000_000)
-        self._async_progress = True
-        ticker = threading.Thread(target=self._tick_loop, name="vaws-coordinator-tick", daemon=True)
-        ticker.start()
-        try:
+            path.unlink(missing_ok=True)
+            windows = os.name == "nt"
+            server = socket.socket(socket.AF_INET if windows else socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(("127.0.0.1", 0) if windows else str(path))
+            except OSError as exc:
+                raise RuntimeError(f"coordinator socket bind failed at {path} ({len(str(path))} bytes): {exc}") from exc
+            if not windows:
+                os.chmod(path, 0o700)
+            self._ipc_token = secrets.token_hex(32) if windows else None
+            address = {"host": "127.0.0.1", "port": server.getsockname()[1],
+                       "token": self._ipc_token} if windows else {"socket": str(path)}
+            server.listen(16)
+            server.settimeout(1.000_000)
+            # Publish only a complete record after the listener is ready.
+            temporary.write_text(
+                json.dumps({**address, "state_dir": str(self.state_dir.resolve())}) + "\n", encoding="utf-8"
+            )
+            temporary.chmod(0o600)
+            os.replace(temporary, marker)
+            print(f"vaws-coordinator listening socket={path} state={self.state_dir} lock={lock_path(self.state_dir)}",
+                  flush=True)
+            self._async_progress = True
+            ticker = threading.Thread(target=self._tick_loop, name="vaws-coordinator-tick", daemon=True)
+            ticker.start()
             while not self._stopped.is_set():
                 try:
                     conn, _ = server.accept()
@@ -1108,11 +1134,17 @@ class CoordinatorService:
                 threading.Thread(target=self._serve_conn, args=(conn,), daemon=True).start()
         finally:
             self._stopped.set()
-            server.close()
-            if path.exists():
-                path.unlink()
-            fcntl.flock(lock, fcntl.LOCK_UN)
-            lock.close()
+            if server is not None:
+                server.close()
+            try:
+                path.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
+            finally:
+                try:
+                    _lock_daemon(lock, release=True)
+                finally:
+                    lock.close()
         return 0
 
     def _tick_loop(self) -> None:
@@ -1186,6 +1218,10 @@ class CoordinatorService:
                 return
             try:
                 request = json.loads(data.decode())
+                if self._ipc_token is not None and not secrets.compare_digest(
+                    str(request.pop("_ipc_token", "")), self._ipc_token
+                ):
+                    raise PermissionError("coordinator IPC authentication failed")
                 reply = self.handle(request)
             except Exception as exc:
                 reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -1208,10 +1244,22 @@ class CoordinatorClient:
         path = socket_path(self.state_dir)
         if not path.exists():
             raise RuntimeError(f"coordinator daemon is not running at {path}")
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if os.name == "nt":
+            try:
+                address = json.loads(path.read_text(encoding="utf-8"))
+                port, token = int(address["port"]), address["token"]
+                if not 0 < port < 65536 or not isinstance(token, str) or not token:
+                    raise ValueError("invalid port or token")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError(f"invalid coordinator IPC marker at {path}") from exc
+            payload["_ipc_token"] = token
+            target = ("127.0.0.1", port)
+        else:
+            target = str(path)
+        conn = socket.socket(socket.AF_INET if os.name == "nt" else socket.AF_UNIX, socket.SOCK_STREAM)
         conn.settimeout(self.timeout)
         try:
-            conn.connect(str(path))
+            conn.connect(target)
             conn.sendall((json.dumps({"op": op, **payload}) + "\n").encode())
             data = b""
             while b"\n" not in data:
@@ -1260,18 +1308,48 @@ def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
     Path(state_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+    # A separate short-lived startup lock avoids spawning losing daemons that
+    # are still importing when the caller has already received another's ping.
+    with (Path(state_dir) / "coordinator.start.lock").open("a+b") as guard:
+        deadline = time.monotonic() + 6
+        while True:
+            try:
+                _lock_daemon(guard)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"coordinator startup is still in progress at {state_dir}")
+                time.sleep(0.05)
+        try:
+            return _ensure_daemon_locked(state_dir, client)
+        finally:
+            _lock_daemon(guard, release=True)
+
+
+def _ensure_daemon_locked(state_dir: Path, client: CoordinatorClient) -> CoordinatorClient:
+    try:
+        client.runtime = (client.call("ping") or {}).get("runtime")
+        return client
+    except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+        pass
     log_path = Path(state_dir) / "daemon.log"
-    log = log_path.open("ab")
-    subprocess.Popen(
-        [sys.executable, "-m", "vaws_coordinator", "daemon", "--state-dir", str(state_dir)],
-        stdout=log, stderr=log, start_new_session=True,
-    )
+    options = ({"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+               if os.name == "nt" else {"start_new_session": True})
+    with log_path.open("ab") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "vaws_coordinator", "daemon", "--state-dir", str(state_dir)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, **options,
+        )
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
             client.runtime = (client.call("ping") or {}).get("runtime")
             return client
         except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+            if process.poll() is not None:
+                detail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                if "coordinator already running for" not in detail:
+                    raise RuntimeError(f"coordinator daemon exited ({process.returncode}): {detail}")
             time.sleep(0.05)
     raise RuntimeError(f"could not start coordinator daemon at {state_dir}")
 

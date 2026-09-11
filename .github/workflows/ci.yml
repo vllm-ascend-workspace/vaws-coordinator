@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p "$HOME"
           uv venv
-          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@c24a64a55e877904c9d539de4544ade0cc76cbac"
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
           uv pip install pytest
           uv pip install -e . --no-deps
           .venv/bin/python -m pytest -q
@@ -60,7 +60,35 @@ jobs:
           cd "${{ runner.temp }}"
           uv venv .venv-wheel
           VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install \
-            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@c24a64a55e877904c9d539de4544ade0cc76cbac"
+            "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
           VIRTUAL_ENV="$PWD/.venv-wheel" uv pip install "${{ github.workspace }}"/dist/*.whl
           .venv-wheel/bin/python -c "import vaws_coordinator, pathlib; p=pathlib.Path(vaws_coordinator.__file__).resolve(); assert 'site-packages' in p.parts, p"
           .venv-wheel/bin/vaws-coordinator --help
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          activate-environment: false
+      - name: Install and validate native local control plane
+        env:
+          HOME: ${{ runner.temp }}/coordinator-test-home
+          USERPROFILE: ${{ runner.temp }}/coordinator-test-home
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+          uv venv
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv pip install pytest
+          uv pip install -e . --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .venv/Scripts/python.exe -m pytest -q tests --junitxml=windows-coordinator.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-coordinator-results
+          path: windows-coordinator.xml
