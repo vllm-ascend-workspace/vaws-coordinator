@@ -1593,12 +1593,16 @@ def verify_runtime_commits_map(
     container: SshEndpoint,
     runtime_root: str,
     expected: dict[str, str],
+    include_untracked: bool = False,
 ) -> dict[str, str]:
     lines = ['set -eo pipefail']
     for relpath in expected:
         repo_dir = runtime_root if relpath in ('', '.') else str(PurePosixPath(runtime_root) / relpath)
+        clean = f"git -C {quoted(repo_dir)} diff --quiet HEAD --"
+        if include_untracked:
+            clean += f' && test -z "$(git -C {quoted(repo_dir)} ls-files --others --exclude-standard)"'
         lines.append(
-            f"if git -C {quoted(repo_dir)} diff --quiet HEAD --; then "
+            f"if {clean}; then "
             f"printf '%s %s\\n' {quoted(relpath)} \"$(git -C {quoted(repo_dir)} rev-parse HEAD)\"; "
             f"else printf '%s %s\\n' {quoted(relpath)} dirty-runtime; fi"
         )
@@ -2044,6 +2048,29 @@ def run_sync(args: argparse.Namespace) -> int:
                 emit_progress(current_phase, lock_path=lock_path, apply_mode=args.apply_mode)
                 acquire_container_lock(container, lock_path, args.dry_run)
                 try:
+                    if args.apply_mode == 'materialize' and not auto_selected_materialize:
+                        # Managed retries often change only the launch options.
+                        # Observe the exact current sources under the same lock
+                        # before deciding that transport/reset can be omitted.
+                        observed = verify_runtime_commits_map(
+                            container=container, runtime_root=runtime_root,
+                            expected=snapshot_commits, include_untracked=True,
+                        )
+                        if observed == snapshot_commits:
+                            summary = summary_payload(
+                                status='materialized', server_name=args.server_name,
+                                container_identity=args.container_identity, workspace_id=workspace_id,
+                                container_cache_root=container_cache_root, records=records,
+                                reinstall_status='skipped-by-apply-mode',
+                                reason='remote sources already match the clean snapshot',
+                                first_install=False, runtime_install_env={},
+                                observed_runtime_commits=observed,
+                            )
+                            summary.update(apply_mode='materialize', fast_path='materialized-snapshot', transfers=[])
+                            emit_progress('complete', status='materialized', fast_path='materialized-snapshot')
+                            print(json_dump(summary))
+                            keep_refs = True
+                            return 0
                     current_phase = 'push-mirrors'
                     emit_progress(current_phase, repo_count=len(records), apply_mode=args.apply_mode)
                     all_mirror_paths = [mirror_path_for(container_cache_root, workspace_id, r) for r in records]

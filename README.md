@@ -222,6 +222,11 @@ export SoC/compiler variables, attestation reads those build selections from
 the latest completed installer log and hashes that log as profile evidence.
 Incomplete or conflicting evidence stays an error.
 
+Managed source materialization checks current remote HEADs and tracked and
+untracked changes under the container lock. When every repository already
+matches the newly computed local snapshot, it skips mirror transport and reset.
+Runtime compatibility, native build checks and resource allocation still run.
+
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;
 structuredContent holds the observation. Pass `full: true` / `--full` for the
