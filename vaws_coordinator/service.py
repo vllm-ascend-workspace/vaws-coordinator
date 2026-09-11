@@ -36,7 +36,7 @@ from vaws_coordinator.placement import (
     runtime_matches,
     select_runtimes,
 )
-from vaws_coordinator.provision.task_environment import TaskRootBusy, checkout_identity
+from vaws_coordinator.provision.task_environment import TaskRootBusy
 from vaws_coordinator.ready_runtime import RuntimePool, user_container_name
 from vaws_coordinator.state_paths import coordinator_state_dir
 
@@ -439,7 +439,9 @@ class CoordinatorService:
                 if index < len(existing_bindings) and existing_bindings[index]:
                     binding = existing_bindings[index]
                 else:
-                    request_id = checkout_identity(runtime_id, role["name"])
+                    request_id = hashlib.sha256(
+                        f"{row['id']}:{runtime_id}:{role['name']}".encode()
+                    ).hexdigest()
                     binding = self.pool.checkout(user, row["remote_session"]["id"], catalog_item["profile_key"],
                                                  request_id, runtime_id)
                 if binding.get("status") == "cache_miss":

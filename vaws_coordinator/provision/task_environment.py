@@ -50,11 +50,6 @@ def task_runtime_id(session_id: str, host: str, role_name: str) -> str:
     return safe_id(f"t{session_safe}-h{host_safe}-{role_safe}"[:128])
 
 
-def checkout_identity(runtime_id: str, role_name: str) -> str:
-    ident = f"{safe_id(runtime_id)}-{safe_id(role_name)}"
-    return ident[:128]
-
-
 def create_venv_script(root: str, python: str, donor_python: str | None = None) -> str:
     """Create a task-owned venv. Image packages may be reused; donor venv is not."""
     from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE

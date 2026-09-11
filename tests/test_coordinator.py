@@ -1233,6 +1233,21 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(second["target"]["binding_id"], binding_id)
         self.assertEqual(second["target"]["runtime_id"], runtime_id)
 
+    def test_resumed_task_checks_out_returned_runtime_with_fresh_identity(self):
+        previous = self.client.run("true")
+        spec = runtime_spec(1, user="alice", recipe="rc")
+        for profile in ("profile-a", "profile-updated"):
+            with self.subTest(profile=profile):
+                self.assertEqual(self.client.finish()["state"], "finished")
+                self.backend.mark_prepared(spec, profile_key=profile)
+                self.pool.register("runtime-a", spec)
+                self.store.attach("codex", "native-alice", str(self.root))
+                current = self.client.run("true")
+                self.assertEqual(current["state"], "running", current.get("error"))
+                self.assertEqual(current["target"]["runtime_id"], previous["target"]["runtime_id"])
+                self.assertNotEqual(current["target"]["binding_id"], previous["target"]["binding_id"])
+                previous = current
+
     def test_role_host_constrains_auto_preparation(self):
         first = self.client.run("true")
         self.assertEqual(first["target"]["endpoint"]["host"], "192.0.2.1")
