@@ -19,6 +19,17 @@ class ExecutionRequestError(ValueError):
     """A permanent request-validation failure that cannot succeed on retry."""
 
 
+def task_preamble(binding):
+    """Use the bound interpreter and sources for both preflight and launch."""
+    command = binding.get("launch_preamble", "")
+    if binding.get("python"):
+        command += "\nexport VAWS_PYTHON=" + shlex.quote(binding["python"])
+    # Repository directories under the task root otherwise shadow editable packages.
+    sources = ":".join(str(PurePosixPath(binding["endpoint"]["cwd"]) / name)
+                       for name in ("vllm", "vllm-ascend"))
+    return command + "\nexport PYTHONPATH=" + shlex.quote(sources) + '"${PYTHONPATH:+:$PYTHONPATH}"'
+
+
 class ManagedExecution:
     def managed_start(self, owner, binding_id, request_id, snapshots, expected_build_key,
                       devices, npu_count, command, env, timeout_seconds=1800,
@@ -155,15 +166,7 @@ class ManagedExecution:
                 if run["state"] == "granted":
                     run = self.control(job["owner"], key, "preflight", _managed=True)
                 if run["state"] == "starting":
-                    python = binding.get("python")
-                    command = binding.get("launch_preamble", "")
-                    if python:
-                        command += "\nexport VAWS_PYTHON=" + shlex.quote(python)
-                    # The task root contains repository directories which can
-                    # shadow editable packages as namespace packages.
-                    source_paths = ":".join(str(PurePosixPath(binding["endpoint"]["cwd"]) / name)
-                                            for name in ("vllm", "vllm-ascend"))
-                    command += "\nexport PYTHONPATH=" + shlex.quote(source_paths) + '"${PYTHONPATH:+:$PYTHONPATH}"'
+                    command = task_preamble(binding)
                     command += ("\nexport ASCEND_RT_VISIBLE_DEVICES="
                                 + shlex.quote(run["environment"]["ASCEND_RT_VISIBLE_DEVICES"]))
                     if run["environment"].get("VAWS_SERVICE_PORT"):

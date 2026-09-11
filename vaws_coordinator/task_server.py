@@ -15,13 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from importlib.metadata import version
 from typing import Any, BinaryIO
 
-from remote_dev.result import make_result
-
 from vaws_coordinator.host_queue import SCHEMA_VERSION
-from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call
+from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call, LOADED_RUNTIMES
 
 SERVICE_NAME = "vaws-coordinator-task"
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
@@ -34,7 +31,7 @@ INSTRUCTIONS = (
 
 
 def package_version() -> str:
-    return version("vaws-coordinator")
+    return LOADED_RUNTIMES[0]["version"] or "unknown"
 
 
 class ProtocolError(ValueError):
@@ -87,7 +84,7 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     canonical = canonical_name(name)
     if canonical not in TOOL_SCHEMAS:
         raise ProtocolError(-32602, f"unknown task tool: {name}")
-    payload = vaws_call(canonical, arguments or {}, make_result=make_result)
+    payload = vaws_call(canonical, arguments or {})
     result = payload["result"]
     return {
         "content": [{"type": "text", "text": payload["text"]}],

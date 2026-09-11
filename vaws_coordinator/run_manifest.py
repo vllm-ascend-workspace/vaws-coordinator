@@ -33,7 +33,7 @@ RUN_STATUSES = frozenset(
 )
 TERMINAL_STATUSES = frozenset({"passed", "failed", "inconclusive", "cancelled"})
 STATUS_TRANSITIONS = {
-    "planned": frozenset({"running", "cancelled"}),
+    "planned": frozenset({"running", "failed", "cancelled", "inconclusive"}),
     "running": frozenset({"passed", "failed", "inconclusive", "cancelled"}),
     "passed": frozenset(),
     "failed": frozenset(),

@@ -1222,6 +1222,7 @@ def runtime_install_step_script(
                 'import json',
                 'import sys',
                 'payload = {"phase": sys.argv[1], "message": sys.argv[2]}',
+                'if sys.argv[4]: payload["remote_log"] = sys.argv[4]',
                 'if len(sys.argv) > 3 and sys.argv[3]:',
                 '    try:',
                 '        payload["expected_seconds"] = int(sys.argv[3])',
@@ -1238,6 +1239,7 @@ def runtime_install_step_script(
                 '  shift 4',
                 '  "$@" >"$log_file" 2>&1 &',
                 '  pid=$!',
+                '  emit_progress "$phase" "$message" "$expected_seconds" "$log_file"',
                 '  start_ts=$(date +%s)',
                 '  while kill -0 "$pid" 2>/dev/null; do',
                 '    sleep 8',
@@ -1270,12 +1272,12 @@ def runtime_install_step_script(
                 '  message="$2"',
                 '  expected_seconds="$3"',
                 '  shift 3',
-                '  log_file="$(mktemp -t parity-step.XXXXXX.log)"',
+                '  mkdir -p "$VAWS_RUNTIME_ROOT/.vaws-runtime/prepare-logs"',
+                '  log_file="$(mktemp "$VAWS_RUNTIME_ROOT/.vaws-runtime/prepare-logs/${phase}.XXXXXX")"',
                 '  set +e',
                 '  run_with_log_progress "$phase" "$message" "$expected_seconds" "$log_file" "$@"',
                 '  status=$?',
                 '  set -e',
-                '  rm -f "$log_file"',
                 '  return "$status"',
                 '}',
                 'configure_pip_index() {',
@@ -1537,6 +1539,8 @@ def run_runtime_install_step(
     stream_progress: bool = False,
     uninstall_packages: tuple[str, ...] = (),
     python: str | None = None,
+    on_progress=None,
+    log_path=None,
 ) -> None:
     script = runtime_install_step_script(
         runtime_root=runtime_root,
@@ -1546,8 +1550,9 @@ def run_runtime_install_step(
         uninstall_packages=uninstall_packages,
         python=python,
     )
-    if stream_progress:
-        ssh_exec_stream(container, script, stream_progress=True)
+    if stream_progress or on_progress is not None or log_path is not None:
+        ssh_exec_stream(container, script, stream_progress=stream_progress,
+                        on_progress=on_progress, log_path=log_path)
     else:
         ssh_exec(container, script)
 

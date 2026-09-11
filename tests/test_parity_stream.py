@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from remote_dev.core.ssh_transport import RemoteCompleted
@@ -25,8 +27,15 @@ class SshExecStreamWiringTests(unittest.TestCase):
             return RemoteCompleted(0, "", "", timed_out=False)
 
         endpoint = SshEndpoint(host="192.0.2.10", port=46000, user="root")
-        with patch("remote_dev.core.ssh_transport.run_stream", fake_run_stream):
-            result = ssh_exec_stream(endpoint, "true", stream_progress=False)
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "install.log"
+            with patch("remote_dev.core.ssh_transport.run_stream", fake_run_stream):
+                result = ssh_exec_stream(endpoint, "true", stream_progress=False,
+                                         on_progress=events.append, log_path=log)
+            self.assertIn("warn", log.read_text())
+            self.assertIn('"ok": true', log.read_text())
+        self.assertEqual(events[0]["phase"], "install")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '{"ok": true}\n')
         self.assertEqual(result.stderr, "warn\n")

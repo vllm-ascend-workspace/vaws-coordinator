@@ -25,7 +25,7 @@ def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
         preview={"stderr": error[-4000:]},
         extra={"error": error},
     )
-    return {"text": result["summary"] + "\n" + error + "\n", "result": result}
+    return result
 
 
 def main():
@@ -41,6 +41,7 @@ def main():
     for name in ("session", "run", "execution", "finish"):
         child = sub.add_parser(name)
         child.add_argument("--context-file")
+        child.add_argument("--full", action="store_true", default=None)
         child.add_argument("--json", default="{}", help="Additional structured tool arguments")
         if name == "run":
             child.add_argument("--command", required=True)
@@ -71,8 +72,8 @@ def main():
     # Unset argparse defaults (None) must not silently override --json keys:
     # `--json '{"action":"stop"}'` degraded to a status query otherwise.
     merged = {**extra, **{key: value for key, value in args.items() if value is not None}}
-    result = vaws_call("vaws." + operation, merged, make_result=make_result)
-    print(json.dumps(result, ensure_ascii=False))
+    result = vaws_call("vaws." + operation, merged)
+    print(json.dumps(result["result"], ensure_ascii=False))
     return 0 if result["result"]["outcome"] == "success" else 1
 
 

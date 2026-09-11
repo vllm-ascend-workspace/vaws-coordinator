@@ -14,7 +14,6 @@ from vaws_coordinator.machine_directory import MachineDirectory
 from vaws_coordinator.provision import host_ops
 from vaws_coordinator.provision.task_environment import (  # noqa: F401
     TaskRootBusy,
-    checkout_identity,
     isolated_python,
     isolated_root,
     prepare_task_environment,

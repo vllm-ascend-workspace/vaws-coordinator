@@ -16,9 +16,11 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any
+from remote_dev.runtime import process_identity, runtime_status
 
 from vaws_coordinator.agent_session import AgentSessions
 from vaws_coordinator.backend import RemoteBackend
@@ -34,7 +36,7 @@ from vaws_coordinator.placement import (
     runtime_matches,
     select_runtimes,
 )
-from vaws_coordinator.provision.task_environment import TaskRootBusy, checkout_identity
+from vaws_coordinator.provision.task_environment import TaskRootBusy
 from vaws_coordinator.ready_runtime import RuntimePool, user_container_name
 from vaws_coordinator.state_paths import coordinator_state_dir
 
@@ -48,6 +50,7 @@ LEASE_READY = {"granted", "starting", "active"}
 PERMANENT_ERRORS = (ValueError, PermissionError, ExecutionRequestError, TaskRootBusy)
 CLIENT_TIMEOUT_SECONDS = 60.0
 STOP_WAIT_SECONDS = 30.0
+LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws-remote-dev")]
 
 
 def socket_path(state_dir: Path) -> Path:
@@ -64,7 +67,7 @@ def lock_path(state_dir: Path) -> Path:
 
 def _service_spec_key(spec: dict) -> dict:
     return {key: spec.get(key) for key in ("command", "env", "environment", "resources", "topology",
-                                           "timeout_seconds", "service")}
+                                           "timeout_seconds", "service", "preflight")}
 
 
 def aggregate_job_states(states: list[str | None]) -> str:
@@ -111,6 +114,8 @@ class CoordinatorService:
         self._lock_registry: dict[tuple[str, str], threading.Lock] = {}
         self._registry_guard = threading.Lock()
         self._stopped = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._active_requests = 0
         self._async_progress = False
         self._load_session_dirs()
         if sessions is not None:
@@ -170,9 +175,37 @@ class CoordinatorService:
             self._resume_finishing_sessions(directory, store)
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("op") == "ping":
+            return {"ok": True, "value": {"runtime": [runtime_status(item) for item in LOADED_RUNTIMES]}}
+        if request.get("op") == "restart_if_idle":
+            return {"ok": True, "value": self.restart_if_idle()}
+        with self._lifecycle_lock:
+            if self._stopped.is_set():
+                raise RuntimeError("coordinator is restarting; retry with the new daemon")
+            self._active_requests += 1
+        try:
+            return self._handle(request)
+        finally:
+            with self._lifecycle_lock:
+                self._active_requests -= 1
+
+    def restart_if_idle(self):
+        with self._lifecycle_lock:
+            if self._active_requests or any(lock.locked() for lock in self._lock_registry.values()):
+                return {"status": "busy", "reason": "coordinator work is in progress"}
+            for directory in self._session_dirs:
+                if any(row.get("admitted") and row.get("phase") not in DONE
+                       for row in self.store(directory).all_executions()):
+                    return {"status": "busy", "reason": "nonterminal executions remain"}
+            from vaws_coordinator.ready_runtime import TERMINAL
+            with self.pool.transaction() as db:
+                if any(row.get("state") not in TERMINAL for row in self.pool.rows(db, "run")):
+                    return {"status": "busy", "reason": "unreleased resource leases remain"}
+            self._stopped.set()
+            return {"status": "stopping"}
+
+    def _handle(self, request: dict[str, Any]) -> dict[str, Any]:
         op = request.get("op")
-        if op == "ping":
-            return {"ok": True}
         if op == "tick":
             self.reconcile()
             return {"ok": True}
@@ -406,7 +439,9 @@ class CoordinatorService:
                 if index < len(existing_bindings) and existing_bindings[index]:
                     binding = existing_bindings[index]
                 else:
-                    request_id = checkout_identity(runtime_id, role["name"])
+                    request_id = hashlib.sha256(
+                        f"{row['id']}:{runtime_id}:{role['name']}".encode()
+                    ).hexdigest()
                     binding = self.pool.checkout(user, row["remote_session"]["id"], catalog_item["profile_key"],
                                                  request_id, runtime_id)
                 if binding.get("status") == "cache_miss":
@@ -415,6 +450,7 @@ class CoordinatorService:
                     store.save_execution(row)
                     return self._reply(row)
                 role_rows.append({"name": role["name"], "command": role["command"], "runtime_id": runtime_id,
+                                  "preflight": role.get("preflight") or spec.get("preflight"),
                                   "binding": binding, "npu_count": role.get("npu_count"),
                                   "devices": role.get("devices") or [],
                                   "service_port": role.get("service_port"),
@@ -440,6 +476,8 @@ class CoordinatorService:
                     row["error"] = "task root is in use by another execution; not overwriting sources"
                     store.save_execution(row)
                     return self._reply(row)
+                self._save_progress(store, row, role["name"], {
+                    "step": "sync-sources", "log_ref": str(self.state_dir / "runs" / row["id"] / role["runtime_id"] / "parity.log")})
                 role["snapshots"] = self.sync_binding(role["binding"], row["sources"], row["id"])
                 halted = self._halt_if_cancelled(store, user, row)
                 if halted is not None:
@@ -447,9 +485,19 @@ class CoordinatorService:
         halted = self._halt_if_cancelled(store, user, row)
         if halted is not None:
             return halted
+        for role in row["roles"]:
+            if role.get("preflight") and not role.get("preflight_passed"):
+                self._save_progress(store, row, role["name"], {"step": "preflight"})
+                self.backend.preflight(role["binding"], role["preflight"],
+                                       {**(spec.get("env") or {}), **(role.get("env") or {})})
+                role["preflight_passed"] = True
+                store.save_execution(row)
+        halted = self._halt_if_cancelled(store, user, row)
+        if halted is not None:
+            return halted
         if any(not role.get("managed_job") for role in row["roles"]):
             row["phase"] = "launch_pending"
-            store.save_execution(row)
+            self._save_progress(store, row, None, {"step": "allocate-and-launch"})
         halted = self._halt_if_cancelled(store, user, row)
         if halted is not None:
             return halted
@@ -514,6 +562,7 @@ class CoordinatorService:
         row["phase"] = aggregate_job_states([job["state"] for job in jobs])
         if row["phase"] == "running":
             self._record_assignment(row, jobs)
+            self._save_progress(store, row, None, {"step": "running"})
         store.save_execution(row)
         return self._reply(row)
 
@@ -586,7 +635,7 @@ class CoordinatorService:
             if need_distinct and host:
                 used_hosts.add(host)
             try:
-                prepared = self._prepare_role(user, row, role, environment, donor)
+                prepared = self._prepare_role(store, user, row, role, environment, donor)
             except TaskRootBusy as exc:
                 return {"status": "waiting", "reason": str(exc)}
             catalog = {item["runtime_id"]: item for item in self.pool.catalog()}
@@ -694,15 +743,30 @@ class CoordinatorService:
             }
         return None
 
-    def _prepare_role(self, user, row, role, environment, donor):
+    def _save_progress(self, store, row, role, event):
+        now = time.time()
+        if event.get("log_ref"):
+            path = Path(event["log_ref"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+        previous = row.get("progress") or {}
+        same_step = (previous.get("step"), previous.get("role")) == (event.get("step"), role)
+        row["progress"] = {**(previous if same_step else {}), **event, "role": role,
+                           "started_at": previous["started_at"] if same_step else now,
+                           "updated_at": now}
+        store.save_execution(row)
+
+    def _prepare_role(self, store, user, row, role, environment, donor):
         from vaws_coordinator.provision import prepare_task_environment
         return prepare_task_environment(
             self.pool, user=user, session_id=row["session_id"], role_name=role["name"],
             environment=environment, donor=donor, sources=row.get("sources") or {},
+            on_progress=lambda event: self._save_progress(store, row, role["name"], event),
+            log_dir=self.state_dir / "runs" / row["id"] / role["name"],
         )
 
     def sync_binding(self, binding, sources, execution_id):
-        directory = self.state_dir / "runs" / execution_id
+        directory = self.state_dir / "runs" / execution_id / binding["runtime_id"]
         directory.mkdir(parents=True, exist_ok=True)
         endpoint = binding["endpoint"]
         args = materialize_command(workspace_id=binding["intent"]["session"],
@@ -789,12 +853,14 @@ class CoordinatorService:
 
     def _record_execution_error(self, store, row, exc) -> dict[str, Any]:
         permanent = isinstance(exc, PERMANENT_ERRORS)
+        path = self.state_dir / "runs" / row["id"] / "error.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + "\n")
+        row["error_ref"] = str(path)
         row["error"] = f"{type(exc).__name__}: {exc}"[:500]
         row["phase"] = "failed" if permanent else "uncertain"
-        try:
-            store.save_execution(row)
-        except Exception:
-            pass
+        store.save_execution(row)
         return self._reply(row)
 
     def _record_daemon_error(self, message: str) -> None:
@@ -818,6 +884,10 @@ class CoordinatorService:
             "root": endpoint.get("cwd") or endpoint.get("root"),
             "endpoint": endpoint or None,
             "env": dict(role.get("env") or {}),
+            "error": job.get("error"),
+            "lease_state": job.get("lease_state"),
+            "quiet": (job.get("remote") or {}).get("quiet"),
+            "descendants_drained": (job.get("remote") or {}).get("descendants_drained"),
         }
         if binding.get("endpoint"):
             target = self._target(row, binding, job)
@@ -833,14 +903,20 @@ class CoordinatorService:
         job = row.get("observation") or {}
         state = row.get("phase") or job.get("state")
         payload = {"execution_id": row["id"], "state": state, "service": (row.get("spec") or {}).get("service"),
-                   "assignment": row.get("assignment")}
+                   "assignment": row.get("assignment"), "observed_at": time.time(),
+                   "progress": row.get("progress")}
         if row.get("cancel_requested"):
             payload["cancel_requested"] = True
         if row.get("error"):
             payload["error"] = str(row["error"])[:500]
+            payload["error_ref"] = row.get("error_ref")
         if row.get("placement") and state == "waiting_for_runtime":
             payload.update({k: row["placement"].get(k) for k in ("reason", "provisioning_started") if k in (row["placement"] or {})})
         roles = row.get("roles") or []
+        from vaws_coordinator.ready_runtime import TERMINAL
+        payload["resources_released"] = state in DONE and all(
+            not item.get("managed_job") or (item.get("observation") or {}).get("lease_state") in TERMINAL
+            for item in roles)
         role_views = [self._role_view(row, item) for item in roles]
         if role:
             role_views = [item for item in role_views if item.get("name") == role]
@@ -851,8 +927,6 @@ class CoordinatorService:
         if binding and state in LIVE | DONE:
             payload["target"] = self._target(row, binding, first_job)
             payload["service_port"] = payload["target"]["service_port"]
-        if len(roles) == 1 and not role:
-            payload.pop("roles", None)
         return payload
 
     def _tail(self, store, user, row, role=None) -> dict[str, Any]:
@@ -1049,6 +1123,17 @@ class CoordinatorService:
                 self._record_daemon_error(f"tick: {type(exc).__name__}: {exc}")
 
     def _dispatch_progress(self) -> None:
+        with self._lifecycle_lock:
+            if self._stopped.is_set():
+                return
+            self._active_requests += 1
+        try:
+            self._dispatch_progress_active()
+        finally:
+            with self._lifecycle_lock:
+                self._active_requests -= 1
+
+    def _dispatch_progress_active(self) -> None:
         self.pool.tick()
         for directory in list(self._session_dirs):
             try:
@@ -1115,15 +1200,16 @@ class CoordinatorService:
 
 
 class CoordinatorClient:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, *, timeout=120):
         self.state_dir = Path(state_dir)
+        self.timeout = timeout
 
     def call(self, op: str, **payload) -> Any:
         path = socket_path(self.state_dir)
         if not path.exists():
             raise RuntimeError(f"coordinator daemon is not running at {path}")
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(120)
+        conn.settimeout(self.timeout)
         try:
             conn.connect(str(path))
             conn.sendall((json.dumps({"op": op, **payload}) + "\n").encode())
@@ -1169,7 +1255,7 @@ class CoordinatorClient:
 def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     client = CoordinatorClient(state_dir)
     try:
-        client.call("ping")
+        client.runtime = (client.call("ping") or {}).get("runtime")
         return client
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
@@ -1183,7 +1269,7 @@ def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
-            client.call("ping")
+            client.runtime = (client.call("ping") or {}).get("runtime")
             return client
         except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
             time.sleep(0.05)
@@ -1195,6 +1281,22 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Run the persistent local VAWS coordinator")
     parser.add_argument("--state-dir", default="", help="Coordinator state directory")
+    parser.add_argument("--action", choices=("serve", "status", "restart-if-idle"), default="serve")
     args = parser.parse_args(argv)
     state = Path(args.state_dir).expanduser() if args.state_dir else coordinator_state_dir()
+    if args.action == "status":
+        print(json.dumps(CoordinatorClient(state).call("ping")))
+        return 0
+    if args.action == "restart-if-idle":
+        reply = CoordinatorClient(state).call("restart_if_idle")
+        if reply["status"] == "busy":
+            print(json.dumps(reply))
+            return 1
+        deadline = time.monotonic() + 5
+        while socket_path(state).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if socket_path(state).exists():
+            raise RuntimeError("daemon shutdown is still pending")
+        print(json.dumps({"status": "restarted", "runtime": ensure_daemon(state).runtime}))
+        return 0
     return CoordinatorService(state).serve()

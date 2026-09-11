@@ -889,6 +889,13 @@ class PoolTests(unittest.TestCase):
             env={**os.environ, **prepared["env"]}, text=True,
         )
         self.assertEqual(json.loads(output), ["bound-vllm", "bound-ascend", "kept-support"])
+        from vaws_coordinator.backend import RemoteBackend
+
+        shell = FakeShell({"outcome": "success"})
+        RemoteBackend(shell=shell).preflight(binding, shlex.join([sys.executable, "-c", code]), {})
+        target, command, _ = shell.calls[-1]
+        output = subprocess.check_output(["bash", "-c", command], cwd=target["cwd"], text=True)
+        self.assertEqual(json.loads(output), ["bound-vllm", "bound-ascend", "kept-support"])
 
     def test_two_roots_in_one_container_run_concurrently_and_stop_is_scoped(self):
         second_root = self.pool.register("runtime-a2", runtime_spec(2, user="alice", python="/opt/alice/venvs/root-2/bin/python"))
@@ -1028,6 +1035,31 @@ class TaskClientTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_preflight_failure_keeps_full_error_and_never_allocates(self):
+        from vaws_coordinator.managed_execution import ExecutionRequestError
+        message = "unknown CLI option " + "detail " * 200
+        self.backend.preflight = mock.Mock(side_effect=ExecutionRequestError(message))
+        result = self.client.run("serve", preflight="parse-only")
+        self.assertEqual(result["state"], "failed")
+        self.assertIn(message, Path(result["error_ref"]).read_text())
+        self.assertTrue(result["resources_released"])
+        self.assertEqual(result["progress"]["step"], "preflight")
+        with self.pool.transaction() as db:
+            self.assertEqual(self.pool.rows(db, "job"), [])
+            self.assertEqual(self.pool.rows(db, "run"), [])
+
+    def test_daemon_restart_refuses_active_work_and_lease_then_allows_idle(self):
+        service = self.client.coordinator
+        reply = self.client.run("serve")
+        self.assertEqual(service.handle({"op": "restart_if_idle"})["value"]["status"], "busy")
+        self.assertFalse(service._stopped.is_set())
+        stopped = self.client.observe(reply["execution_id"], "stop")
+        self.assertTrue(stopped["resources_released"])
+        self.assertEqual(stopped["roles"][0]["lease_state"], "released")
+        self.assertTrue(stopped["roles"][0]["quiet"])
+        self.assertEqual(service.handle({"op": "restart_if_idle"})["value"]["status"], "stopping")
+        self.assertTrue(service._stopped.is_set())
 
     def test_run_observe_and_target_expose_user_container_and_selected_python(self):
         reply = self.client.run("true")
@@ -1207,6 +1239,21 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(second["state"], "running")
         self.assertEqual(second["target"]["binding_id"], binding_id)
         self.assertEqual(second["target"]["runtime_id"], runtime_id)
+
+    def test_resumed_task_checks_out_returned_runtime_with_fresh_identity(self):
+        previous = self.client.run("true")
+        spec = runtime_spec(1, user="alice", recipe="rc")
+        for profile in ("profile-a", "profile-updated"):
+            with self.subTest(profile=profile):
+                self.assertEqual(self.client.finish()["state"], "finished")
+                self.backend.mark_prepared(spec, profile_key=profile)
+                self.pool.register("runtime-a", spec)
+                self.store.attach("codex", "native-alice", str(self.root))
+                current = self.client.run("true")
+                self.assertEqual(current["state"], "running", current.get("error"))
+                self.assertEqual(current["target"]["runtime_id"], previous["target"]["runtime_id"])
+                self.assertNotEqual(current["target"]["binding_id"], previous["target"]["binding_id"])
+                previous = current
 
     def test_role_host_constrains_auto_preparation(self):
         first = self.client.run("true")
@@ -1533,7 +1580,7 @@ class DaemonProcessTests(unittest.TestCase):
                 deadline = time.time() + 5
                 while time.time() < deadline:
                     try:
-                        self.assertEqual(client.call("ping"), None)
+                        self.assertEqual(client.call("ping")["runtime"][0]["loaded"]["package"], "vaws-coordinator")
                         break
                     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
                         time.sleep(0.05)
@@ -1637,6 +1684,11 @@ class DaemonProcessTests(unittest.TestCase):
                 self.assertEqual(status["execution_id"], admitted["execution_id"])
                 self.assertNotEqual(status["state"], "timeout")
                 self.assertTrue(started.wait(3))
+                status = client.advance(str(sessions.state_dir), "alice", admitted["execution_id"], "status")
+                self.assertEqual(status["progress"]["step"], "sync-sources")
+                self.assertIn("parity.log", status["progress"]["log_ref"])
+                self.assertTrue(Path(status["progress"]["log_ref"]).is_file())
+                self.assertEqual(client.call("restart_if_idle")["status"], "busy")
                 t2 = time.time()
                 client.call("ping")
                 self.assertLess(time.time() - t2, 0.5)

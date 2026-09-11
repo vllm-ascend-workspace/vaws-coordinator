@@ -21,7 +21,7 @@ uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main va
 Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
 is the same entry as `vaws-coordinator`.
 
-The package depends on `vaws-remote-dev>=0.5.0` (import `remote_dev`). It
+The package depends on `vaws-remote-dev>=0.5.1` (import `remote_dev`). It
 does not pin that package's git source; the workspace that installs this
 library chooses the tag. `uv sync` / `uv lock` are not the developer path
 here: a library that named remote-dev's git source in `pyproject.toml`
@@ -116,7 +116,7 @@ executed on the physical host. Durable host state defaults to
 ## Development
 
 `uv sync` is not the setup path. This library declares
-`vaws-remote-dev>=0.5.0` without a git source: remote-dev is not on PyPI,
+`vaws-remote-dev>=0.5.1` without a git source: remote-dev is not on PyPI,
 so `uv sync` / `uv lock` fail with an unsatisfiable-dependency error.
 That is intentional. A library that pinned remote-dev's git URL would
 take the upgrade decision away from every consumer, and
@@ -127,7 +127,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@v0.5.0"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@c24a64a55e877904c9d539de4544ade0cc76cbac"
 uv pip install pytest
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
@@ -136,3 +136,32 @@ uv pip install -e . --no-deps
 `uv venv` is the first command so an unreadable project config fails
 before install. Do not add `[tool.uv.sources]` for remote-dev: that table
 travels to consumers. Requires Python 3.11+.
+
+## Progress, records, and loaded versions
+
+Execution observations include the active preparation/sync/preflight step,
+its timestamps and log reference. Installation heartbeat events reach status
+while compilation is in progress. Full install logs remain in the task root;
+role errors, lease state and descendant quietness remain visible after failure.
+`resources_released` is separate from execution state.
+
+Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
+default, with one local `record_ref` to the full response. MCP text is a summary;
+structuredContent holds the observation. Pass `full: true` / `--full` for the
+full response. Python TaskClient continues to return complete records. CLI
+success and error output are each a single result object, without a text/result
+wrapper. Explicit target requests retain launch data exactly or point to the
+full record if oversized; truncated shell setup is never returned as executable.
+
+`vaws-coordinator daemon --action status` reads loaded and installed package
+identities without starting a daemon. `--action restart-if-idle` asks the daemon
+to reject restart while work or unreleased leases remain; after an idle exit it
+starts the installed version. MCP tools report their own process identity and
+require a native-client MCP restart when stale. Missing commit metadata is unknown.
+
+A run (or each topology role) may supply a `preflight` shell command to validate
+the prepared environment before any NPU lease is allocated. It uses the selected
+interpreter and a placeholder service port of zero, and must not require devices
+or start a service. Failure retains original stderr references and does not launch
+the business command. Planned Run Manifests can record early failure/inconclusive
+outcomes without inventing a running stage.
