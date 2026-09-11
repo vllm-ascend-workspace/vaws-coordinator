@@ -2581,9 +2581,12 @@ def main() -> int:
         parser.error(f'unsupported command: {args.command}')
         return 2
     except Exception as exc:
+        from vaws_coordinator.parity_support import LocalCommandError, RemoteCommandError
         payload: dict[str, Any] = {
             'status': 'failed',
             'reason': str(exc),
+            'retryable': not (isinstance(exc, (LocalCommandError, ValueError, PermissionError))
+                              or isinstance(exc, RemoteCommandError) and exc.returncode != 255),
         }
         for field in ('server_name', 'container_identity', 'workspace_id'):
             if hasattr(args, field):

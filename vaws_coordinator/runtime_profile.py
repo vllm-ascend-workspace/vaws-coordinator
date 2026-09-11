@@ -14,7 +14,7 @@ import shlex
 import shutil
 import sysconfig
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 PROFILE_FIELDS = ("image_digest", "soc", "driver", "cann", "python_abi",
@@ -133,7 +133,8 @@ def profile_key(profile: dict[str, Any]) -> str:
     if not {"cann", "driver"}.issubset(profile.get("system_files", {})):
         raise ValueError("profile requires actual CANN and driver version-file hashes")
     for row in profile["system_files"].values():
-        if not Path(row["path"]).is_absolute() or len(row["sha256"]) != 64:
+        absolute = PurePosixPath(row["path"]).is_absolute() or PureWindowsPath(row["path"]).is_absolute()
+        if not absolute or len(row["sha256"]) != 64:
             raise ValueError("system file identity requires an absolute path and SHA256")
     return digest(profile)
 

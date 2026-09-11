@@ -15,8 +15,8 @@ from vaws_coordinator.provision.host_ops import DEFAULT_WORKDIR
 from vaws_coordinator.ready_runtime import safe_id
 
 INSTALL_STEPS = (
-    "install-vllm",
     "check-build-compat",
+    "install-vllm",
     "install-vllm-ascend-requirements",
     "install-vllm-ascend",
     "verify-imports",

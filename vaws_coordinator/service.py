@@ -28,6 +28,7 @@ from vaws_coordinator.backend import RemoteBackend
 from vaws_coordinator.build_inputs import BUILD_INPUT_ENV_KEYS
 from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMINAL
 from vaws_coordinator.parity import materialize_command
+from vaws_coordinator.parity_support import RemoteCommandError
 from vaws_coordinator.placement import (
     SUPPORTED_RECIPES,
     can_prepare,
@@ -712,7 +713,7 @@ class CoordinatorService:
 
     def _ensure_user_container(self, user, environment, role, used_hosts, require_distinct=False):
         recipe = environment.get("recipe") or environment.get("image")
-        if not recipe or recipe not in SUPPORTED_RECIPES:
+        if recipe and recipe not in SUPPORTED_RECIPES:
             return None
         wanted_host = str(role["host"]) if role.get("host") else None
         for record in self._configured_machines():
@@ -725,13 +726,19 @@ class CoordinatorService:
             machine_type = host_info.get("machine_type")
             if environment.get("machine_type") and machine_type != environment["machine_type"]:
                 continue
-            ssh_port = (record.get("container") or {}).get("ssh_port")
+            configured = record.get("container") or {}
+            owned = record.get("user") in (None, user) and configured.get("name") == user_container_name(user)
+            ssh_port = configured.get("ssh_port") if owned else None
             host_endpoint = {
                 "host": host_ip,
                 "port": int(host_info.get("port") or 22),
                 "user": host_info.get("user") or "root",
             }
             if not ssh_port:
+                if not recipe:
+                    # An existing configured container needs no image choice.
+                    # Creating a container still requires an explicit recipe.
+                    continue
                 from vaws_coordinator.provision import provision_user_container
 
                 def reserve_port(*, user, container_name, port):
@@ -811,9 +818,16 @@ class CoordinatorService:
         with (directory / "parity.json").open("w") as stdout, (directory / "parity.log").open("w") as stderr:
             result = subprocess.run(args, stdout=stdout, stderr=stderr,
                                     env=environment, timeout=600, check=False)
+        try:
+            payload = json.loads((directory / "parity.json").read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            if not result.returncode:
+                raise
+            payload = {}
         if result.returncode:
-            raise RuntimeError(f"source synchronization failed; inspect {directory / 'parity.log'}")
-        payload = json.loads((directory / "parity.json").read_text())
+            reason = payload.get("reason") or f"inspect {directory / 'parity.log'}"
+            error = ValueError if payload.get("retryable") is False else RuntimeError
+            raise error(f"source synchronization failed: {reason}")
         if payload.get("status") not in {"ready", "materialized"}:
             raise RuntimeError("source staging alone does not authorize execution")
         return payload["snapshot_commits"]
@@ -889,6 +903,12 @@ class CoordinatorService:
 
     def _record_execution_error(self, store, row, exc) -> dict[str, Any]:
         permanent = isinstance(exc, PERMANENT_ERRORS)
+        # A build/preparation command that exited nonzero has a known result.
+        # Repeating the same source preparation cannot resolve that failure.
+        # Lost SSH transport (255) and already-bound/live work remain recoverable.
+        if (isinstance(exc, RemoteCommandError) and exc.returncode != 255
+                and row.get("phase") == "preparing" and not row.get("roles")):
+            permanent = True
         path = self.state_dir / "runs" / row["id"] / "error.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as stream:

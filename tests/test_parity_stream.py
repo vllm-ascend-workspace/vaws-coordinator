@@ -10,6 +10,7 @@ from remote_dev.core.ssh_transport import RemoteCompleted
 from vaws_coordinator.parity_support import (
     PROGRESS_SENTINEL,
     SshEndpoint,
+    RemoteCommandError,
     ssh_exec_stream,
 )
 
@@ -50,8 +51,9 @@ class SshExecStreamWiringTests(unittest.TestCase):
 
         endpoint = SshEndpoint(host="192.0.2.10", port=46000, user="root")
         with patch("remote_dev.core.ssh_transport.run_stream", fake_run_stream):
-            with self.assertRaises(RuntimeError) as raised:
+            with self.assertRaises(RemoteCommandError) as raised:
                 ssh_exec_stream(endpoint, "false")
+        self.assertEqual(raised.exception.returncode, 7)
         self.assertIn("command failed (7)", str(raised.exception))
         self.assertIn("out", str(raised.exception))
         self.assertIn("err", str(raised.exception))

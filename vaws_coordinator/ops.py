@@ -54,13 +54,13 @@ TOOL_SCHEMAS["vaws.execution"]["oneOf"] = [
 ]
 
 
-def vaws_call(name, args):
+def vaws_call(name, args, *, allow_native_context=True):
     started = time.monotonic()
     target = {"kind": "vaws-task"}
     client = None
     try:
         from vaws_coordinator.task_client import TaskClient
-        client = TaskClient(args.get("context_file", ""))
+        client = TaskClient(args.get("context_file", ""), allow_native_context=allow_native_context)
         target["session_id"] = client.context["session"]["id"]
         if name == "vaws.session":
             if args.get("sources"):

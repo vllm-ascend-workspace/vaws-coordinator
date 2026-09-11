@@ -10,6 +10,20 @@ business command and constraints.
 
 ## Agent references and recorded launch facts
 
+`TaskClient()` uses an explicit context or `VAWS_CONTEXT_FILE` first. Local
+Codex commands can also resolve their actual `CODEX_THREAD_ID`, creating or
+resuming its native attachment locally when the hook did not export a context.
+Conflicting native identities require an explicit context. This does not bind
+sources, discover machines, or allocate devices; ordinary code review needs no
+task client.
+
+A configured existing user container can prepare a task without selecting an
+image recipe again. Creating a container still requires an explicit recipe.
+Preparation checks source/image build compatibility before installing vLLM.
+A completed failing preparation command ends that execution with its diagnostic
+log; an unavailable SSH transport remains uncertain. Correct the configuration
+and submit a new execution instead of repeating the failed preparation forever.
+
 `vaws_execution` accepts exactly one `execution_id` or task-scoped `service`.
 The Python equivalent is `client.observe(service="model", action="status")`.
 An absent service returns `state: not_found` without contacting a runtime.
@@ -186,6 +200,8 @@ On native Windows, run the same setup commands and use
 directory and token-authenticated IPv4 loopback IPC; its listener is never bound
 to an external interface. Native CLI pipes and Git output use UTF-8. Source
 publication preserves Linux path syntax independently of the client platform.
+Git snapshot commands enable long-path support for their own Windows invocation,
+including nested submodule refs, without changing repository or global Git config.
 The tests that emulate a Linux peer need a working Bash. If the Windows `bash`
 alias points at an unconfigured WSL installation, prepend Git for Windows'
 `bin` directory to the test process's `PATH`, as the Windows CI job does.
@@ -197,6 +213,10 @@ its timestamps and log reference. Installation heartbeat events reach status
 while compilation is in progress. Full install logs remain in the task root;
 role errors, lease state and descendant quietness remain visible after failure.
 `resources_released` is separate from execution state.
+Completed build-compatibility failures end preparation before editable installs
+and do not retry automatically. Completed source-sync failures retain their
+original cause; lost transport remains uncertain. Remote profile paths are
+validated independently of the client operating system.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;

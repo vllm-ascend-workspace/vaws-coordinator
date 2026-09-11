@@ -69,6 +69,10 @@ class SshStreamingResult:
     progress_events: list[dict[str, Any]]
 
 
+class LocalCommandError(RuntimeError):
+    """A local child process completed with a nonzero exit code."""
+
+
 def run(
     cmd: list[str],
     *,
@@ -96,7 +100,7 @@ def run(
             f'stderr:\n{exc.stderr or ""}'
         ) from exc
     if check and result.returncode != 0:
-        raise RuntimeError(
+        raise LocalCommandError(
             f"command failed ({result.returncode}): {' '.join(shlex.quote(part) for part in cmd)}\n"
             f'stdout:\n{result.stdout}\n'
             f'stderr:\n{result.stderr}'
@@ -112,7 +116,8 @@ def git(
     check: bool = True,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return run(['git', '-C', str(repo), *args], env=env, check=check, timeout=timeout)
+    options = ['-c', 'core.longpaths=true'] if os.name == 'nt' else []
+    return run(['git', *options, '-C', str(repo), *args], env=env, check=check, timeout=timeout)
 
 
 def repo_root_from(path: Path) -> Path:
@@ -251,8 +256,16 @@ def _remote_endpoint(endpoint: SshEndpoint, *, long_stream: bool = False):
     return Endpoint(host=endpoint.host, port=endpoint.port, user=endpoint.user)
 
 
-def _ssh_failure(returncode: int, stdout: str, stderr: str, *, what: str) -> RuntimeError:
-    return RuntimeError(
+class RemoteCommandError(RuntimeError):
+    """A completed SSH command status, distinct from a lost transport."""
+
+    def __init__(self, returncode: int, message: str):
+        super().__init__(message)
+        self.returncode = returncode
+
+
+def _ssh_failure(returncode: int, stdout: str, stderr: str, *, what: str) -> RemoteCommandError:
+    return RemoteCommandError(returncode,
         f'command failed ({returncode}): {what}\n'
         f'stdout:\n{stdout}\n'
         f'stderr:\n{stderr}'
