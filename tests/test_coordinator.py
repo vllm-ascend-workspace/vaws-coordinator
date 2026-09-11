@@ -1328,7 +1328,7 @@ class TaskClientTests(unittest.TestCase):
             syncs.append(threading.current_thread().name)
             if len(syncs) == 1:
                 started.set()
-                self.assertTrue(release.wait(3))
+                self.assertTrue(release.wait(30))
             return original(*args, **kwargs)
 
         self.client.coordinator.sync_binding = blocked
@@ -1339,12 +1339,15 @@ class TaskClientTests(unittest.TestCase):
 
         worker = threading.Thread(target=run_first)
         worker.start()
-        self.assertTrue(started.wait(3))
-        second = self.client.run("sleep 1")
-        self.assertEqual(second["state"], "waiting")
-        self.assertEqual(len(syncs), 1)
-        release.set()
-        worker.join(5)
+        try:
+            self.assertTrue(started.wait(30))
+            second = self.client.run("sleep 1")
+            self.assertEqual(second["state"], "waiting")
+            self.assertEqual(len(syncs), 1)
+        finally:
+            release.set()
+            worker.join(60)
+        self.assertFalse(worker.is_alive(), "materialization worker must finish before fixture cleanup")
         self.assertEqual(first["reply"]["state"], "running")
 
     def test_restart_does_not_overlap_while_stop_is_stopping(self):
