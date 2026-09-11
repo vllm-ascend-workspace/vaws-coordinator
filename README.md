@@ -79,7 +79,7 @@ uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main va
 Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
 is the same entry as `vaws-coordinator`.
 
-The package depends on `vaws-remote-dev>=0.5.1` (import `remote_dev`). It
+The package depends on `vaws-remote-dev>=0.6.0` (import `remote_dev`). It
 does not pin that package's git source; the workspace that installs this
 library chooses the tag. `uv sync` / `uv lock` are not the developer path
 here: a library that named remote-dev's git source in `pyproject.toml`
@@ -174,7 +174,7 @@ executed on the physical host. Durable host state defaults to
 ## Development
 
 `uv sync` is not the setup path. This library declares
-`vaws-remote-dev>=0.5.1` without a git source: remote-dev is not on PyPI,
+`vaws-remote-dev>=0.6.0` without a git source: remote-dev is not on PyPI,
 so `uv sync` / `uv lock` fail with an unsatisfiable-dependency error.
 That is intentional. A library that pinned remote-dev's git URL would
 take the upgrade decision away from every consumer, and
@@ -185,7 +185,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@68ced0cc4fc16e805da8cd46bdf97bc1eccdd2ce"
 uv pip install pytest
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
