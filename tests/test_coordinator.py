@@ -1665,6 +1665,7 @@ class DaemonProcessTests(unittest.TestCase):
                 status = client.advance(str(sessions.state_dir), "alice", admitted["execution_id"], "status")
                 self.assertEqual(status["progress"]["step"], "sync-sources")
                 self.assertIn("parity.log", status["progress"]["log_ref"])
+                self.assertTrue(Path(status["progress"]["log_ref"]).is_file())
                 self.assertEqual(client.call("restart_if_idle")["status"], "busy")
                 t2 = time.time()
                 client.call("ping")

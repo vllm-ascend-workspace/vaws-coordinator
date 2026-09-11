@@ -743,6 +743,10 @@ class CoordinatorService:
 
     def _save_progress(self, store, row, role, event):
         now = time.time()
+        if event.get("log_ref"):
+            path = Path(event["log_ref"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
         previous = row.get("progress") or {}
         same_step = (previous.get("step"), previous.get("role")) == (event.get("step"), role)
         row["progress"] = {**(previous if same_step else {}), **event, "role": role,
