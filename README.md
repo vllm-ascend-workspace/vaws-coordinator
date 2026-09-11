@@ -217,6 +217,10 @@ Completed build-compatibility failures end preparation before editable installs
 and do not retry automatically. Completed source-sync failures retain their
 original cause; lost transport remains uncertain. Remote profile paths are
 validated independently of the client operating system.
+If a successful editable build removed its CMake cache and the image did not
+export SoC/compiler variables, attestation reads those build selections from
+the latest completed installer log and hashes that log as profile evidence.
+Incomplete or conflicting evidence stays an error.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;

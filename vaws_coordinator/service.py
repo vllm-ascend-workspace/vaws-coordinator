@@ -1385,12 +1385,14 @@ def _ensure_daemon_locked(state_dir: Path, client: CoordinatorClient) -> Coordin
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
     log_path = Path(state_dir) / "daemon.log"
+    environment = dict(os.environ)
+    environment.setdefault("REMOTE_DEV_STATE_DIR", str(Path(state_dir).resolve().parent / "remote-dev-state"))
     options = ({"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
                if os.name == "nt" else {"start_new_session": True})
     with log_path.open("ab") as log:
         process = subprocess.Popen(
             [sys.executable, "-m", "vaws_coordinator", "daemon", "--state-dir", str(state_dir)],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log, **options,
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=environment, **options,
         )
     deadline = time.time() + 5
     while time.time() < deadline:

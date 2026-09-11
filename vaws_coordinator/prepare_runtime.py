@@ -63,8 +63,6 @@ if cann_file is None or driver_file is None:
     raise ValueError("cannot attest CANN/driver version files")
 
 soc = os.environ.get("SOC_VERSION") or os.environ.get("VAWS_SOC_VERSION")
-if not soc:
-    raise ValueError("cannot attest soc: SOC_VERSION is not set in the environment")
 compiler = os.environ.get("CXX") or os.environ.get("C_COMPILER") or os.environ.get("CXX_COMPILER")
 if not compiler:
     # Use the actual custom-op build selection when no compiler was exported.
@@ -74,8 +72,13 @@ if not compiler:
             if line.startswith("CMAKE_CXX_COMPILER:FILEPATH="):
                 compiler = line.partition("=")[2].strip()
                 break
+toolchain = build_toolchain_from_logs(root) if not soc or not compiler else {}
+soc = soc or toolchain.get("soc")
+compiler = compiler or "; ".join(toolchain.get("compilers") or [])
+if not soc:
+    raise ValueError("cannot attest soc from environment or completed build evidence")
 if not compiler:
-    raise ValueError("cannot attest compiler")
+    raise ValueError("cannot attest compiler from environment or completed build evidence")
 python_abi = sysconfig.get_config_var("SOABI")
 if not python_abi:
     raise ValueError("cannot attest python_abi")
@@ -122,6 +125,8 @@ if not smoke["passed"]:
 (evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
 inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))
 evidence = {name: ".vaws-runtime/profile-evidence/" + name + ".json" for name in ("cann", "driver", "smoke")}
+if toolchain:
+    evidence["toolchain_log"] = toolchain["path"]
 manifest = capture(root, profile, inputs, files, evidence)
 verify(root, manifest)
 marker = root / ".vaws-runtime/ready-profile.json"
