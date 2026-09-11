@@ -51,7 +51,9 @@ def main():
             child.add_argument("--restart", action="store_true")
             child.add_argument("--timeout-seconds", type=int)
         if name == "execution":
-            child.add_argument("--execution-id", required=True)
+            reference = child.add_mutually_exclusive_group()
+            reference.add_argument("--execution-id")
+            reference.add_argument("--service")
             child.add_argument("--action", choices=["status", "tail", "stop", "target"])
             child.add_argument("--role", default=None)
             child.add_argument("--refresh", action="store_true", default=None,

@@ -1012,6 +1012,9 @@ class CoordinatorService:
             service_port = int(lease_env["VAWS_SERVICE_PORT"])
         if service_port is not None:
             environment["VAWS_SERVICE_PORT"] = str(service_port)
+        # A completed job keeps its original attestation even if its binding
+        # is subsequently refreshed for another source version.
+        launch_observation = dict((job or {}).get("launch_observation") or {})
         return {
             "execution_id": row["id"], "session_id": row["session_id"],
             "runtime_id": binding["runtime_id"], "binding_id": binding["id"],
@@ -1021,6 +1024,7 @@ class CoordinatorService:
             "profile_key": binding.get("profile_key"), "build_key": binding.get("build_key"),
             "launch_env": binding.get("launch_env") or {},
             "launch_preamble": binding.get("launch_preamble") or "",
+            "launch_observation": launch_observation,
             "environment": environment, "service_port": service_port,
             "state": state, "live": state in LIVE,
             "assignment": row.get("assignment"),

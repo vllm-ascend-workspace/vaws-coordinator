@@ -452,6 +452,24 @@ class PoolTests(unittest.TestCase):
                                        {"vllm": "a" * 40, "vllm-ascend": "b" * 40},
                                        "native-a", [device], 0, "exec python task.py", {}, 60)
 
+    def test_managed_launch_injects_and_retains_verified_observation(self):
+        binding = self.bind("alice", self.root / "a")
+        prepared = []
+        original = self.backend.job
+        def capture(runtime, job_id, action, **params):
+            if action == "prepare":
+                prepared.append(params["spec"])
+            return original(runtime, job_id, action, **params)
+        with mock.patch.object(self.backend, "job", side_effect=capture):
+            job = self.managed("alice", binding)
+        receipt = json.loads(prepared[0]["env"]["VAWS_EXECUTION_OBSERVATION"])
+        self.assertEqual(receipt, job["launch_observation"])
+        self.assertEqual(receipt["workspace_snapshot"]["vllm_commit"], "a" * 40)
+        self.assertEqual(receipt["native_digest"]["build_key"], "native-a")
+        self.pool.managed_control("alice", job["id"], "stop")
+        ended = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(ended["launch_observation"], receipt)
+
     def test_managed_gate_renew_restart_and_stop_one_preserves_peer(self):
         a, b = self.bind("alice", self.root / "a"), self.bind("bob", self.root / "b")
         first, second = self.managed("alice", a), self.managed("bob", b, 1)
@@ -628,13 +646,16 @@ class PoolTests(unittest.TestCase):
             self.pool.reconcile("admin", job["id"], "already terminal")
         self.assertEqual(self.pool.return_runtime("alice", binding["id"])["status"], "returned")
 
-    def test_task_worktrees_can_change_only_between_returned_bindings(self):
+    def test_task_worktree_rebind_returns_idle_roots_but_preserves_live_work(self):
         binding = self.bind("alice", self.root / "a")
-        with self.assertRaisesRegex(ValueError, "return task runtimes"):
+        job = self.managed("alice", binding)
+        with self.assertRaisesRegex(ValueError, "resolve/release"):
             self.pool.session_open("alice", "same-session-name", {"va": str(self.root / "new/worktree")})
-        self.pool.return_runtime("alice", binding["id"])
+        self.pool.managed_control("alice", job["id"], "stop")
+        self.pool.managed_control("alice", job["id"])
         result = self.pool.session_open("alice", "same-session-name", {"va": str(self.root / "new/worktree")})
         self.assertEqual(result["id"], binding["intent"]["session"])
+        self.assertEqual(self.pool.status("alice")["bindings"][0]["state"], "returned")
 
     def test_drain_waits_for_existing_managed_job_and_disables_automatic_reuse(self):
         binding = self.bind("alice", self.root / "a")

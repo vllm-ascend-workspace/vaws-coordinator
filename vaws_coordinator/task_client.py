@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import getpass
+import math
+import time
 from pathlib import Path
 
 from vaws_coordinator.agent_session import AgentSessions, load_context
@@ -91,7 +93,29 @@ class TaskClient:
             return reply["target"]
         raise ValueError("execution has no runtime binding; no guessed target")
 
-    def observe(self, execution_id, action="status", force=False, role=None, refresh=True):
+    def resolve_execution(self, execution_id=None, *, service=None):
+        """Resolve one owned reference without starting a daemon or allocating resources."""
+        if bool(execution_id) == bool(service):
+            raise ValueError("provide exactly one of execution_id or service")
+        if execution_id:
+            self._require_execution_id(execution_id)
+            return execution_id
+        if not isinstance(service, str) or not service.strip():
+            raise ValueError("service must be a nonempty string")
+        rows = [row for row in self.store.executions(self.context["session"]["id"])
+                if (row.get("spec") or {}).get("service") == service]
+        live = [row for row in rows if row.get("phase") not in DONE]
+        if len(live) > 1:
+            raise ValueError("service has multiple live executions; use an execution_id")
+        selected = live or sorted(rows, key=lambda row: (row.get("created_at", 0), row["id"]))[-1:]
+        return selected[0]["id"] if selected else None
+
+    def observe(self, execution_id=None, action="status", force=False, role=None, refresh=True, *, service=None):
+        if action not in {"status", "tail", "stop", "target"}:
+            raise ValueError("unsupported execution action")
+        execution_id = self.resolve_execution(execution_id, service=service)
+        if execution_id is None:
+            return {"state": "not_found", "service": service}
         self._require_execution_id(execution_id)
         if action == "target":
             target = self.target(execution_id)
@@ -108,3 +132,29 @@ class TaskClient:
     def finish(self, force=False):
         return self.coordinator.finish(str(self.store.state_dir), self.user,
                                        self.context["session"]["id"], force=force)
+
+    def wait(self, execution_id, *, until="running", timeout_seconds=30, poll_interval=1):
+        """Wait on one owned execution; return the last facts on bounded timeout.
+
+        A terminal failure ends a running wait. Release waits end only when
+        the coordinator confirms both termination and resource release.
+        """
+        if until not in {"running", "released"}:
+            raise ValueError("until must be running or released")
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be finite and nonnegative")
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValueError("poll_interval must be finite and positive")
+        self._require_execution_id(execution_id)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            reply = self.observe(execution_id)
+            terminal = reply.get("state") in DONE
+            if until == "running" and (terminal or reply.get("state") == "running"):
+                return reply
+            if until == "released" and terminal and reply.get("resources_released") is True:
+                return reply
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {**reply, "wait_timed_out": True}
+            time.sleep(min(poll_interval, remaining))

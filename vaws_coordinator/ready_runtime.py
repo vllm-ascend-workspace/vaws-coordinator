@@ -125,6 +125,17 @@ class RuntimePool(ManagedExecution):
         if not sources or any(not isinstance(path, str) or not Path(path).is_absolute() for path in sources.values()):
             raise ValueError("record the actual absolute local business worktree paths")
         key = digest([owner, session_id])
+        # A new business worktree reference is an intent to prepare that code.
+        # Returning idle bindings is an internal part of this transition. The
+        # normal return path still rejects live jobs or unreleased leases and
+        # preserves the user container and remote files.
+        with self.lock, self.transaction() as db:
+            previous = next((row for row in self.rows(db, "session") if row["id"] == key), None)
+            stale_bindings = [row for row in self.rows(db, "binding")
+                              if previous and previous["sources"] != sources
+                              and row["intent"]["session"] == key and row["state"] != "returned"]
+        for binding in stale_bindings:
+            self.return_runtime(owner, binding["id"])
         with self.lock, self.transaction() as db:
             for old in self.rows(db, "session"):
                 if old["id"] == key:
