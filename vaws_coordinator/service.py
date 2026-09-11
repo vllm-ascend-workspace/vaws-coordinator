@@ -45,6 +45,7 @@ SOCKET_NAME = "coordinator.sock"
 LOCK_NAME = "coordinator.lock"
 IPC_NAME = "coordinator.ipc"
 TICK_SECONDS = 2.0
+STATUS_CACHE_SECONDS = 2.0
 DONE = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
 LIVE = {"running"}
 LEASE_READY = {"granted", "starting", "active"}
@@ -236,7 +237,7 @@ class CoordinatorService:
         if op == "advance":
             value = self.advance(request["sessions_dir"], request["user"], request["execution_id"],
                                  action=request.get("action", "status"), force=bool(request.get("force")),
-                                 role=request.get("role"))
+                                 role=request.get("role"), refresh=request.get("refresh", True))
             return {"ok": True, "value": value}
         if op == "finish":
             value = self.finish(request["sessions_dir"], request["user"], request["session_id"],
@@ -307,15 +308,15 @@ class CoordinatorService:
             daemon=True,
         ).start()
 
-    def advance(self, sessions_dir, user, execution_id, action="status", force=False, role=None) -> dict[str, Any]:
+    def advance(self, sessions_dir, user, execution_id, action="status", force=False, role=None, refresh=True) -> dict[str, Any]:
         if action in {"status", "target", "tail"}:
-            return self._observe(sessions_dir, user, execution_id, action, role=role)
+            return self._observe(sessions_dir, user, execution_id, action, role=role, refresh=refresh)
         if action == "stop":
             return self._request_stop(sessions_dir, user, execution_id, force)
         with self._lock_for("execution", execution_id):
             return self._advance_locked(sessions_dir, user, execution_id, action=action, force=force)
 
-    def _observe(self, sessions_dir, user, execution_id, action, role=None) -> dict[str, Any]:
+    def _observe(self, sessions_dir, user, execution_id, action, role=None, refresh=True) -> dict[str, Any]:
         store = self.store(sessions_dir)
         with store.transaction() as db:
             row = store.get(db, "execution", execution_id)
@@ -324,12 +325,25 @@ class CoordinatorService:
         user = user or row.get("user")
         lock = self._lock_for("execution", execution_id)
         acquired = lock.acquire(blocking=False)
+        refreshed = False
         try:
-            if acquired and row.get("roles"):
-                row = self._refresh_jobs(store, user, row)
+            if acquired:
+                # Another observer may have refreshed between the first read
+                # and lock acquisition. Do not overwrite its newer snapshot.
+                with store.transaction() as db:
+                    row = store.get(db, "execution", execution_id)
+                current = self._observation_freshness(row)["fresh"]
+                if row.get("roles") and (action != "status" or refresh or not current):
+                    row = self._refresh_jobs(store, user, row)
+                    refreshed = bool(row.get("jobs_observed_at"))
             if action == "tail":
                 return self._tail(store, user, row, role=role)
-            return self._reply(row, role=role)
+            reply = self._reply(row, role=role)
+            reply["observation_freshness"].update(
+                source="refreshed" if refreshed else "cache" if row.get("jobs_observed_at") else "local",
+                refresh_requested=bool(refresh), refresh_deferred=not acquired,
+            )
+            return reply
         finally:
             if acquired:
                 lock.release()
@@ -812,7 +826,10 @@ class CoordinatorService:
                 continue
             job = self.pool.managed_control(user, role["managed_job"], "status")
             role["observation"] = job
+            role["status_observed_at"] = time.time()
         if row["roles"]:
+            if any(role.get("managed_job") for role in row["roles"]):
+                row["jobs_observed_at"] = time.time()
             row["observation"] = row["roles"][0].get("observation")
             row["managed_job"] = row["roles"][0].get("managed_job")
             states = [role.get("observation", {}).get("state") for role in row["roles"] if role.get("observation")]
@@ -907,6 +924,7 @@ class CoordinatorService:
             "lease_state": job.get("lease_state"),
             "quiet": (job.get("remote") or {}).get("quiet"),
             "descendants_drained": (job.get("remote") or {}).get("descendants_drained"),
+            "status_observed_at": role.get("status_observed_at"),
         }
         if binding.get("endpoint"):
             target = self._target(row, binding, job)
@@ -918,12 +936,20 @@ class CoordinatorService:
                 view["service_port"] = target.get("service_port")
         return view
 
+    @staticmethod
+    def _observation_freshness(row):
+        sampled = row.get("jobs_observed_at")
+        age = time.time() - sampled if isinstance(sampled, (int, float)) else None
+        return {"snapshot_completed_at": sampled, "age_seconds": round(age, 3) if age is not None else None,
+                "max_age_seconds": STATUS_CACHE_SECONDS,
+                "fresh": age is not None and 0 <= age <= STATUS_CACHE_SECONDS}
+
     def _reply(self, row, role=None) -> dict[str, Any]:
         job = row.get("observation") or {}
         state = row.get("phase") or job.get("state")
         payload = {"execution_id": row["id"], "state": state, "service": (row.get("spec") or {}).get("service"),
                    "assignment": row.get("assignment"), "observed_at": time.time(),
-                   "progress": row.get("progress")}
+                   "progress": row.get("progress"), "observation_freshness": self._observation_freshness(row)}
         if row.get("cancel_requested"):
             payload["cancel_requested"] = True
         if row.get("error"):
@@ -1288,11 +1314,13 @@ class CoordinatorClient:
         return self.call("admit", sessions_dir=str(sessions_dir), user=user,
                          session_id=session_id, spec=spec, restart=restart)
 
-    def advance(self, sessions_dir, user, execution_id, action="status", force=False, role=None):
+    def advance(self, sessions_dir, user, execution_id, action="status", force=False, role=None, refresh=True):
         payload = dict(sessions_dir=str(sessions_dir), user=user,
                        execution_id=execution_id, action=action, force=force)
         if role:
             payload["role"] = role
+        if not refresh:
+            payload["refresh"] = False
         return self.call("advance", **payload)
 
     def finish(self, sessions_dir, user, session_id, force=False):

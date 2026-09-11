@@ -6,6 +6,24 @@ allocation. It is not a hosted multi-user service.
 Install it, run it on the machine you are sitting at, and it talks to *your*
 remote containers through the `vaws-remote-dev` package. Code identity is git.
 
+## Status observations
+
+Task MCP/CLI execution status may reuse a managed-job snapshot for up to two
+seconds. `vaws execution --refresh` (or tool argument `refresh: true`) requests
+a new status observation. Replies include `observation_freshness` with snapshot
+completion time, age, freshness, source and whether a busy execution deferred
+refresh. Per-role `status_observed_at` preserves individual sampling times;
+roles are sampled sequentially. The existing top-level `observed_at` is the
+response-generation time, not proof of a new remote query.
+
+`TaskClient.observe()` preserves its fresh-by-default library behavior; pass
+`refresh=False` to permit the short status cache. Tail, target, stop, resource
+allocation and background progression retain their existing behavior. Cached
+observations neither allocate resources nor establish new ownership. A busy
+execution returns its stored observation immediately and explicitly marks a
+requested refresh as deferred. Stale or missing timestamps trigger a refresh
+when the execution is available; state/error/release fields remain visible.
+
 ## Install
 
 ```bash
