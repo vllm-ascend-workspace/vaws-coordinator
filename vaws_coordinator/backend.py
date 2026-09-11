@@ -119,10 +119,15 @@ print(json.dumps({'pid':matches[0]}))
     def bash(self, target, command):
         result = self.shell.run(target, command, timeout_ms=45000)
         if result["outcome"] != "success":
+            from vaws_coordinator.parity_support import RemoteCommandError
             refs = result.get("refs") or {}
             stderr = Path(refs["stderr"]).read_text(errors="replace")[-300:].strip() if refs.get("stderr") else ""
-            raise RuntimeError(f"runtime probe failed ({result['outcome']}/{result.get('status')}, "
-                               f"exit {result.get('exit_code')}): {stderr or 'no stderr'}")
+            code = result.get("exit_code")
+            message = (f"runtime probe failed ({result['outcome']}/{result.get('status')}, "
+                       f"exit {code}): {stderr or 'no stderr'}")
+            if type(code) is int and code > 0:
+                raise RemoteCommandError(code, message)
+            raise RuntimeError(message)
         return Path(result["refs"]["stdout"]).read_text()
 
     def inspect(self, runtime, *, idle=False, snapshots=None):

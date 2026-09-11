@@ -55,6 +55,28 @@ def file_digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def build_toolchain_from_logs(root: Path) -> dict[str, Any]:
+    """Read the latest completed package-owned install's build selection.
+
+    Editable wheel builds may remove their temporary CMake cache. Retained
+    installer output still records the selected SoC and C++ compilers.
+    An incomplete newer attempt cannot borrow an older successful log.
+    """
+    logs = list((root / ".vaws-runtime/prepare-logs").glob("runtime-install-vllm-ascend.*"))
+    if not logs:
+        return {}
+    path = max(logs, key=lambda item: item.stat().st_mtime_ns)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not re.search(r"^Successfully installed .*\bvllm[-_]ascend-", text, re.MULTILINE):
+        raise ValueError("latest vllm-ascend install has no successful completion evidence")
+    socs = set(re.findall(r"-- Detected SOC version:\s*([A-Za-z0-9_]+)", text))
+    if len(socs) > 1:
+        raise ValueError("completed build log contains conflicting SoC selections")
+    compilers = sorted(set(re.findall(r"-- The CXX compiler identification is ([^\r\n]+)", text)))
+    return {"soc": next(iter(socs), None), "compilers": compilers,
+            "path": path.relative_to(root).as_posix(), "sha256": file_digest(path)}
+
+
 def checked_file(root: Path, relative: str) -> Path:
     name = PurePosixPath(relative)
     if name.is_absolute() or not name.parts or ".." in name.parts:
