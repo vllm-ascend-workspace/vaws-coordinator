@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "jsonschema>=4"]
 
 [project.scripts]
 vaws-coordinator = "vaws_coordinator.cli:main"
