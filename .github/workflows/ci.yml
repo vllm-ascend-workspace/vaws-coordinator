@@ -79,6 +79,13 @@ jobs:
           HOME: ${{ runner.temp }}/coordinator-test-home
           USERPROFILE: ${{ runner.temp }}/coordinator-test-home
         run: |
+          # Use Git Bash for local Linux-peer fixtures. The Windows bash.exe
+          # alias can point at WSL with no distribution installed on the runner.
+          $gitBin = Join-Path $env:ProgramFiles 'Git/bin'
+          if (-not (Test-Path -LiteralPath (Join-Path $gitBin 'bash.exe'))) {
+            throw 'Git Bash is required by the local Linux-peer test fixtures'
+          }
+          $env:PATH = "$gitBin;$env:PATH"
           New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
           uv venv
           uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"

@@ -142,6 +142,9 @@ On native Windows, run the same setup commands and use
 directory and token-authenticated IPv4 loopback IPC; its listener is never bound
 to an external interface. Native CLI pipes and Git output use UTF-8. Source
 publication preserves Linux path syntax independently of the client platform.
+The tests that emulate a Linux peer need a working Bash. If the Windows `bash`
+alias points at an unconfigured WSL installation, prepend Git for Windows'
+`bin` directory to the test process's `PATH`, as the Windows CI job does.
 
 ## Progress, records, and loaded versions
 
