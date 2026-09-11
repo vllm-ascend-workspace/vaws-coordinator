@@ -22,8 +22,8 @@ def coordinator_user(explicit: str | None = None) -> str:
 
 
 class TaskClient:
-    def __init__(self, context_file="", *, pool=None, user=None, service=None):
-        self.context = load_context(context_file)
+    def __init__(self, context_file="", *, pool=None, user=None, service=None, allow_native_context=True):
+        self.context = load_context(context_file, allow_native_context=allow_native_context)
         self.store = AgentSessions(Path(self.context["state_dir"]))
         self.user = coordinator_user(user)
         self._pool = pool

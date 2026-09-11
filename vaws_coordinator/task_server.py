@@ -84,7 +84,9 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     canonical = canonical_name(name)
     if canonical not in TOOL_SCHEMAS:
         raise ProtocolError(-32602, f"unknown task tool: {name}")
-    payload = vaws_call(canonical, arguments or {})
+    # A persistent MCP server's environment can outlive the native caller.
+    # It must use the caller's context, never the thread that launched it.
+    payload = vaws_call(canonical, arguments or {}, allow_native_context=False)
     result = payload["result"]
     return {
         "content": [{"type": "text", "text": payload["text"]}],

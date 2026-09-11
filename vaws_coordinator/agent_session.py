@@ -220,10 +220,31 @@ class AgentSessions:
             self.put(db, "execution", row)
 
 
-def load_context(context_file: str = "") -> dict:
+def load_context(context_file: str = "", *, allow_native_context: bool = True) -> dict:
     filename = context_file or os.environ.get("VAWS_CONTEXT_FILE", "")
     if not filename:
-        raise ValueError("VAWS context is required; use the native session hook or explicit task association")
+        # Codex exposes a native thread id to local commands even when the
+        # session hook cannot export VAWS_CONTEXT_FILE to their environment.
+        # Resolve only that identity; cwd is attachment metadata, never a key.
+        native = os.environ.get("CODEX_THREAD_ID", "").strip()
+        session = os.environ.get("CODEX_SESSION_ID", "").strip()
+        if not native or not allow_native_context:
+            raise ValueError("VAWS context is required; use the native session hook or explicit task association")
+        if session and session != native:
+            raise ValueError("conflicting native Codex identities; pass context_file explicitly")
+        parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
+        association = os.environ.get("VAWS_ATTACH_CONTEXT", "")
+        if parent or association:
+            inherited = load_context(parent or association)
+            store = AgentSessions(Path(inherited["state_dir"]))
+        else:
+            store = AgentSessions()
+            try:
+                return store.native_context("codex", native)
+            except ValueError:
+                pass
+        return store.attach("codex", native, str(Path.cwd()),
+                            parent_context=parent, association=association)
     path = Path(filename).expanduser().resolve(strict=True)
     reference = json.loads(path.read_text())
     if reference.get("schema_version") != "vaws.agent-context.v1":

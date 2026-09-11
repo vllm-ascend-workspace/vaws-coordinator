@@ -1064,6 +1064,28 @@ class TaskClientTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_completed_preparation_failure_is_terminal_without_repeating_work(self):
+        from vaws_coordinator.parity_support import RemoteCommandError
+        service = self.client.coordinator
+        prepare = mock.Mock(side_effect=RemoteCommandError(1, "incompatible torch build"))
+        with mock.patch.object(service, "_place_or_prepare", prepare):
+            result = self.client.run("serve-mismatched-source")
+            self.assertEqual(result["state"], "failed")
+            self.assertTrue(result["resources_released"])
+            self.assertIn("incompatible torch build", Path(result["error_ref"]).read_text())
+            service._dispatch_progress()
+            observed = self.client.observe(result["execution_id"])
+        self.assertEqual(observed["state"], "failed")
+        prepare.assert_called_once()
+
+    def test_lost_preparation_transport_keeps_unknown_state(self):
+        from vaws_coordinator.parity_support import RemoteCommandError
+        with mock.patch.object(self.client.coordinator, "_place_or_prepare",
+                               side_effect=RemoteCommandError(255, "connection lost")):
+            result = self.client.run("serve-over-unavailable-transport")
+        self.assertEqual(result["state"], "uncertain")
+        self.assertFalse(result["resources_released"])
+
     def test_preflight_failure_keeps_full_error_and_never_allocates(self):
         from vaws_coordinator.managed_execution import ExecutionRequestError
         message = "unknown CLI option " + "detail " * 200

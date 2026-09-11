@@ -12,6 +12,34 @@ from vaws_coordinator.parity import build_snapshot_records
 from vaws_coordinator.state_paths import shared_workspace_root
 
 
+def test_snapshot_ref_beyond_windows_path_limit(tmp_path):
+    from vaws_coordinator.parity_support import git
+    root = tmp_path / "nested-source"
+    root.mkdir()
+    git(root, ["init", "-q"])
+    git(root, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+               "commit", "--allow-empty", "-qm", "fixture"])
+    ref = "refs/parity/" + "a" * 64 + "/" + "b" * 64 + "/" + "c" * 100
+    assert len(str(root / ".git" / ref)) > 260
+    git(root, ["update-ref", ref, "HEAD"])
+    assert git(root, ["rev-parse", ref]).stdout == git(root, ["rev-parse", "HEAD"]).stdout
+    assert git(root, ["config", "--local", "--get", "core.longpaths"], check=False).returncode == 1
+
+
+def test_remote_profile_absolute_paths_do_not_depend_on_client_os():
+    import pytest
+    from vaws_coordinator.runtime_profile import PROFILE_FIELDS, profile_key, launch_preamble
+    profile = {key: "test" for key in PROFILE_FIELDS}
+    profile.update(build_env={}, launch_env={}, compatibility_evidence="fixture",
+                   system_files={name: {"path": f"/usr/local/{name}/version.info", "sha256": "a" * 64}
+                                 for name in ("cann", "driver")})
+    assert len(profile_key(profile)) == 64
+    assert "/owned/.venv/bin" in launch_preamble(profile, python="/owned/.venv/bin/python")
+    profile["system_files"]["cann"]["path"] = "relative/version.info"
+    with pytest.raises(ValueError, match="absolute path"):
+        profile_key(profile)
+
+
 def test_remote_upload_uses_posix_parent_and_exact_bytes(monkeypatch):
     from types import SimpleNamespace
     from vaws_coordinator.parity_support import SshEndpoint, ssh_stream_to_file, ssh_stream_bytes_to_file
