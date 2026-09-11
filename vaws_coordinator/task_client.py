@@ -58,16 +58,19 @@ class TaskClient:
         return self.context
 
     def run(self, command, *, env=None, environment=None, resources=None, topology=None,
-            timeout_seconds=1800, service=None, restart=False):
+            timeout_seconds=1800, service=None, restart=False, preflight=None):
         if not command or not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
         env = validate_user_env(env)
         resources = normalize_resources(resources)
         roles = role_plan(topology, resources, command)
+        if preflight is not None and (not isinstance(preflight, str) or not preflight.strip()):
+            raise ValueError("preflight must be a nonempty shell command")
         spec = {
             "command": command, "env": env, "environment": environment or {},
             "resources": resources, "topology": topology or {}, "roles": roles,
             "timeout_seconds": timeout_seconds, "service": service,
+            "preflight": preflight,
         }
         return self.coordinator.admit(str(self.store.state_dir), self.user,
                                       self.context["session"]["id"], spec, restart=restart)

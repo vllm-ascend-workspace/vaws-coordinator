@@ -233,16 +233,11 @@ class ResultAndToolContractTests(unittest.TestCase):
                 self.assertFalse(schema["additionalProperties"])
 
     def test_an_unavailable_task_registry_is_blocked_and_never_a_remote_success(self):
-        captured = {}
-
-        def factory(**kwargs):
-            captured.update(kwargs)
-            return {"outcome": kwargs["outcome"]}
-
         with mock.patch.dict("os.environ", {}, clear=True):
-            payload = vaws_call("vaws.session", {}, make_result=factory)
+            payload = vaws_call("vaws.session", {})
         self.assertEqual(payload["result"]["outcome"], "blocked")
-        self.assertEqual(captured["status"], "unavailable")
+        self.assertEqual(payload["result"]["status"], "unavailable")
+
 
 
 if __name__ == "__main__":

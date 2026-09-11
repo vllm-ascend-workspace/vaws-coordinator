@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from vaws_coordinator import ops as vaws_ops
@@ -12,6 +15,9 @@ class FakeTaskClient:
 
     def __init__(self, *_args, **_kwargs):
         self.context = {"session": {"id": "sess-test"}}
+        self._service = None
+        self._temporary = tempfile.TemporaryDirectory()
+        self.store = SimpleNamespace(state_dir=Path(self._temporary.name) / "sessions")
 
     def finish(self, _force=False):
         return {"state": self.state, "executions": [], "worktrees_preserved": True}

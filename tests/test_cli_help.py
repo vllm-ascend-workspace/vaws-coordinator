@@ -58,10 +58,10 @@ print(json.dumps(captured))
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["result"]["schema_version"], "remote-dev.result.v1")
-        self.assertEqual(payload["result"]["tool"], "vaws.session")
-        self.assertEqual(payload["result"]["status"], "invalid_json")
-        self.assertEqual(payload["result"]["outcome"], "needs_input")
+        self.assertEqual(payload["schema_version"], "remote-dev.result.v1")
+        self.assertEqual(payload["tool"], "vaws.session")
+        self.assertEqual(payload["status"], "invalid_json")
+        self.assertEqual(payload["outcome"], "needs_input")
 
     def test_vaws_cli_attach_error_returns_result_contract_without_traceback(self) -> None:
         proc = subprocess.run(
@@ -84,10 +84,10 @@ print(json.dumps(captured))
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["result"]["schema_version"], "remote-dev.result.v1")
-        self.assertEqual(payload["result"]["tool"], "vaws.attach")
-        self.assertEqual(payload["result"]["status"], "attach_failed")
-        self.assertEqual(payload["result"]["outcome"], "failed")
+        self.assertEqual(payload["schema_version"], "remote-dev.result.v1")
+        self.assertEqual(payload["tool"], "vaws.attach")
+        self.assertEqual(payload["status"], "attach_failed")
+        self.assertEqual(payload["outcome"], "failed")
 
 
 if __name__ == "__main__":

@@ -294,6 +294,8 @@ def ssh_exec_stream(
     *,
     check: bool = True,
     stream_progress: bool = True,
+    on_progress=None,
+    log_path=None,
 ) -> SshStreamingResult:
     from remote_dev.core.ssh_transport import run_stream
 
@@ -302,12 +304,17 @@ def ssh_exec_stream(
     progress_events: list[dict[str, Any]] = []
 
     def on_output(channel: str, text: str) -> None:
+        if log_path is not None:
+            with Path(log_path).open('a', encoding='utf-8') as log:
+                log.write(text)
         if channel == 'stdout':
             stdout_parts.append(text)
             return
         event = parse_progress_event(text)
         if event is not None:
             progress_events.append(event)
+            if on_progress is not None:
+                on_progress(event)
             if stream_progress:
                 sys.stderr.write(text if text.endswith('\n') else text + '\n')
                 sys.stderr.flush()

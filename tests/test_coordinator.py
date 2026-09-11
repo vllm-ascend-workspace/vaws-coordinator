@@ -1029,6 +1029,31 @@ class TaskClientTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_preflight_failure_keeps_full_error_and_never_allocates(self):
+        from vaws_coordinator.managed_execution import ExecutionRequestError
+        message = "unknown CLI option " + "detail " * 200
+        self.backend.preflight = mock.Mock(side_effect=ExecutionRequestError(message))
+        result = self.client.run("serve", preflight="parse-only")
+        self.assertEqual(result["state"], "failed")
+        self.assertIn(message, Path(result["error_ref"]).read_text())
+        self.assertTrue(result["resources_released"])
+        self.assertEqual(result["progress"]["step"], "preflight")
+        with self.pool.transaction() as db:
+            self.assertEqual(self.pool.rows(db, "job"), [])
+            self.assertEqual(self.pool.rows(db, "run"), [])
+
+    def test_daemon_restart_refuses_active_work_and_lease_then_allows_idle(self):
+        service = self.client.coordinator
+        reply = self.client.run("serve")
+        self.assertEqual(service.handle({"op": "restart_if_idle"})["value"]["status"], "busy")
+        self.assertFalse(service._stopped.is_set())
+        stopped = self.client.observe(reply["execution_id"], "stop")
+        self.assertTrue(stopped["resources_released"])
+        self.assertEqual(stopped["roles"][0]["lease_state"], "released")
+        self.assertTrue(stopped["roles"][0]["quiet"])
+        self.assertEqual(service.handle({"op": "restart_if_idle"})["value"]["status"], "stopping")
+        self.assertTrue(service._stopped.is_set())
+
     def test_run_observe_and_target_expose_user_container_and_selected_python(self):
         reply = self.client.run("true")
         self.assertEqual(reply["state"], "running")
@@ -1533,7 +1558,7 @@ class DaemonProcessTests(unittest.TestCase):
                 deadline = time.time() + 5
                 while time.time() < deadline:
                     try:
-                        self.assertEqual(client.call("ping"), None)
+                        self.assertEqual(client.call("ping")["runtime"][0]["loaded"]["package"], "vaws-coordinator")
                         break
                     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
                         time.sleep(0.05)
@@ -1637,6 +1662,10 @@ class DaemonProcessTests(unittest.TestCase):
                 self.assertEqual(status["execution_id"], admitted["execution_id"])
                 self.assertNotEqual(status["state"], "timeout")
                 self.assertTrue(started.wait(3))
+                status = client.advance(str(sessions.state_dir), "alice", admitted["execution_id"], "status")
+                self.assertEqual(status["progress"]["step"], "sync-sources")
+                self.assertIn("parity.log", status["progress"]["log_ref"])
+                self.assertEqual(client.call("restart_if_idle")["status"], "busy")
                 t2 = time.time()
                 client.call("ping")
                 self.assertLess(time.time() - t2, 0.5)

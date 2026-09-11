@@ -96,6 +96,8 @@ def prepare_task_environment(
     environment: dict[str, Any] | None,
     donor: dict[str, Any],
     sources: dict[str, str] | None = None,
+    on_progress=None,
+    log_dir=None,
 ) -> dict[str, Any]:
     """Create an isolated task root, install into a task-owned interpreter, register.
 
@@ -166,11 +168,10 @@ def prepare_task_environment(
         "machine_type": environment.get("machine_type") or donor.get("machine_type"),
     }
     backend = pool.backend
-    if not hasattr(backend, "prepare_task_root"):
-        raise RuntimeError("backend cannot prepare an isolated task environment")
     backend.prepare_task_root(
         spec, sources=sources, environment=environment, donor_python=donor_python,
         workspace_root=str(__import__("pathlib").Path(sources["vllm"]).resolve().parent),
+        on_progress=on_progress, log_dir=log_dir,
     )
     return pool.register(runtime_id, spec)
 

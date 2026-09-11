@@ -56,6 +56,19 @@ class RemoteBackend:
         endpoint = dict(runtime["endpoint"])
         return control(resolve_endpoint(endpoint), job_id, action, **parameters)
 
+    def preflight(self, binding, command, env):
+        from vaws_coordinator.managed_execution import ExecutionRequestError
+        exports = {**(binding.get("launch_env") or {}), **env,
+                   "VAWS_PYTHON": binding["python"], "VAWS_SERVICE_PORT": "0"}
+        script = "set -e\n" + (binding.get("launch_preamble") or "") + "\n"
+        script += "\n".join(f"export {key}={shlex.quote(value)}" for key, value in exports.items())
+        script += "\n" + command
+        result = self.shell.run(binding["endpoint"], script, timeout_ms=120000)
+        if result["outcome"] != "success":
+            refs = result.get("refs") or {}
+            detail = Path(refs["stderr"]).read_text(errors="replace") if refs.get("stderr") else str(result)
+            raise ExecutionRequestError(f"preflight failed before NPU allocation: {detail}\nlog refs: {refs}")
+
     def job_host_pid(self, runtime, receipt):
         code = '''
 import json, subprocess
@@ -156,7 +169,8 @@ print(json.dumps(manifest))
         return {**manifest, "container_id": info["Id"],
                 "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
 
-    def prepare_task_root(self, spec, *, sources, environment, donor_python=None, workspace_root=None):
+    def prepare_task_root(self, spec, *, sources, environment, donor_python=None, workspace_root=None,
+                          on_progress=None, log_dir=None):
         """First-install isolated sources + task venv + editables + verified profile.
 
         Does not mutate ``donor_python`` site-packages. Image packages may be
@@ -168,7 +182,7 @@ print(json.dumps(manifest))
             prepare_isolated_root_script,
             run_runtime_install_step,
         )
-        from vaws_coordinator.parity_support import SshEndpoint, ssh_exec
+        from vaws_coordinator.parity_support import SshEndpoint, ssh_exec_stream
         from vaws_coordinator.provision.task_environment import INSTALL_STEPS, create_venv_script
 
         endpoint = spec["endpoint"]
@@ -179,8 +193,20 @@ print(json.dumps(manifest))
         if not {"vllm", "vllm-ascend"}.issubset(sources or {}):
             raise ValueError("bind the actual vllm and vllm-ascend worktrees before preparation")
         container = SshEndpoint(host=endpoint["host"], port=int(endpoint["port"]), user=endpoint["user"])
-        ssh_exec(container, prepare_isolated_root_script(root))
-        ssh_exec(container, create_venv_script(root, python, donor_python))
+        def progress(step, event=None):
+            value = {"step": step, **(event or {})}
+            if log_dir is not None:
+                value["log_ref"] = str(Path(log_dir) / (step + ".log"))
+            if on_progress is not None:
+                on_progress(value)
+            return value.get("log_ref")
+
+        if log_dir is not None:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+        for step, script in (("prepare-root", prepare_isolated_root_script(root)),
+                             ("create-venv", create_venv_script(root, python, donor_python))):
+            log = progress(step)
+            ssh_exec_stream(container, script, stream_progress=False, log_path=log)
         identity = spec.get("container_name") or ("vaws-" + spec["user"])
         args = materialize_command(
             workspace_id=identity,
@@ -190,11 +216,17 @@ print(json.dumps(manifest))
             workspace_root=workspace_root,
         )
         env = {key: value for key, value in os.environ.items()}
-        result = subprocess.run(args, env=env, timeout=3600, check=False, capture_output=True, text=True)
+        log = progress("materialize")
+        if log:
+            with Path(log).open("w") as stream:
+                result = subprocess.run(args, env=env, timeout=3600, check=False, stdout=stream, stderr=stream)
+        else:
+            result = subprocess.run(args, env=env, timeout=3600, check=False, capture_output=True, text=True)
         if result.returncode:
-            detail = (result.stderr or result.stdout or "")[-500:]
+            detail = f"inspect {log}" if log else (result.stderr or result.stdout or "")
             raise RuntimeError(f"source materialization failed: {detail}")
         for step in INSTALL_STEPS:
+            log = progress(step)
             run_runtime_install_step(
                 container=container,
                 runtime_root=root,
@@ -203,7 +235,10 @@ print(json.dumps(manifest))
                 step=step,
                 stream_progress=False,
                 python=python,
+                on_progress=lambda event, step=step: progress(step, event),
+                log_path=log,
             )
+        progress("verify-profile")
         self._write_ready_profile(spec, environment)
         return self.inspect(spec)
 

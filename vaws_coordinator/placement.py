@@ -59,6 +59,10 @@ def role_plan(topology: dict[str, Any] | None, resources: dict[str, Any], comman
             raise ValueError("topology.roles entries need a name")
         name = str(role["name"])
         item = {"name": name, "command": role.get("command") or command}
+        if role.get("preflight") is not None:
+            if not isinstance(role["preflight"], str) or not role["preflight"].strip():
+                raise ValueError("role preflight must be a nonempty shell command")
+            item["preflight"] = role["preflight"]
         if role.get("devices"):
             item["devices"] = list(role["devices"])
         else:

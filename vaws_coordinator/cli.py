@@ -16,6 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
     daemon = sub.add_parser("daemon", help="Run the persistent coordinator for this user/state-dir")
     daemon.add_argument("--state-dir", default="")
+    daemon.add_argument("--action", choices=("serve", "status", "restart-if-idle"), default="serve")
     task = sub.add_parser("task-server", help="Serve the four VAWS task tools over stdio MCP")
     task.add_argument("--describe", action="store_true",
                       help="print the capability declaration and tool list as JSON, then exit")
@@ -48,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "daemon":
         from vaws_coordinator.service import main as daemon_main
-        return daemon_main(["--state-dir", args.state_dir] if args.state_dir else [])
+        return daemon_main(["--state-dir", args.state_dir, "--action", args.action])
     if args.command == "task-server":
         from vaws_coordinator.task_server import main as task_main
         return task_main(["--describe"] if args.describe else [])
