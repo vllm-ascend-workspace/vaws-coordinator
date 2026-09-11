@@ -100,8 +100,14 @@ the container, SSH endpoint, prepared environments, worktrees and evidence.
 Thus stopping a model releases that model execution's NPUs; an idle local task
 does not keep cards reserved.
 
-**Close task.** Close admission under the existing binding lock, persist the
-finish intent (owner/`force`), and stop/cancel admitted executions. The
+**Close task.** A task that has never admitted managed work finishes directly
+in the local registry without loading a coordinator service or remote runtime.
+Its close check/state change and managed execution admission use the same
+database write transaction boundary. If close commits first, admission fails;
+if admission commits first, finish delegates to the coordinator. Admission
+checks the task's open state and writes its complete admitted execution record
+atomically, without an intermediate unadmitted row. For managed tasks, persist
+the finish intent (owner/`force`) and stop/cancel admitted executions. The
 daemon's existing tick/reconcile path returns remaining bindings and marks
 the task finished once execution stop has drained. A frontend exit does not
 require a second finish; the same pending finish continues after daemon

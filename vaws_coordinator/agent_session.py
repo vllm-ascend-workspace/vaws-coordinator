@@ -190,6 +190,51 @@ class AgentSessions:
         with self.transaction() as db:
             return self.rows(db, "execution")
 
+    def close_if_unmanaged(self, session_id: str, *, user: str, force=False) -> dict | None:
+        """Close a task locally only when it has never admitted remote work.
+
+        The same write transaction guards admission's open-state check, so a
+        concurrent submit either becomes managed first or sees a closed task.
+        """
+        with self.transaction() as db:
+            session = self.get(db, "session", session_id)
+            rows = [row for row in self.rows(db, "execution") if row["session_id"] == session_id]
+            remote_facts = ("remote_session", "roles", "managed_job", "binding", "preparation_jobs")
+            if any(row.get("admitted") or any(row.get(key) for key in remote_facts) for row in rows):
+                return None
+            if session["state"] != "finished":
+                session["state"] = "finished"
+                session["finish"] = {"user": user, "force": bool(force), "at": time.time()}
+                self.put(db, "session", session)
+            observations = []
+            for row in rows:
+                row.update(phase="cancelled", cancel_requested=True)
+                self.put(db, "execution", row)
+                observations.append({"execution_id": row["id"], "state": "cancelled", "resources_released": True})
+            return {"state": "finished", "executions": observations, "worktrees_preserved": True}
+
+    def admit_execution(self, session_id: str, request_id: str, spec: dict, *, user: str) -> dict:
+        """Publish accepted execution facts atomically with the open-task check."""
+        key = hashlib.sha256(json.dumps([session_id, request_id]).encode()).hexdigest()
+        with self.transaction() as db:
+            if self.get(db, "session", session_id)["state"] != "open":
+                raise ValueError("task admission is closed; resume the task before starting another execution")
+            existing = [row for row in self.rows(db, "execution") if row["id"] == key]
+            if existing:
+                row = existing[0]
+                if row["spec"] != spec:
+                    raise ValueError("execution request id reused with different arguments")
+                if row.get("admitted"):
+                    if row.get("user") != user:
+                        raise PermissionError("execution belongs to another principal")
+                    return row
+            else:
+                row = {"id": key, "session_id": session_id, "request_id": request_id,
+                       "spec": spec, "created_at": time.time()}
+            row.update(phase="queued", admitted=True, user=user)
+            self.put(db, "execution", row)
+            return row
+
     def execution(self, context: dict, request_id: str, spec: dict) -> dict:
         key = hashlib.sha256(json.dumps([context["session"]["id"], request_id]).encode()).hexdigest()
         with self.transaction() as db:

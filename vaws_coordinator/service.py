@@ -321,9 +321,7 @@ class CoordinatorService:
                             return stopped
             if execution_id is None:
                 request_id = uuid.uuid4().hex
-                row = store.execution({"session": {"id": session_id}}, request_id, spec)
-                row.update(phase="queued", admitted=True, user=user)
-                store.save_execution(row)
+                row = store.admit_execution(session_id, request_id, spec, user=user)
                 execution_id = row["id"]
                 created = True
         if wait is None:

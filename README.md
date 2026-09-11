@@ -17,6 +17,12 @@ Conflicting native identities require an explicit context. This does not bind
 sources, discover machines, or allocate devices; ordinary code review needs no
 task client.
 
+`client.finish()` closes a task that has never admitted managed work directly
+in the local registry, without starting or importing the coordinator service
+or remote-dev. Local close and execution admission share one database write
+transaction boundary: if close wins, submission is rejected; if admission wins,
+finish delegates to the coordinator for owned-execution cleanup.
+
 A configured existing user container can prepare a task without selecting an
 image recipe again. Creating a container still requires an explicit recipe.
 Preparation checks source/image build compatibility before installing vLLM.

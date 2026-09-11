@@ -139,6 +139,9 @@ class TaskClient:
                                         **({"refresh": False} if action == "status" and not refresh else {}))
 
     def finish(self, force=False):
+        local = self.store.close_if_unmanaged(self.context["session"]["id"], user=self.user, force=force)
+        if local is not None:
+            return local
         return self.coordinator.finish(str(self.store.state_dir), self.user,
                                        self.context["session"]["id"], force=force)
 
