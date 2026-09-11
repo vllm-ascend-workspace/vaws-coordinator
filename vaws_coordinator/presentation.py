@@ -6,9 +6,9 @@ from pathlib import Path
 
 EXECUTION_KEYS = ("execution_id", "state", "service", "error", "error_ref", "reason", "progress",
                   "observed_at", "cancel_requested", "service_port", "provisioning_started",
-                  "worktrees_preserved", "resources_released", "stdout", "stderr")
+                  "worktrees_preserved", "resources_released", "stdout", "stderr", "observation_freshness")
 ROLE_KEYS = ("name", "state", "runtime_id", "host", "root", "service_port", "error", "lease_state",
-             "quiet", "descendants_drained", "stdout", "stderr")
+             "quiet", "descendants_drained", "stdout", "stderr", "status_observed_at")
 
 
 def execution_summary(value: dict, *, target=False) -> dict:

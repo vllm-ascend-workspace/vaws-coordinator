@@ -91,7 +91,7 @@ class TaskClient:
             return reply["target"]
         raise ValueError("execution has no runtime binding; no guessed target")
 
-    def observe(self, execution_id, action="status", force=False, role=None):
+    def observe(self, execution_id, action="status", force=False, role=None, refresh=True):
         self._require_execution_id(execution_id)
         if action == "target":
             target = self.target(execution_id)
@@ -102,7 +102,8 @@ class TaskClient:
                                                  action="target", force=force, role=role)
             return reply
         return self.coordinator.advance(str(self.store.state_dir), self.user, execution_id,
-                                        action=action, force=force, role=role)
+                                        action=action, force=force, role=role,
+                                        **({"refresh": False} if action == "status" and not refresh else {}))
 
     def finish(self, force=False):
         return self.coordinator.finish(str(self.store.state_dir), self.user,
