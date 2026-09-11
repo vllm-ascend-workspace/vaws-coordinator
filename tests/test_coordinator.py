@@ -452,6 +452,24 @@ class PoolTests(unittest.TestCase):
                                        {"vllm": "a" * 40, "vllm-ascend": "b" * 40},
                                        "native-a", [device], 0, "exec python task.py", {}, 60)
 
+    def test_managed_launch_injects_and_retains_verified_observation(self):
+        binding = self.bind("alice", self.root / "a")
+        prepared = []
+        original = self.backend.job
+        def capture(runtime, job_id, action, **params):
+            if action == "prepare":
+                prepared.append(params["spec"])
+            return original(runtime, job_id, action, **params)
+        with mock.patch.object(self.backend, "job", side_effect=capture):
+            job = self.managed("alice", binding)
+        receipt = json.loads(prepared[0]["env"]["VAWS_EXECUTION_OBSERVATION"])
+        self.assertEqual(receipt, job["launch_observation"])
+        self.assertEqual(receipt["workspace_snapshot"]["vllm_commit"], "a" * 40)
+        self.assertEqual(receipt["native_digest"]["build_key"], "native-a")
+        self.pool.managed_control("alice", job["id"], "stop")
+        ended = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(ended["launch_observation"], receipt)
+
     def test_managed_gate_renew_restart_and_stop_one_preserves_peer(self):
         a, b = self.bind("alice", self.root / "a"), self.bind("bob", self.root / "b")
         first, second = self.managed("alice", a), self.managed("bob", b, 1)
@@ -628,13 +646,16 @@ class PoolTests(unittest.TestCase):
             self.pool.reconcile("admin", job["id"], "already terminal")
         self.assertEqual(self.pool.return_runtime("alice", binding["id"])["status"], "returned")
 
-    def test_task_worktrees_can_change_only_between_returned_bindings(self):
+    def test_task_worktree_rebind_returns_idle_roots_but_preserves_live_work(self):
         binding = self.bind("alice", self.root / "a")
-        with self.assertRaisesRegex(ValueError, "return task runtimes"):
+        job = self.managed("alice", binding)
+        with self.assertRaisesRegex(ValueError, "resolve/release"):
             self.pool.session_open("alice", "same-session-name", {"va": str(self.root / "new/worktree")})
-        self.pool.return_runtime("alice", binding["id"])
+        self.pool.managed_control("alice", job["id"], "stop")
+        self.pool.managed_control("alice", job["id"])
         result = self.pool.session_open("alice", "same-session-name", {"va": str(self.root / "new/worktree")})
         self.assertEqual(result["id"], binding["intent"]["session"])
+        self.assertEqual(self.pool.status("alice")["bindings"][0]["state"], "returned")
 
     def test_drain_waits_for_existing_managed_job_and_disables_automatic_reuse(self):
         binding = self.bind("alice", self.root / "a")
@@ -1307,7 +1328,7 @@ class TaskClientTests(unittest.TestCase):
             syncs.append(threading.current_thread().name)
             if len(syncs) == 1:
                 started.set()
-                self.assertTrue(release.wait(3))
+                self.assertTrue(release.wait(30))
             return original(*args, **kwargs)
 
         self.client.coordinator.sync_binding = blocked
@@ -1318,12 +1339,15 @@ class TaskClientTests(unittest.TestCase):
 
         worker = threading.Thread(target=run_first)
         worker.start()
-        self.assertTrue(started.wait(3))
-        second = self.client.run("sleep 1")
-        self.assertEqual(second["state"], "waiting")
-        self.assertEqual(len(syncs), 1)
-        release.set()
-        worker.join(5)
+        try:
+            self.assertTrue(started.wait(30))
+            second = self.client.run("sleep 1")
+            self.assertEqual(second["state"], "waiting")
+            self.assertEqual(len(syncs), 1)
+        finally:
+            release.set()
+            worker.join(60)
+        self.assertFalse(worker.is_alive(), "materialization worker must finish before fixture cleanup")
         self.assertEqual(first["reply"]["state"], "running")
 
     def test_restart_does_not_overlap_while_stop_is_stopping(self):

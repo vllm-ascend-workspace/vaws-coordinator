@@ -6,10 +6,12 @@ process receipts; RuntimePool owns checkouts; the host owns physical NPU leases.
 from __future__ import annotations
 
 import re
+import json
 import shlex
 from pathlib import PurePosixPath
 
 from vaws_coordinator.runtime_profile import digest
+from vaws_coordinator.launch_observation import ENV_NAME, launch_observation
 
 JOB_TERMINAL = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
 LEASE_TERMINAL = {"released", "cancelled", "expired"}
@@ -38,7 +40,7 @@ class ManagedExecution:
             raise ValueError("a bounded nonempty shell command is required")
         if not isinstance(env, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
                                            or key.startswith("REMOTE_DEV_JOB_")
-                                           or key in {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON"}
+                                           or key in {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON", ENV_NAME}
                                            or not isinstance(value, str) for key, value in env.items()):
             raise ValueError("invalid environment or attempted override of managed device or service-port ownership")
         if timeout_seconds is not None and (type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 86400):
@@ -166,6 +168,8 @@ class ManagedExecution:
                 if run["state"] == "granted":
                     run = self.control(job["owner"], key, "preflight", _managed=True)
                 if run["state"] == "starting":
+                    receipt = launch_observation(binding, job["request"], job["spec"], run["environment"])
+                    job["launch_observation"] = receipt
                     command = task_preamble(binding)
                     command += ("\nexport ASCEND_RT_VISIBLE_DEVICES="
                                 + shlex.quote(run["environment"]["ASCEND_RT_VISIBLE_DEVICES"]))
@@ -173,7 +177,8 @@ class ManagedExecution:
                         command += "\nexport VAWS_SERVICE_PORT=" + shlex.quote(run["environment"]["VAWS_SERVICE_PORT"])
                     command += "\n" + job["spec"]["command"]
                     specification = {**job["spec"], "command": command, "cwd": binding["endpoint"]["cwd"],
-                                     "env": {**job["spec"]["env"], **run["environment"]}}
+                                     "env": {**job["spec"]["env"], **run["environment"],
+                                             ENV_NAME: json.dumps(receipt, sort_keys=True)}}
                     job["service_port"] = run.get("service_port")
                     observed = self.backend.job(runtime, job["job_id"], "prepare", spec=specification)
                     job["remote"] = observed

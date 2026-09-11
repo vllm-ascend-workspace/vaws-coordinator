@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 SUPPORTED_RECIPES = {"rc", "main", "stable", "local-latest"}
-RESERVED_ENV = {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON"}
+RESERVED_ENV = {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON", "VAWS_EXECUTION_OBSERVATION"}
 
 
 def validate_user_env(env: dict[str, Any] | None) -> dict[str, str]:

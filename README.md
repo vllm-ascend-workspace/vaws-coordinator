@@ -3,8 +3,34 @@
 Local-process coordinator for one user's remote Ascend containers and host NPU
 allocation. It is not a hosted multi-user service.
 
-Install it, run it on the machine you are sitting at, and it talks to *your*
-remote containers through the `vaws-remote-dev` package. Code identity is git.
+Consumer agents access it on the local machine; it operates the user's remote
+containers through `vaws-remote-dev`. Code identity is git. The API owns runtime
+preparation, lifecycle transitions and resource release; callers provide the
+business command and constraints.
+
+## Agent references and recorded launch facts
+
+`vaws_execution` accepts exactly one `execution_id` or task-scoped `service`.
+The Python equivalent is `client.observe(service="model", action="status")`.
+An absent service returns `state: not_found` without contacting a runtime.
+An ambiguous live service requires an execution reference. Lookup never joins
+another task or allocates resources.
+
+Library workflows can use `client.wait(execution_id, until="running")` or
+`until="released"`, with a bounded `timeout_seconds`. A timeout returns the
+last observation with `wait_timed_out: true`; a release wait requires confirmed
+termination and resource release. Changing bound business worktree paths
+returns idle runtime bindings internally before preparing the next code state;
+live execution leases still prevent that transition.
+
+Managed launch injects `VAWS_EXECUTION_OBSERVATION` and retains the same receipt
+as `target.launch_observation`. It records the source snapshots, attested
+environment/native build identity, physical host, allocated devices and actual
+command. User environment values are represented by a digest. The variable is
+reserved and cannot be supplied by callers. The receipt survives termination
+and later binding refreshes; it proves what was verified at launch, not a later
+inspection of runtime mutations. Workload collectors add their actual model,
+topology and input parameters; missing facts remain unknown.
 
 ## Status observations
 

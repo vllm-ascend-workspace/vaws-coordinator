@@ -19,7 +19,7 @@ LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws
 TOOL_DESCRIPTIONS = {
     "vaws.session": "Inspect this native session's VAWS task and bind actual business worktrees. Local only: no machine is required. Use the context_file supplied by the session hook.",
     "vaws.run": "Run a business command on this task's isolated root in the user container. Pass environment/resource/topology needs; do not pass request IDs, profile hashes, or runtime IDs. The coordinator places, prepares, launches and recovers.",
-    "vaws.execution": "Observe, tail, stop or read the launch target of one execution belonging to this VAWS task. Stop releases that execution's devices and ports; the container and task root remain.",
+    "vaws.execution": "Observe, tail, stop or read the launch target by execution_id or task-scoped service name belonging to this VAWS task. Stop releases that execution's devices and ports; the container and task root remain.",
     "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
 }
 
@@ -45,9 +45,13 @@ TOOL_SCHEMAS = {
         "service": {"type": ["string", "null"], "description": "Task-scoped service name; reconnects a live service with this name"},
         "restart": {"type": "boolean", "description": "Replace a live named service, including one with the same spec"},
     }, ("command",)),
-    "vaws.execution": task_schema({"execution_id": {"type": "string"}, "action": {"type": "string", "enum": ["status", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name for per-role target or tail"}}, ("execution_id",)),
+    "vaws.execution": task_schema({"execution_id": {"type": "string"}, "service": {"type": "string", "description": "Task-scoped service name, mutually exclusive with execution_id"}, "action": {"type": "string", "enum": ["status", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name for per-role target or tail"}}),
     "vaws.finish": task_schema({"force": {"type": "boolean"}}),
 }
+TOOL_SCHEMAS["vaws.execution"]["oneOf"] = [
+    {"required": ["execution_id"], "not": {"required": ["service"]}},
+    {"required": ["service"], "not": {"required": ["execution_id"]}},
+]
 
 
 def vaws_call(name, args):
@@ -69,8 +73,9 @@ def vaws_call(name, args):
             value = client.run(**{key: args[key] for key in keys if key in args})
             status = value["state"]
         elif name == "vaws.execution":
-            value = client.observe(args["execution_id"], args.get("action", "status"),
-                                   args.get("force", False), role=args.get("role"), refresh=bool(args.get("refresh")))
+            value = client.observe(args.get("execution_id"), args.get("action", "status"),
+                                   args.get("force", False), role=args.get("role"), refresh=bool(args.get("refresh")),
+                                   **({"service": args["service"]} if "service" in args else {}))
             status = value["state"]
         elif name == "vaws.finish":
             value = client.finish(args.get("force", False))
