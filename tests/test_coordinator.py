@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1895,7 +1896,7 @@ class ProfileTests(unittest.TestCase):
             import os, subprocess
             profile["launch_env"]["PYTHONPATH"] = "/scoped/source"
             script = "export PYTHONPATH=/base/acl:/base/native-compat\n" + launch_preamble(profile) + '\nprintf "%s" "$PYTHONPATH"'
-            result = subprocess.run(["bash", "-s"], input=script.encode("utf-8"), check=True,
+            result = subprocess.run([shutil.which("bash") or "bash", "-s"], input=script.encode("utf-8"), check=True,
                                     capture_output=True,
                                     env={**os.environ, "PYTHONPATH": "/base/acl:/base/native-compat"}).stdout.decode("utf-8")
             self.assertEqual(result, "/scoped/source:/base/acl:/base/native-compat")
