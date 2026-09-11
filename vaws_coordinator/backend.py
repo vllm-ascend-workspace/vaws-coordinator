@@ -57,17 +57,15 @@ class RemoteBackend:
         return control(resolve_endpoint(endpoint), job_id, action, **parameters)
 
     def preflight(self, binding, command, env):
-        from vaws_coordinator.managed_execution import ExecutionRequestError
-        exports = {**(binding.get("launch_env") or {}), **env,
-                   "VAWS_PYTHON": binding["python"], "VAWS_SERVICE_PORT": "0"}
-        script = "set -e\n" + (binding.get("launch_preamble") or "") + "\n"
-        script += "\n".join(f"export {key}={shlex.quote(value)}" for key, value in exports.items())
-        script += "\n" + command
+        from vaws_coordinator.managed_execution import ExecutionRequestError, task_preamble
+        script = "set -e\n" + "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
+        script += "\n" + task_preamble(binding) + "\nexport VAWS_SERVICE_PORT=0\n" + command
         result = self.shell.run(binding["endpoint"], script, timeout_ms=120000)
         if result["outcome"] != "success":
             refs = result.get("refs") or {}
             detail = Path(refs["stderr"]).read_text(errors="replace") if refs.get("stderr") else str(result)
-            raise ExecutionRequestError(f"preflight failed before NPU allocation: {detail}\nlog refs: {refs}")
+            cause = detail.strip().splitlines()[-1][-300:] if detail.strip() else result.get("summary", "no stderr")
+            raise ExecutionRequestError(f"preflight failed before NPU allocation: {cause}\nlog refs: {refs}")
 
     def job_host_pid(self, runtime, receipt):
         code = '''

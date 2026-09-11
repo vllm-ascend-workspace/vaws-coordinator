@@ -889,6 +889,13 @@ class PoolTests(unittest.TestCase):
             env={**os.environ, **prepared["env"]}, text=True,
         )
         self.assertEqual(json.loads(output), ["bound-vllm", "bound-ascend", "kept-support"])
+        from vaws_coordinator.backend import RemoteBackend
+
+        shell = FakeShell({"outcome": "success"})
+        RemoteBackend(shell=shell).preflight(binding, shlex.join([sys.executable, "-c", code]), {})
+        target, command, _ = shell.calls[-1]
+        output = subprocess.check_output(["bash", "-c", command], cwd=target["cwd"], text=True)
+        self.assertEqual(json.loads(output), ["bound-vllm", "bound-ascend", "kept-support"])
 
     def test_two_roots_in_one_container_run_concurrently_and_stop_is_scoped(self):
         second_root = self.pool.register("runtime-a2", runtime_spec(2, user="alice", python="/opt/alice/venvs/root-2/bin/python"))
