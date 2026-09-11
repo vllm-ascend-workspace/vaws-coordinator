@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 WORKSPACE_ID_PATTERN = re.compile(r'[^A-Za-z0-9._-]+')
@@ -85,7 +85,7 @@ def run(
             env=env,
             check=False,
             capture_output=capture_output,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
@@ -348,7 +348,7 @@ def ssh_exec_stream(
 def ssh_stream_to_file(endpoint: SshEndpoint, remote_path: str, payload: str) -> None:
     from remote_dev.core.ssh_transport import run_bytes
 
-    script = f'mkdir -p {quoted(str(Path(remote_path).parent))} && cat > {quoted(remote_path)}'
+    script = f'mkdir -p {quoted(str(PurePosixPath(remote_path).parent))} && cat > {quoted(remote_path)}'
     result = run_bytes(_remote_endpoint(endpoint), script, stdin=payload.encode('utf-8'))
     stdout = (result.stdout or b'').decode('utf-8', errors='replace')
     stderr = (result.stderr or b'').decode('utf-8', errors='replace')
@@ -362,7 +362,7 @@ def ssh_stream_bytes_to_file(endpoint: SshEndpoint, remote_path: str, payload: b
     from remote_dev.core.ssh_transport import run_bytes
 
     script = (
-        f'mkdir -p {quoted(str(Path(remote_path).parent))} && '
+        f'mkdir -p {quoted(str(PurePosixPath(remote_path).parent))} && '
         f'head -c {len(payload)} > {quoted(remote_path)}'
     )
     result = run_bytes(_remote_endpoint(endpoint), script, stdin=payload)

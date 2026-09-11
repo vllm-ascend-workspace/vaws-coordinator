@@ -111,7 +111,7 @@ evidence_dir = root / ".vaws-runtime/profile-evidence"
 evidence_dir.mkdir(parents=True, exist_ok=True)
 result = subprocess.run(
     [sys.executable, "-c", "import torch_npu, vllm, vllm_ascend, acl; import vllm_ascend.vllm_ascend_C"],
-    capture_output=True, text=True, timeout=30,
+    capture_output=True, text=True, encoding="utf-8", timeout=30,
 )
 smoke = {"passed": result.returncode == 0, "profile_key": profile_key(profile),
          "stdout": result.stdout[-4000:], "stderr": result.stderr[-8000:]}
@@ -135,13 +135,13 @@ print(json.dumps(manifest))
 def require_clean_sources(root: Path):
     for name in ("vllm", "vllm-ascend"):
         for node in iter_postorder(discover_repo_tree(root / name, name)):
-            dirty = subprocess.check_output(["git", "-C", str(node.repo_path), "status", "--porcelain", "--untracked-files=all"], text=True)
+            dirty = subprocess.check_output(["git", "-C", str(node.repo_path), "status", "--porcelain", "--untracked-files=all"], text=True, encoding="utf-8")
             if dirty.strip():
                 raise ValueError("attest a clean materialized parity snapshot, including child submodules")
             for child in node.children:
                 path = child.repo_path.relative_to(node.repo_path).as_posix()
-                head = subprocess.check_output(["git", "-C", str(child.repo_path), "rev-parse", "HEAD"], text=True).strip()
-                entry = subprocess.check_output(["git", "-C", str(node.repo_path), "ls-tree", "HEAD", "--", path], text=True).strip()
+                head = subprocess.check_output(["git", "-C", str(child.repo_path), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
+                entry = subprocess.check_output(["git", "-C", str(node.repo_path), "ls-tree", "HEAD", "--", path], text=True, encoding="utf-8").strip()
                 if entry != f"160000 commit {head}\t{path}":
                     raise ValueError("native submodule must be tracked at its pinned commit: " + child.relpath)
 
@@ -161,7 +161,7 @@ def attest(root: Path, spec: dict):
         environment[name] = value + (":" + environment[name] if name in {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH"} and environment.get(name) else "")
     try:
         smoke = subprocess.run([sys.executable, "-c", "import torch_npu, vllm, vllm_ascend, acl; import vllm_ascend.vllm_ascend_C"], env=environment,
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, encoding="utf-8", timeout=60)
     except subprocess.TimeoutExpired as exc:
         stderr = exc.stderr or ""
         if isinstance(stderr, bytes):

@@ -270,7 +270,7 @@ class ParityCommandTests(unittest.TestCase):
         self.assertIn("vllm=/tmp/vllm", command)
         self.assertIn("vllm-ascend=/tmp/vllm-ascend", command)
         self.assertIn("--workspace-root", command)
-        self.assertEqual(command[command.index("--workspace-root") + 1], "/tmp/workspace")
+        self.assertEqual(command[command.index("--workspace-root") + 1], str(Path("/tmp/workspace")))
         without_root = materialize_command(
             workspace_id="ws", runtime_id="rt",
             endpoint={"host": "h", "port": 22, "user": "root", "root": "/vllm-workspace"},

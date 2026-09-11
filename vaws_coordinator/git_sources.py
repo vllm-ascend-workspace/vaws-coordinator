@@ -31,7 +31,7 @@ class RepoNode:
 
 def git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo), *args], check=check,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8")
 
 
 def is_git_worktree(path: Path) -> bool:

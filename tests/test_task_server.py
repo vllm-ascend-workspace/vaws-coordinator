@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.metadata import version
 from pathlib import Path
@@ -15,6 +16,7 @@ from vaws_coordinator import task_server
 from vaws_coordinator.agent_session import AgentSessions
 from vaws_coordinator.host_queue import SCHEMA_VERSION
 from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS
+from vaws_coordinator.service import CoordinatorClient, socket_path, _lock_daemon
 from vaws_coordinator.task_server import (
     ALIASES,
     SERVICE_NAME,
@@ -33,6 +35,33 @@ def clean_environment(**extra):
     environment = {key: value for key, value in os.environ.items() if key not in LEAKY}
     environment.update(extra)
     return environment
+
+
+def stop_test_daemon(root):
+    """Stop only the daemon belonging to this test before removing its files."""
+    state = root / "coordinator"
+    if not socket_path(state).exists():
+        return
+    client = CoordinatorClient(state, timeout=5)
+    pid = client.call("ping")["runtime"][0]["loaded"]["pid"]
+    assert client.call("restart_if_idle")["status"] == "stopping"
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if not socket_path(state).exists():
+            if os.name == "nt":
+                from test_windows_service import pid_alive
+                if pid_alive(pid):
+                    time.sleep(0.05)
+                    continue
+            try:
+                with (state / "coordinator.lock").open("a+b") as guard:
+                    _lock_daemon(guard)
+                    _lock_daemon(guard, release=True)
+                return
+            except OSError:
+                pass
+        time.sleep(0.05)
+    raise AssertionError("test daemon did not release its state directory")
 
 
 class TaskRegistry:
@@ -105,6 +134,7 @@ class DispatchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.addCleanup(stop_test_daemon, self.root)
         self.registry = TaskRegistry(self.root)
         patcher = mock.patch.dict("os.environ", clean_environment(), clear=True)
         patcher.start()
@@ -251,6 +281,7 @@ class LiveStdioTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.registry = TaskRegistry(Path(self.temp.name))
+        self.addCleanup(stop_test_daemon, Path(self.temp.name))
         self.env = clean_environment()
 
     def session(self, framed):

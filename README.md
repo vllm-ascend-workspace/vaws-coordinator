@@ -127,7 +127,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@c24a64a55e877904c9d539de4544ade0cc76cbac"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@9120004fd30967c38b35965af7d2b0cbae9a6809"
 uv pip install pytest
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
@@ -136,6 +136,15 @@ uv pip install -e . --no-deps
 `uv venv` is the first command so an unreadable project config fails
 before install. Do not add `[tool.uv.sources]` for remote-dev: that table
 travels to consumers. Requires Python 3.11+.
+
+On native Windows, run the same setup commands and use
+`.venv/Scripts/python.exe -m pytest tests`. The local daemon uses a locked state
+directory and token-authenticated IPv4 loopback IPC; its listener is never bound
+to an external interface. Native CLI pipes and Git output use UTF-8. Source
+publication preserves Linux path syntax independently of the client platform.
+The tests that emulate a Linux peer need a working Bash. If the Windows `bash`
+alias points at an unconfigured WSL installation, prepend Git for Windows'
+`bin` directory to the test process's `PATH`, as the Windows CI job does.
 
 ## Progress, records, and loaded versions
 

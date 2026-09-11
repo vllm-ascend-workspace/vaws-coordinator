@@ -9,6 +9,8 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
+    from vaws_coordinator._stdio import configure_stdio
+    configure_stdio()
     parser = argparse.ArgumentParser(
         prog="vaws-coordinator",
         description="Local VAWS coordinator: persistent environment, task isolation and resource placement.",
