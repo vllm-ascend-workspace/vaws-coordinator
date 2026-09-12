@@ -132,6 +132,29 @@ def test_container_timeout_is_an_unknown_host_reply():
     assert export_existing_objects(request(), run)['status'] == 'uncertain'
 
 
+def test_local_snapshot_hints_are_bounded_and_exclude_other_repo_refs(monkeypatch):
+    lines = ['f' * 40 + ' refs/vaws/inputs/current/project',
+             'e' * 40 + ' refs/vaws/inputs/current/project-scm']
+    for index in range(100):
+        oid = f'{index:040x}'
+        lines.extend([oid + f' refs/vaws/inputs/source-{index}/project',
+                      oid + f' refs/parity-transport/owner/{index}/project'])
+    monkeypatch.setattr(parity, 'git', lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout='\n'.join(lines)))
+    hints = parity._local_snapshot_bases(SimpleNamespace(source_path='unused', repo_id='project', commit='f' * 40))
+    assert len(hints) == len(set(hints)) == 64
+    assert 'f' * 40 not in hints and 'e' * 40 not in hints
+
+
+@pytest.mark.parametrize('failure', [PermissionError('unreadable local refs'),
+                                     subprocess.TimeoutExpired('for-each-ref', 10)])
+def test_optional_local_hints_do_not_gate_fixed_inputs(monkeypatch, failure):
+    def unavailable(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(parity, 'git', unavailable)
+    assert parity._local_snapshot_bases(SimpleNamespace(source_path='unused', repo_id='project', commit='f' * 40)) == []
+
+
 @pytest.mark.parametrize('reply, error', [
     ({'status': 'cancelled'}, PreparationCancelled),
     ({'status': 'failed', 'remote_outcome': 'unknown'}, PreparationUncertain),

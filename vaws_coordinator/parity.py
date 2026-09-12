@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -171,9 +172,11 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
     if host_endpoint is not None or shared_cache_root is not None:
         shared = validate_absolute_posix_path(shared_cache_root or SHARED_SOURCE_CACHE,
                                              label='shared source cache')
-        for row, record in zip(request['records'], records):
-            row['repo_id'] = record.repo_id
-            row['shared_mirror'] = str(PurePosixPath(shared) / (record.repo_id + '.git'))
+        with ThreadPoolExecutor(max_workers=min(4, len(records))) as pool:
+            for row, record, bases in zip(request['records'], records, pool.map(_local_snapshot_bases, records)):
+                row['repo_id'] = record.repo_id
+                row['shared_mirror'] = str(PurePosixPath(shared) / (record.repo_id + '.git'))
+                row['local_bases'] = bases
     def command():
         program = (inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(_materialize_fixed)
                    + '\nimport json\nresult = _materialize_fixed(' + repr(request) + ')\n')
@@ -319,6 +322,32 @@ def _fixed_inline_pack(repo, commit, carrier, previous, *, limit=65536):
         data = output.read()
     return {'previous': previous, 'carrier': carrier, 'bytes': len(data),
             'sha256': hashlib.sha256(data).hexdigest(), 'data': base64.b64encode(data).decode('ascii')}
+
+
+def _local_snapshot_bases(record, *, limit=64):
+    """Bounded local membership hints, never source selection or authority.
+
+    Retained input/transport refs include parentless snapshots that an ordinary
+    ancestor walk misses. Missing local history simply leaves the Git fallback.
+    """
+    try:
+        refs = git(Path(record.source_path), ['for-each-ref', '--count=256', '--sort=-refname',
+            '--format=%(objectname) %(refname)', 'refs/vaws/inputs', 'refs/parity-transport', 'refs/parity'],
+            check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if refs.returncode:
+        return []
+    result = []
+    for line in refs.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) == 2 and parts[1].endswith('/' + record.repo_id)
+                and re.fullmatch(r'[0-9a-f]{40,64}', parts[0])
+                and parts[0] != record.commit and parts[0] not in result):
+            result.append(parts[0])
+            if len(result) == limit:
+                break
+    return result
 
 
 PYTHON_METADATA_PREAMBLE = (

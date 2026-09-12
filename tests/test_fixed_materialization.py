@@ -143,7 +143,9 @@ def test_cold_owner_small_edit_uses_shared_fixed_base_without_full_push(peer, tm
     assert git(private, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
 
 
-def test_disconnected_snapshots_pack_only_the_cpp_edit_for_a_new_owner(peer, tmp_path, monkeypatch):
+@pytest.mark.parametrize('foreign_snapshot', [False, True])
+def test_disconnected_snapshots_pack_only_the_cpp_edit_for_a_new_owner(peer, tmp_path, monkeypatch,
+                                                                     foreign_snapshot):
     import random
     # Unchanged data must exceed the inline limit. A tiny repository can send
     # its entire tree and accidentally make the delta test appear successful.
@@ -154,7 +156,10 @@ def test_disconnected_snapshots_pack_only_the_cpp_edit_for_a_new_owner(peer, tmp
     git(peer.source, 'commit', '-qm', 'baseline input')
     def fixed_record():
         record = make_record(peer.source, 'project')
-        commit = git(peer.source, 'commit-tree', record.tree, '-m', 'fixed tree snapshot')
+        commit = subprocess.check_output(['git', '-C', str(peer.source), 'commit-tree', record.tree,
+            '-m', 'fixed tree snapshot'], text=True,
+            env={**os.environ, 'GIT_AUTHOR_DATE': '1970-01-01T00:00:00Z',
+                 'GIT_COMMITTER_DATE': '1970-01-01T00:00:00Z'}).strip()
         assert 'parent ' not in git(peer.source, 'cat-file', '-p', commit)
         return replace(record, commit=commit, ref='refs/inputs/' + commit)
     first = fixed_record()
@@ -162,9 +167,33 @@ def test_disconnected_snapshots_pack_only_the_cpp_edit_for_a_new_owner(peer, tmp
     peer.run([first], shared_cache=shared)
     donor = parity.mirror_path_for(str(peer.cache), 'test', first)
     donor_refs = git(donor, 'show-ref')
+    if foreign_snapshot:
+        from vaws_coordinator.shared_source_objects import copy_fixed_objects
+        foreign = tmp_path / 'independent-source'
+        git(tmp_path, 'clone', '--local', str(peer.source), str(foreign))
+        (foreign / 'marker.py').write_text("marker = 'another source copy'\n")
+        git(foreign, 'add', '.')
+        foreign_tree = git(foreign, 'write-tree')
+        unknown = subprocess.check_output(['git', '-C', str(foreign), 'commit-tree', foreign_tree,
+            '-m', 'independent parentless marker'], text=True,
+            env={**os.environ, 'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.invalid',
+                 'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.invalid',
+                 'GIT_AUTHOR_DATE': '1970-01-01T00:00:01Z',
+                 'GIT_COMMITTER_DATE': '1970-01-01T00:00:01Z'}).strip()
+        copy_fixed_objects(foreign, Path(shared) / 'project.git', {'commit': unknown, 'tree': foreign_tree})
+        assert 'parent ' not in git(foreign, 'cat-file', '-p', unknown)
+        assert parity.git(peer.source, ['cat-file', '-e', unknown], check=False).returncode
+        assert git(Path(shared) / 'project.git', 'for-each-ref', '--count=1', '--sort=-creatordate',
+                   '--format=%(objectname)', 'refs/vaws/snapshots/') == unknown
+        # Keep the older fixed input ref, without a local transport association
+        # for this recipient. A different source copy must not hide that base.
+        git(peer.source, 'update-ref', 'refs/vaws/inputs/old-source/project', first.commit)
+        for ref in git(peer.source, 'for-each-ref', '--format=%(refname)', 'refs/parity-transport').splitlines():
+            git(peer.source, 'update-ref', '-d', ref)
     cpp.write_text('int Operator(int recipient_op) { return recipient_op + 1; }\n')
     git(peer.source, 'commit', '-am', 'one operator variable edit')
     second = fixed_record()
+    assert first.commit in parity._local_snapshot_bases(second)
     assert parity._fixed_inline_pack(peer.source, second.commit, second.commit, first.commit) is None
     packs = []
     original = parity._fixed_inline_pack
