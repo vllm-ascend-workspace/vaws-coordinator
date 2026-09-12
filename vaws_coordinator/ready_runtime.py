@@ -609,7 +609,11 @@ class RuntimePool(ManagedExecution):
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run["submitted"] = True
                     with self.lock, self.transaction() as db:
+                        previous = self.get(db, "run", run_id)
                         self.put(db, "run", run)
+                        if admission_reply is not None and previous["state"] != run["state"]:
+                            self.event(db, owner, "run-state", run=run_id,
+                                       state=run["state"], error=run.get("error"))
                 if run["state"] in TERMINAL:
                     reply = {"task": run.get("task", {"state": run["state"]})}
                 elif action == "poll":

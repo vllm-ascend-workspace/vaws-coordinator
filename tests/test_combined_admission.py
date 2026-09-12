@@ -38,6 +38,9 @@ def test_native_admission_persists_epoch_then_uses_one_mutating_exchange(case):
     run = case.request('alice', binding)
     assert run['state'] == 'granted'
     assert [action for kind, action in case.backend.calls if kind == 'host'] == ['status', 'submit-acquire']
+    events = [item for item in case.pool.events('alice')['events']
+              if item.get('kind') == 'run-state' and item.get('run') == run['id']]
+    assert [item['state'] for item in events] == ['granted']
 
 
 def test_lost_combined_reply_reconciles_same_grant_without_repeating_submission(case):
