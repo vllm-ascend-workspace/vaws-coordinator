@@ -34,10 +34,10 @@ from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMIN
 from vaws_coordinator.parity import materialize_command
 from vaws_coordinator.parity_support import RemoteCommandError
 from vaws_coordinator.placement import (
-    SUPPORTED_RECIPES,
     can_prepare,
     distinct_hosts_required,
     host_key,
+    provisionable_recipe,
     role_plan,
     runtime_matches,
 )
@@ -801,7 +801,7 @@ class CoordinatorService(TaskMessages):
 
     def _ensure_user_container(self, user, environment, role, used_hosts, require_distinct=False):
         recipe = environment.get("recipe") or environment.get("image")
-        if recipe and recipe not in SUPPORTED_RECIPES:
+        if recipe and not provisionable_recipe(recipe):
             return None
         wanted_host = str(role["host"]) if role.get("host") else None
         for record in self._configured_machines():

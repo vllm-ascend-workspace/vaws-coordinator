@@ -24,7 +24,9 @@ transaction boundary: if close wins, submission is rejected; if admission wins,
 finish delegates to the coordinator for owned-execution cleanup.
 
 A configured existing user container can prepare a task without selecting an
-image recipe again. Creating a container still requires an explicit recipe.
+image recipe again. Creating a container requires an explicit recipe or a
+concrete image tag/digest, supplied in the same run's `environment.image`.
+No separate provisioning call is required for a first run at a fixed version.
 Preparation checks source/image build compatibility before installing vLLM.
 A completed failing preparation command ends that execution with its diagnostic
 log; an unavailable SSH transport remains uncertain. Correct the configuration

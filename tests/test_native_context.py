@@ -290,3 +290,36 @@ def test_existing_user_container_needs_no_image_selection():
     record["container"] = {}
     assert service._ensure_user_container("alice", {}, {}, set()) is None
     service.backend.host.assert_not_called()
+
+
+@pytest.mark.parametrize("image", ["registry.example/ascend:v1.2.3", "registry.example/ascend@sha256:" + "a" * 64])
+def test_first_run_can_provision_an_explicit_fixed_image(image, monkeypatch):
+    from vaws_coordinator import provision
+    from vaws_coordinator.service import CoordinatorService
+    service = object.__new__(CoordinatorService)
+    service.backend = Mock()
+    record = {"host": {"ip": "192.0.2.10", "machine_type": "A3"},
+              "container": {"name": "vaws-donor", "ssh_port": 2201}, "user": "donor"}
+    service._configured_machines = lambda: [record]
+    create = Mock(return_value={"ssh_port": 2202})
+    monkeypatch.setattr(provision, "provision_user_container", create)
+    donor = service._ensure_user_container("recipient", {"image": image}, {"host": "192.0.2.10"}, set())
+    assert donor["recipe"] == image
+    assert donor["container_name"] == "vaws-recipient"
+    assert donor["ssh_port"] == 2202
+    assert create.call_args.kwargs["image"] == image
+    assert create.call_args.kwargs["user"] == "recipient"
+    assert record["container"]["name"] == "vaws-donor"
+
+
+@pytest.mark.parametrize("image", ["typo", "registry.example/ascend", "registry.example/ascend:latest", "auto"])
+def test_first_run_does_not_provision_implicit_or_unsupported_images(image, monkeypatch):
+    from vaws_coordinator import provision
+    from vaws_coordinator.service import CoordinatorService
+    service = object.__new__(CoordinatorService)
+    service.backend = Mock()
+    service._configured_machines = lambda: [{"host": {"ip": "192.0.2.10"}}]
+    create = Mock()
+    monkeypatch.setattr(provision, "provision_user_container", create)
+    assert service._ensure_user_container("recipient", {"image": image}, {}, set()) is None
+    create.assert_not_called()
