@@ -540,6 +540,7 @@ class RuntimePool(ManagedExecution):
                 )
             try:
                 pending_status = None
+                admission_reply = None
                 if run["state"] == "uncertain":
                     # A previous timed-out action may have succeeded. Recover by
                     # observing its exact task; never submit a replacement.
@@ -595,7 +596,14 @@ class RuntimePool(ManagedExecution):
                     if intent.get("service_port") is not None:
                         submit["service_port"] = intent["service_port"]
                         submit["service_ports"] = runtime.get("service_ports", [])
-                    reply = self.backend.host(runtime, submit)
+                    combined = getattr(self.backend, "submit_and_acquire", None)
+                    if callable(combined):
+                        # The epoch and exact task ID were persisted before
+                        # this potentially mutating exchange. A lost reply
+                        # follows normal uncertain-task reconciliation.
+                        reply = admission_reply = combined(runtime, submit)
+                    else:
+                        reply = self.backend.host(runtime, submit)
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run["submitted"] = True
                     with self.lock, self.transaction() as db:
@@ -603,7 +611,9 @@ class RuntimePool(ManagedExecution):
                 if run["state"] in TERMINAL:
                     reply = {"task": run.get("task", {"state": run["state"]})}
                 elif action == "poll":
-                    if run["state"] == "queued":
+                    if admission_reply is not None:
+                        reply = admission_reply
+                    elif run["state"] == "queued":
                         reply = self.backend.host(runtime, {**request, "action": "acquire"})
                     else:
                         status = self.backend.host(runtime, {**request, "action": "status", "no_probe": False})
