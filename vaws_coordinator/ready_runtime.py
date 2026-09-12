@@ -152,6 +152,16 @@ class RuntimePool(ManagedExecution):
 
     def register(self, runtime_id: str, spec: dict[str, Any]):
         """Adopt a prepared work root in the caller's fixed user container."""
+        return self._register(runtime_id, spec)
+
+    def _register_checkout(self, runtime_id, spec, owner, session, request_id):
+        """Bind a freshly prepared managed root using its registration probe."""
+        safe_id(request_id)
+        if spec["user"] != owner or spec.get("reuse_only"):
+            raise PermissionError("managed preparation must bind the owner's execution root")
+        return self._register(runtime_id, spec, checkout=(owner, session, request_id))
+
+    def _register(self, runtime_id, spec, *, checkout=None):
         safe_id(runtime_id)
         reuse_only = spec.get('reuse_only', False)
         if type(reuse_only) is not bool:
@@ -186,8 +196,24 @@ class RuntimePool(ManagedExecution):
             raise ValueError("service_ports must contain distinct TCP ports")
         if spec["endpoint"]["port"] in ports or spec["host_endpoint"]["port"] in ports:
             raise ValueError("service ports cannot overlap SSH endpoints")
-        with self._entity_lock("runtime", runtime_id):
+        key = digest([checkout[0], checkout[2]]) if checkout else None
+        checkout_lock = self._entity_lock("checkout", key) if checkout else contextlib.nullcontext()
+        # Match checkout's lock order. Registration and binding share one
+        # probe and one commit; no ready intermediate state is published.
+        with checkout_lock, self._entity_lock("runtime", runtime_id):
             with self.lock, self.transaction() as db:
+                if checkout:
+                    owner, session, _ = checkout
+                    self.owned(db, "session", session, owner)
+                    previous = next((item for item in self.rows(db, "binding") if item["id"] == key), None)
+                    if previous:
+                        runtime = self.get(db, "runtime", previous["runtime_id"])
+                        if (previous["intent"]["session"] != session or previous["runtime_id"] != runtime_id
+                                or any(runtime.get(name) != value for name, value in spec.items())):
+                            raise ValueError("request id reused with different checkout parameters")
+                        if previous["state"] != "bound" or runtime["state"] != "bound":
+                            raise ValueError("this checkout request id belongs to a returned binding; use a new request id")
+                        return {**runtime, "binding": previous}
                 self._check_registration(db, runtime_id, spec)
             # The probe runs outside the global lock; conflicts are re-checked
             # against fresh state before committing. Sibling roots in the same
@@ -197,10 +223,32 @@ class RuntimePool(ManagedExecution):
                 self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
                                           "container_name": container_name, "port": spec["endpoint"]["port"]})
             row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed, "draining": False}
+            binding = self._checkout_row(owner, session, key, row, observed) if checkout else None
             with self.lock, self.transaction() as db:
                 self._check_registration(db, runtime_id, spec, container_id=observed.get("container_id"))
+                if binding:
+                    self.owned(db, "session", session, owner)
+                    row["state"] = "bound"
+                    self.put(db, "binding", binding)
+                    self.event(db, owner, "runtime-bound", binding=key, runtime=runtime_id)
                 self.put(db, "runtime", row)
-            return row
+            return {**row, "binding": binding} if binding else row
+
+    def _checkout_row(self, owner, session, key, runtime, observed, *, requested_runtime=None):
+        profile_key = observed["profile_key"]
+        return {"id": key, "owner": owner,
+                "intent": {"session": session, "profile_key": profile_key,
+                           "runtime_id": runtime["id"] if requested_runtime is None else requested_runtime},
+                "runtime_id": runtime["id"], "state": "bound", "endpoint": runtime["endpoint"],
+                "host_endpoint": runtime["host_endpoint"], "user": runtime["user"], "python": runtime["python"],
+                "container_name": runtime["container_name"], "container_id": observed.get("container_id"),
+                "profile_key": profile_key, "build_key": observed["build_key"],
+                "service_ports": runtime["service_ports"],
+                "environment": {"VAWS_ENVIRONMENT_FINGERPRINT": profile_key},
+                "build_env": observed["profile"].get("build_env", {}),
+                "launch_env": observed["profile"]["launch_env"],
+                "source_names": sorted(self.owned_source_names(owner, session)),
+                "launch_preamble": observed.get("launch_preamble", "")}
 
     def _check_registration(self, db, runtime_id: str, spec: dict[str, Any], container_id: str | None = None):
         ports = set(spec["service_ports"])
@@ -271,19 +319,7 @@ class RuntimePool(ManagedExecution):
                                 latest["error"] = str(exc)[:500]
                                 self.put(db, "runtime", latest)
                         continue
-                    row = {"id": key, "owner": owner, "intent": intent, "runtime_id": runtime["id"],
-                           "state": "bound", "endpoint": runtime["endpoint"],
-                           "host_endpoint": runtime["host_endpoint"],
-                           "user": runtime["user"], "python": runtime["python"],
-                           "container_name": runtime["container_name"],
-                           "container_id": observed.get("container_id"),
-                           "profile_key": profile_key, "build_key": observed["build_key"],
-                           "service_ports": runtime["service_ports"],
-                           "environment": {"VAWS_ENVIRONMENT_FINGERPRINT": profile_key},
-                           "build_env": observed["profile"].get("build_env", {}),
-                           "launch_env": observed["profile"]["launch_env"],
-                           "source_names": sorted(self.owned_source_names(owner, session)),
-                           "launch_preamble": observed.get("launch_preamble", "")}
+                    row = self._checkout_row(owner, session, key, runtime, observed, requested_runtime=runtime_id)
                     with self.lock, self.transaction() as db:
                         # Re-validate after the lock-free probe: a concurrent
                         # drain/return/re-register must win over this snapshot.

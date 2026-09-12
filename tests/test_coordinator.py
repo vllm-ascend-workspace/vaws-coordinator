@@ -303,6 +303,56 @@ class PoolTests(unittest.TestCase):
     def request(self, owner, binding, **extra):
         return self.pool.request_run(owner, binding["id"], "request", {"vllm": "a" * 40, "vllm-ascend": "b" * 40}, "native-a", [0], 0, **extra)
 
+    def test_managed_registration_binds_atomically_and_replays_one_probe(self):
+        session = self.pool.session_open("alice", "prepared-session", {})
+        spec = runtime_spec(3)
+        self.backend.calls.clear()
+        with ThreadPoolExecutor(2) as workers:
+            results = list(workers.map(lambda _: self.pool._register_checkout(
+                "prepared", spec, "alice", session["id"], "prepared-request"), range(2)))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0]["state"], "bound")
+        self.assertEqual(sum(kind == "inspect" for kind, _ in self.backend.calls), 1)
+        self.assertEqual(self.pool.session_bindings("alice", session["id"]), [results[0]["binding"]])
+        restarted = RuntimePool(self.root / "manager", self.backend)
+        self.assertEqual(restarted._register_checkout(
+            "prepared", spec, "alice", session["id"], "prepared-request"), results[0])
+        with self.assertRaisesRegex(ValueError, "different checkout"):
+            self.pool._register_checkout("prepared", {**spec, "python": "/different/python"},
+                                         "alice", session["id"], "prepared-request")
+        self.pool.return_runtime("alice", results[0]["binding"]["id"])
+        with self.assertRaisesRegex(ValueError, "returned binding"):
+            self.pool._register_checkout("prepared", spec, "alice", session["id"], "prepared-request")
+
+    def test_managed_registration_does_not_publish_unverified_or_half_bound_root(self):
+        session = self.pool.session_open("alice", "prepared-session", {})
+        original = self.backend.inspect
+        def probe(*args, **kwargs):
+            self.assertFalse(any(row["runtime_id"] == "prepared" for row in self.pool.catalog()))
+            self.assertEqual(self.pool.session_bindings("alice", session["id"]), [])
+            return original(*args, **kwargs)
+        with mock.patch.object(self.backend, "inspect", side_effect=probe), \
+             mock.patch.object(self.backend, "host", side_effect=TimeoutError("reservation failed")):
+            with self.assertRaisesRegex(TimeoutError, "reservation failed"):
+                self.pool._register_checkout("prepared", runtime_spec(3), "alice", session["id"], "prepared-request")
+        self.assertFalse(any(row["runtime_id"] == "prepared" for row in self.pool.catalog()))
+        self.assertEqual(self.pool.session_bindings("alice", session["id"]), [])
+
+    def test_managed_binding_keeps_request_and_post_queue_drift_checks(self):
+        session = self.pool.session_open("alice", "prepared-session", {})
+        binding = self.pool._register_checkout(
+            "prepared", runtime_spec(3), "alice", session["id"], "prepared-request")["binding"]
+        original = copy.deepcopy(self.backend.attestation)
+        self.backend.attestation["build_key"] = "drifted"
+        with self.assertRaisesRegex(ValueError, "changed"):
+            self.pool.request_run("alice", binding["id"], "request", {}, "native-a", [], 0)
+        self.backend.attestation = original
+        run = self.pool.request_run("alice", binding["id"], "request", {}, "native-a", [], 0)
+        self.backend.attestation["build_key"] = "changed-after-queue"
+        failed = self.pool.control("alice", run["id"], "preflight")
+        self.assertEqual(failed["state"], "uncertain")
+        self.assertIn("changed before launch", failed["error"])
+
     def test_two_management_roots_share_one_runtime_and_card_authority(self):
         with ThreadPoolExecutor(2) as workers:
             a, b = list(workers.map(lambda args: self.bind(*args), [("alice", self.root / "clone-a"), ("bob", self.root / "linked-b")]))
@@ -1595,6 +1645,48 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(session["state"], "finished")
         self.assertEqual(self.pool.session_bindings("alice", remote), [])
         self.assertEqual(len(self.pool.status("alice")["jobs"]), 0)
+
+    def test_cancelled_preparation_persists_first_binding_and_finish_recovers_write_gap(self):
+        service = self.client.coordinator
+        original = service._prepare_role
+        prepared = []
+        def prepare(store, user, row, role, environment, donor):
+            result = original(store, user, row, role, environment, donor)
+            persisted = store.executions(row["session_id"])[0]
+            self.assertEqual(persisted["prepared_bindings"][role["name"]], result["binding"])
+            prepared.append(role["name"])
+            persisted["cancel_requested"] = True
+            store.save_execution(persisted)
+            return result
+        with mock.patch.object(service, "_prepare_role", side_effect=prepare):
+            reply = self.client.run("true", sources={}, topology={"roles": [
+                {"name": "first", "npu_count": 0}, {"name": "second", "npu_count": 0}]})
+        self.assertEqual(reply["state"], "cancelled")
+        self.assertEqual(len(prepared), 1)
+        row = self.store.executions(self.context["session"]["id"])[0]
+        remote = row["remote_session"]["id"]
+        self.assertEqual(len(self.pool.session_bindings("alice", remote)), 1)
+        self.assertEqual(self.pool.status("alice")["jobs"], [])
+        # Simulate losing the local role save after the pool committed its
+        # atomic binding. The already persisted execution session owns it.
+        row.pop("prepared_bindings")
+        self.store.save_execution(row)
+        from vaws_coordinator.service import CoordinatorService
+        restarted = CoordinatorService(service.state_dir, pool=self.pool, backend=self.backend)
+        result = restarted.finish(str(self.store.state_dir), "alice", self.context["session"]["id"])
+        self.assertEqual(result["state"], "finished")
+        self.assertEqual(self.pool.session_bindings("alice", remote), [])
+
+    def test_recovered_preparation_reuses_its_binding_without_replacing_sources(self):
+        from vaws_coordinator.provision import prepare_task_environment
+        with mock.patch("vaws_coordinator.provision.prepare_task_environment", wraps=prepare_task_environment) as prepare:
+            reply = self.client.run("true", sources={}, resources={"npu_count": 0})
+        self.assertEqual(reply["state"], "running")
+        row = self.store.executions(self.context["session"]["id"])[0]
+        with mock.patch.object(self.backend, "prepare_task_root", side_effect=AssertionError("must not prepare again")), \
+             mock.patch.object(self.backend, "inspect", side_effect=AssertionError("bound replay must not reprobe")):
+            recovered = prepare_task_environment(*prepare.call_args.args, **prepare.call_args.kwargs)
+        self.assertEqual(recovered["binding"], row["roles"][0]["binding"])
 
     def test_same_host_roles_keep_separate_roots_and_literal_env(self):
         self._seed(self.pool, "runtime-a2", runtime_spec(2, user="alice", recipe="rc"))
