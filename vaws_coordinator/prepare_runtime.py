@@ -135,6 +135,7 @@ else:
     if not smoke['passed']:
         (evidence_dir / 'smoke.json').write_text(json.dumps(smoke, indent=2) + '\n')
         raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
+smoke['source_mapping'] = native_source_mapping(root)
 (evidence_dir / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
 (evidence_dir / "cann.json").write_text(json.dumps(profile["system_files"]["cann"], sort_keys=True) + "\n")
 (evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
@@ -145,13 +146,18 @@ if reuse:
     evidence['reuse'] = '.vaws-runtime/reuse.json'
 manifest = capture(root, profile, inputs, files, evidence)
 manifest['preparation'] = verified_preparation(args.get('preparation', {}), profile)
+manifest['execution_view'] = {'source_id': args.get('source_id'), 'python': sys.executable}
 verify(root, manifest)
 marker = root / ".vaws-runtime/ready-profile.json"
 temp = marker.with_suffix(".tmp")
 temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 os.replace(temp, marker)
-print(json.dumps({'manifest': str(marker), 'profile_key': manifest['profile_key'],
-                  'build_key': manifest['build_key']}))
+# Preserve the complete verified bytes while avoiding repetitive path/JSON
+# overhead in stdout collection. Publication and its proof have one reply.
+import base64, zlib
+encoded_manifest = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
+print(json.dumps({'manifest_zlib_base64': base64.b64encode(zlib.compress(encoded_manifest)).decode('ascii'),
+                  'manifest_bytes': len(encoded_manifest), 'manifest_digest': digest(manifest)}))
 '''
 
 

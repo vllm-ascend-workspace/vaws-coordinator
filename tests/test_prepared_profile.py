@@ -1,5 +1,6 @@
 """Installed-artifact and environment boundaries for automatic attestation."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,8 +91,10 @@ class PreparedProfileTests(unittest.TestCase):
         backend = RemoteBackend()
         spec = {"python": "/owned root/.venv/bin/python", "endpoint": {"root": "/owned root"},
                 "host_endpoint": {}, "container_name": "test"}
-        with mock.patch.object(backend, "bash", side_effect=['"sha256:test"', "{}\n"]) as bash:
-            backend._write_ready_profile(spec, {"recipe": "test"})
+        info = {"Id": "container", "Image": "sha256:test", "State": {"Running": True}}
+        with mock.patch.object(backend, "bash", side_effect=[json.dumps(info), "{}\n"]) as bash:
+            with self.assertRaisesRegex(ValueError, 'invalid captured manifest'):
+                backend._write_ready_profile(spec, {"recipe": "test"})
         command = bash.call_args_list[1].args[1]
         self.assertIn("/etc/profile.d/vaws-ascend-env.sh", command)
         self.assertLess(command.index("/etc/profile.d/vaws-ascend-env.sh"),

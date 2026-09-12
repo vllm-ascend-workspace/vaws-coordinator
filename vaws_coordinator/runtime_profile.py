@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import sysconfig
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -363,8 +364,18 @@ def native_source_mapping(root: Path) -> dict[str, str]:
             raise ValueError('module mapping escaped the execution source view: ' + name)
         result[name] = str(Path(spec.origin).resolve())
         dist = importlib.metadata.distribution(source)
-        metadata_root = root / '.vaws-runtime/metadata'
-        if Path(dist.locate_file('')).resolve() != metadata_root:
+        metadata_roots = {root / '.vaws-runtime/metadata'}
+        # A fresh editable build owns its venv; a copied view instead owns an
+        # overlay and may run under its donor's interpreter. Never accept a
+        # sibling/donor site-packages directory as this execution's metadata.
+        if Path(sys.prefix).resolve() == root / '.venv':
+            # Editable installs may expose their generated .egg-info through
+            # the package's own source directory ahead of venv site-packages.
+            metadata_roots.add(root / source)
+            purelib = Path(sysconfig.get_paths()['purelib']).resolve()
+            if purelib.is_relative_to(root / '.venv'):
+                metadata_roots.add(purelib)
+        if Path(dist.locate_file('')).resolve() not in metadata_roots:
             raise ValueError('distribution metadata escaped the execution source view: ' + source)
         result[source + '_version'] = dist.version
     extension = importlib.machinery.PathFinder.find_spec(

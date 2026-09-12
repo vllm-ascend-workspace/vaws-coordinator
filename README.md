@@ -217,6 +217,14 @@ native-view publication: outputs are copied and checked against the existing
 hashes, source/SCM mappings are updated, and the original import proof is carried
 forward. Its completed receipt goes directly into an atomic managed binding.
 There is no second profile capture, full registration probe, or SSH reservation.
+Fresh native builds and shared/incremental restores also hand their completed
+capture directly to managed registration. The capture still runs the required
+import, hashes the full bundle, verifies its environment and atomically writes
+the marker; its compressed reply retains every file identity. The handoff checks
+the exact execution root, interpreter, source identity and observed image and
+container, and waits for any owned cache store and cancellation check. Launch
+still verifies current container, environment, source mapping and pinned Git
+inputs before admission.
 Before launch, coordinator checks the container, environment version facts,
 current source mappings and fixed Git inputs; it does not rehash all native
 outputs in its private execution view. Initial builds, changed native or

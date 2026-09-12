@@ -7,9 +7,12 @@ the single device-allocation authority. Generic process control is
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import shlex
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,13 +21,33 @@ from remote_dev.core.shell_ops import remote_bash
 
 from vaws_coordinator.host_queue import HostQueue
 from vaws_coordinator.machine_directory import MachineDirectory
-from vaws_coordinator.runtime_profile import digest, launch_preamble, native_compatibility_key
+from vaws_coordinator.runtime_profile import build_key, digest, launch_preamble, native_compatibility_key, profile_key
 
 
 @dataclass(frozen=True)
 class PreparedNativeView:
-    """Internal completed-publication handoff, never a registration argument."""
+    """Internal completed native proof, never a registration argument."""
     attestation: dict
+
+
+def _captured_manifest(output: str) -> dict:
+    """Decode a bounded complete capture receipt, never a preview or a subset."""
+    limit = 16 * 1024 * 1024
+    reply = json.loads(output)
+    size = reply.get('manifest_bytes')
+    encoded = reply.get('manifest_zlib_base64')
+    if (type(size) is not int or not 0 < size <= limit or not isinstance(encoded, str)
+            or len(encoded) > limit * 2):
+        raise ValueError('invalid captured manifest size or encoding')
+    compressed = base64.b64decode(encoded, validate=True)
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(compressed, size + 1)
+    if len(raw) != size or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+        raise ValueError('captured manifest is truncated or exceeds its declared size')
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or digest(manifest) != reply.get('manifest_digest'):
+        raise ValueError('captured manifest digest differs')
+    return manifest
 
 
 def _package_file(relative: str) -> Path:
@@ -577,19 +600,23 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         check_cancel()
         log = progress("verify-profile")
         try:
-            self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
-                                      process=owned_process("verify-profile"), log_path=log)
+            captured = self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
+                                                process=owned_process("verify-profile"), log_path=log)
         except (PreparationCancelled, PreparationUncertain):
             raise
         except Exception as exc:
             if incremental_native or not cached_native:
                 raise
             rebuild(exc)
-            self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
-                                      process=owned_process("verify-profile"), log_path=log)
+            captured = self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
+                                                process=owned_process("verify-profile"), log_path=log)
+        check_cancel()
         if compiled_native:
             progress('shared-native-cache', self._shared_native(spec, 'store', versions, process=owned_process('shared-native-store')))
-        # Registration performs the full container/profile/source attestation.
+        check_cancel()
+        if native_recipe and captured is not None:
+            return PreparedNativeView(captured)
+        # Legacy adapters and command roots retain their registration probe.
 
     def _shared_native(self, spec, action, versions, *, process=None, candidate=None):
         """One bounded automatic cache lookup/copy; no other user's runtime."""
@@ -702,16 +729,19 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         root = spec["endpoint"]["root"]
         host = {**spec["host_endpoint"], "root": "/", "cwd": "/"}
         name = shlex.quote(spec["container_name"])
-        digest = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
-        if not digest:
+        fields = shlex.quote('{"Id":{{json .Id}},"Image":{{json .Image}},"State":{{json .State}}}')
+        info = json.loads(self.bash(host, f"docker inspect --format {fields} {name}"))
+        if not info.get('Id') or not info.get('Image'):
             raise ValueError("cannot attest image digest")
+        if not info['State']['Running'] or info['State'].get('Paused') or info['State'].get('Restarting'):
+            raise ValueError('capture container is not running normally')
         recipe = (environment or {}).get("recipe") or (environment or {}).get("image") or spec.get("recipe")
         module = _package_file("runtime_profile.py").read_text()
         build_source = _package_file("build_inputs.py").read_text()
         request = json.dumps({
             "root": root,
             "recipe": recipe,
-            "image_digest": digest,
+            "image_digest": info['Image'],
             "machine_type": (environment or {}).get("machine_type") or spec.get("machine_type"),
             "cann_files": list(CANN_VERSION_CANDIDATES),
             "driver_files": list(DRIVER_VERSION_CANDIDATES),
@@ -740,9 +770,29 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         command = (preamble + "\n" + shlex.quote(python) + " - " + shlex.quote(request)
                    + " <<'VAWS_CAPTURE_PROBE'\n" + module + runner + "\nVAWS_CAPTURE_PROBE\n")
         if process is None:
-            self.bash(spec["endpoint"], command)
+            output = self.bash(spec["endpoint"], command)
         else:
             from vaws_coordinator.parity_support import SshEndpoint, ssh_exec_stream
             endpoint = spec["endpoint"]
-            ssh_exec_stream(SshEndpoint(endpoint["host"], int(endpoint["port"]), endpoint["user"]),
-                            command, stream_progress=False, process=process, log_path=log_path)
+            completed = ssh_exec_stream(SshEndpoint(endpoint["host"], int(endpoint["port"]), endpoint["user"]),
+                                        command, stream_progress=False, process=process, log_path=log_path)
+            output = completed.stdout
+        if native_recipe:
+            manifest = _captured_manifest(output)
+            source_id = spec.get('source_snapshot', {}).get('id')
+            files, evidence = manifest.get('files', {}), manifest.get('evidence', {})
+            if (manifest.get('schema_version') != 1 or not files
+                    or not {'library', 'metadata'}.issubset({row.get('role') for row in files.values()})
+                    or not {'cann', 'driver', 'smoke'}.issubset(evidence)
+                    or any(not re.fullmatch('[0-9a-f]{64}', str(row.get('sha256', '')))
+                           for row in [*files.values(), *evidence.values()])
+                    or manifest.get('profile_key') != profile_key(manifest['profile'])
+                    or manifest.get('build_key') != build_key(manifest['profile'], manifest['build_inputs'])):
+                raise ValueError('capture did not return a complete native proof')
+            if (not source_id or manifest.get('execution_view', {}).get('source_id') != source_id
+                    or manifest.get('execution_view', {}).get('python') != python
+                    or manifest.get('runtime_root') != root
+                    or manifest.get('profile', {}).get('image_digest') != info['Image']):
+                raise ValueError('capture did not return this fixed execution view')
+            return {**manifest, 'container_id': info['Id'],
+                    'launch_preamble': launch_preamble(manifest['profile'], python=python)}
