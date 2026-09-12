@@ -87,6 +87,41 @@ def test_known_unavailable_donor_uses_another_candidate():
     assert calls == ['a' * 64, 'e' * 64] and result['diagnostics']
 
 
+@pytest.mark.parametrize('stdout', ['startup notice\n{}', '[]', '{}', '{"copied":null}',
+    '{"copied":[{}]}', '{"copied":["unexpected"]}', '{"copied":[],"diagnostics":{}}'])
+@pytest.mark.parametrize('second_valid', [False, True])
+def test_completed_invalid_donor_reply_keeps_other_candidates_and_git_fallback(stdout, second_valid):
+    calls = []
+    def run(args, **kwargs):
+        if args[1] == 'ps':
+            return SimpleNamespace(stdout='aaaa\nbbbb\n')
+        if args[1] == 'inspect':
+            return SimpleNamespace(stdout=json.dumps([container(), container('e')]))
+        calls.append(args[3])
+        output = json.dumps({'copied': ['c' * 40]}) if second_valid and len(calls) == 2 else stdout
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+    result = export_existing_objects(request(), run)
+    assert calls == ['a' * 64, 'e' * 64]
+    assert result['status'] == ('copied' if second_valid else 'miss')
+    assert result['copied'] == (['c' * 40] if second_valid else [])
+    assert result['diagnostics']
+
+
+@pytest.mark.parametrize('reply', [{'status': 'cancelled'}, {'status': 'uncertain'},
+                                 {'status': 'failed', 'remote_outcome': 'unknown'}])
+def test_uncertain_reply_is_not_downgraded_by_missing_copied_data(reply):
+    calls = []
+    def run(args, **kwargs):
+        if args[1] == 'ps':
+            return SimpleNamespace(stdout='aaaa\nbbbb\n')
+        if args[1] == 'inspect':
+            return SimpleNamespace(stdout=json.dumps([container(), container('e')]))
+        calls.append(args[3])
+        return SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr='')
+    assert export_existing_objects(request(), run) == reply
+    assert calls == ['a' * 64]
+
+
 def test_container_timeout_is_an_unknown_host_reply():
     def run(args, **kwargs):
         if args[1] == 'ps':

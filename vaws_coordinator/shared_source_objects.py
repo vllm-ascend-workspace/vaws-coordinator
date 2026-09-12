@@ -114,13 +114,27 @@ def export_existing_objects(request, run=None):
             print('fixed object donor unavailable: ' + reply.stderr[-2000:], file=sys.stderr, flush=True)
             diagnostics.append(reply.stderr[-2000:])
             continue
-        result = json.loads(reply.stdout)
-        if result.get('status') in {'uncertain', 'cancelled'}:
-            return result
-        diagnostics.extend(result.get('diagnostics', []))
-        found = result['copied']
-        if not isinstance(found, list) or any(commit not in {r['commit'] for r in pending} for commit in found):
-            raise ValueError('fixed object donor returned unexpected commits')
+        try:
+            result = json.loads(reply.stdout)
+            if not isinstance(result, dict):
+                raise ValueError('fixed object donor reply is not an object')
+            if result.get('status') in {'uncertain', 'cancelled'} or result.get('remote_outcome') == 'unknown':
+                return result
+            found = result.get('copied')
+            if (not isinstance(found, list) or any(not isinstance(commit, str) or
+                    commit not in {r['commit'] for r in pending} for commit in found)):
+                raise ValueError('fixed object donor returned unexpected commits')
+            reported = result.get('diagnostics', [])
+            if not isinstance(reported, list) or any(not isinstance(value, str) for value in reported):
+                raise ValueError('fixed object donor diagnostics are invalid')
+        except (ValueError, TypeError) as exc:
+            # This donor command has exited. An unusable optional cache reply
+            # must not discard other donors or block the normal Git upload.
+            message = 'fixed object donor reply unavailable: ' + str(exc)
+            print(message, file=sys.stderr, flush=True)
+            diagnostics.append(message[-2000:])
+            continue
+        diagnostics.extend(reported)
         copied.extend(found)
         pending = [row for row in pending if row['commit'] not in found]
         if not pending:
