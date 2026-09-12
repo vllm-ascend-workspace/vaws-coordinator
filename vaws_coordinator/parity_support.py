@@ -482,7 +482,7 @@ def _materialize_fixed(request):
             if json.loads(owner.read_text()) != expected_owner:
                 raise ValueError('fixed source root belongs to different inputs')
         else:
-            if any(path.name not in {'.vaws-runtime', '.venv'} for path in root.iterdir()):
+            if any(path.name not in {'.vaws-runtime', '.venv', '.remote-dev'} for path in root.iterdir()):
                 raise ValueError('fixed source root contains unowned files')
             atomic_json(owner, expected_owner)
         receipt = marker / 'source-materialization.json'

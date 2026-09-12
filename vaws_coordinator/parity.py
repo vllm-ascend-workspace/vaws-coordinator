@@ -142,7 +142,7 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
         relpath = validate_relative_posix_path(record.relpath, label='fixed source path')
         if relpath != record.relpath or relpath in seen or '\\' in relpath:
             raise ValueError('fixed source paths must be unique canonical POSIX paths')
-        if PurePosixPath(relpath).parts[0] in {'.vaws-runtime', '.venv', '.git'}:
+        if PurePosixPath(relpath).parts[0] in {'.vaws-runtime', '.venv', '.git', '.remote-dev'}:
             raise ValueError('fixed source path overlaps coordinator-owned runtime files')
         seen.add(relpath)
         if record.repo_id != sanitize_repo_id(relpath):

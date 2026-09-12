@@ -186,6 +186,11 @@ def test_owned_missing_and_materialize_use_distinct_durable_jobs(peer, monkeypat
         assert action == 'launch'
         assert saved[-1]['job_id'] == job_id and saved[-1]['state'] == 'pending'
         jobs.append(job_id)
+        # The real remote-dev worker persists its job before launching the
+        # command, including the first missing-object probe.
+        job_dir = Path(endpoint['root']) / '.remote-dev/jobs' / job_id
+        job_dir.mkdir(parents=True)
+        (job_dir / 'receipt.json').write_text(json.dumps({'job_id': job_id, 'owned': True}))
         script = kwargs['spec']['command']
         result = subprocess.run(['bash', '-s'], input=script, capture_output=True, text=True)
         return {'quiet': True, 'state': 'completed', 'result': {'exit_code': result.returncode},
@@ -202,6 +207,22 @@ def test_owned_missing_and_materialize_use_distinct_durable_jobs(peer, monkeypat
     assert result['status'] == 'materialized'
     assert len(jobs) == 2 and len(set(jobs)) == 2
     assert saved[-1]['quiet']
+    for job_id in jobs:
+        receipt = peer.root / '.remote-dev/jobs' / job_id / 'receipt.json'
+        assert json.loads(receipt.read_text()) == {'job_id': job_id, 'owned': True}
+
+
+@pytest.mark.parametrize('name', ['.remote-dev', '.remote-dev/nested', '.vaws-runtime', '.venv', '.git'])
+def test_sources_cannot_overlap_owned_runtime_directories(tmp_path, monkeypatch, name):
+    row = parity.SnapshotRecord(name, name.replace('/', '__'), 'a' * 40, None, 'a' * 40,
+                               'b' * 40, 'refs/input', [], [], source_path=str(tmp_path))
+    def unexpected(*args, **kwargs):
+        raise AssertionError('reserved source paths must fail before remote work')
+    monkeypatch.setattr(parity, 'ssh_exec_stream', unexpected)
+    with pytest.raises(ValueError, match='overlaps coordinator-owned runtime files'):
+        parity.materialize_fixed_sources(workspace_id='test',
+            endpoint={'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': '/isolated/run'},
+            source_snapshot=snapshot([row]))
 
 
 def test_preserves_environment_and_ignored_native_outputs(peer):
