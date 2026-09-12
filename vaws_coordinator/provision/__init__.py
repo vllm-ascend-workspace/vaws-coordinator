@@ -85,6 +85,7 @@ def provision_user_container(
         args=[json.dumps(image_request, ensure_ascii=False), host_ops.DEFAULT_PORT_RANGE, "vaws-"],
         timeout_seconds=host_ops.DEFAULT_PROBE_TIMEOUT_SECONDS,
         stream_progress=False,
+        reuse_connection=True,
     )
     probe_payload = host_ops.assert_remote_success(probe, require_payload=True)
     chosen_port = int(ssh_port or probe_payload.get("free_port") or probe_payload.get("suggested_port") or probe_payload.get("ssh_port")
@@ -121,6 +122,7 @@ def provision_user_container(
         args=[""],
         timeout_seconds=host_ops.DEFAULT_SMOKE_TIMEOUT_SECONDS,
         stream_progress=False,
+        reuse_connection=True,
     )
     host_ops.assert_remote_success(smoke, require_payload=True)
     return _record_ready_container(host, image, user, host_user, host_port,

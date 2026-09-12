@@ -939,6 +939,7 @@ def run_remote_script(
     batch_mode: bool = True,
     timeout_seconds: int | None = None,
     stream_progress: bool = True,
+    reuse_connection: bool = False,
 ) -> RemoteResult:
     if not batch_mode:
         raise MachineManagementError(
@@ -963,13 +964,28 @@ def run_remote_script(
                 emit_progress_event(event, target=target)
 
     try:
-        completed = run_stream(
-            endpoint,
-            remote_script,
-            timeout_ms=timeout_ms,
-            merge_stderr=False,
-            on_output=on_output,
-        )
+        if reuse_connection:
+            # Bounded package-owned probes use the same connection as managed
+            # preparation. Long bootstrap/install commands retain streaming.
+            from remote_dev.core.ssh_transport import run_rpc_script
+            endpoint = resolve_endpoint({'host': target.host, 'port': int(target.port),
+                                         'user': target.user, 'root': '/', 'cwd': '/'})
+            completed = run_rpc_script(endpoint, remote_script, timeout_ms=timeout_ms)
+            if completed.cancelled:
+                raise MachineManagementError('provision probe cancelled; no fallback command was sent')
+            if completed.returncode is None and not completed.timed_out:
+                raise MachineManagementError('provision probe outcome is unknown; no fallback command was sent')
+            for channel in ('stdout', 'stderr'):
+                for line in (getattr(completed, channel) or '').splitlines(keepends=True):
+                    on_output(channel, line)
+        else:
+            completed = run_stream(
+                endpoint,
+                remote_script,
+                timeout_ms=timeout_ms,
+                merge_stderr=False,
+                on_output=on_output,
+            )
     except FileNotFoundError as exc:
         raise MachineManagementError("required local command not found: ssh") from exc
 

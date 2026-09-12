@@ -156,6 +156,7 @@ def test_provision_uses_configured_user_with_shared_root_transport(tmp_path, mon
     assert boot.kwargs["args"][0] == "vaws-alice"
     assert boot.kwargs["args"][5] == "alice"
     assert boot.kwargs["args"][1] == '2222'
+    assert [call.kwargs.get('reuse_connection', False) for call in calls.call_args_list] == [True, False, True]
     assert 'if not False:' in calls.call_args_list[2].args[1]
     assert calls.call_args_list[2].args[0].user == "root"
     assert directory.upsert_machine.call_args.args[0]["user"] == "alice"
