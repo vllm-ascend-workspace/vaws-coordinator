@@ -8,6 +8,50 @@ containers through `vaws-remote-dev`. Code identity is git. The API owns runtime
 preparation, lifecycle transitions and resource release; callers provide the
 business command and constraints.
 
+## Quick start
+
+Use the existing `vaws_run` / `vaws_execution` MCP tools when available.
+Python callers can use the same task API below. The complete short example
+and its semantics are also available in one local command:
+`python -m vaws_coordinator.vaws --help` (or `help(TaskClient)` in Python).
+
+```python
+from vaws_coordinator.task_client import TaskClient
+
+client = TaskClient("/local/task-context.json")
+run = client.run(
+    '"$VAWS_PYTHON" -c "import torch_npu; print(1)"',
+    sources={"vllm": "/local/vllm", "vllm-ascend": "/local/vllm-ascend"},
+    resources={"devices": [0]},
+    topology={"host": "npu-host"},
+)
+execution_id = run["execution_id"]
+status = client.wait(execution_id, until="released", timeout_seconds=30)
+print(status["state"], status["resources_released"])
+log = client.observe(execution_id, action="tail")
+print(log.get("tail", ""))
+```
+
+Replace the paths and host with your task's inputs. Use the native attachment's
+supplied `context_file`, or `TaskClient()` to resolve `VAWS_CONTEXT_FILE` / the
+actual native task context. No separate session or attach call is needed.
+`sources` captures edits from local Git worktrees; their names become remote
+subdirectories on `PYTHONPATH`. The command runs in that execution root and
+`VAWS_PYTHON` selects its prepared interpreter. Omitted sources use task defaults;
+`sources={}` runs without source dependencies. Resources default to no NPU;
+use `npu_count` for available devices or `devices` with `topology.host` for
+specific physical devices. Explicit sharing of one physical NPU adds
+`allow_external_busy=True` to resources; other managed leases still conflict.
+
+`run` returns after admission. A released result confirms termination and
+resource release; business success also requires `state == "succeeded"`.
+If a bounded wait returns `wait_timed_out=True`, inspect its facts and wait on
+the same id again as needed; that timeout does not stop or resubmit the work.
+Tail replies include `tail` and separate `stdout` / `stderr`. For progress use
+`observe(execution_id, refresh=False)`; to stop it use `action="stop"` and wait
+for release. `finish()` closes the entire task and stops its owned executions;
+completed runs release their resources without a per-run finish call.
+
 ## Agent references and recorded launch facts
 
 `TaskClient()` uses an explicit context or `VAWS_CONTEXT_FILE` first. Local
