@@ -608,6 +608,8 @@ class RuntimePool(ManagedExecution):
                         reply = self.backend.host(runtime, submit)
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run["submitted"] = True
+                    if admission_reply is not None:
+                        run.pop("error", None)
                     with self.lock, self.transaction() as db:
                         previous = self.get(db, "run", run_id)
                         self.put(db, "run", run)
