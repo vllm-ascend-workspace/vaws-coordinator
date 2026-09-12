@@ -254,7 +254,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@862e9ae4ab5e4bb8252a99cfee8629dbfeeb2597"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@2de5cc32c5f3dd517e698cadfb1f9ed23589b1aa"
 uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
@@ -308,6 +308,14 @@ final HEAD and dirty-state checks across parent repositories and submodules.
 Uncertain jobs are observed, never replayed. Runtime compatibility, native
 build checks and resource allocation still run. Host coordination uses the
 remote-dev Python RPC code cache, sending only the request after the first call.
+
+Short root preparation reuses that endpoint's Python RPC connection; owned
+preparation jobs wait for exit within their bounded polling interval instead
+of returning early merely because output arrived. First admission persists
+the observed host epoch before submitting and acquiring in one host exchange.
+Container identity and compact source/environment verification run concurrently
+within the same preflight; both must finish successfully before host preflight.
+They are not cached across queue waits.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;

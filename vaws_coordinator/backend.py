@@ -63,6 +63,10 @@ class RemoteBackend:
         endpoint = dict(runtime["endpoint"])
         return control(resolve_endpoint(endpoint), job_id, action, **parameters)
 
+    def submit_and_acquire(self, runtime, request):
+        """Use the already persisted epoch for one host admission exchange."""
+        return self.host(runtime, {**request, "action": "submit-acquire"})
+
     def preflight(self, binding, command, env):
         from vaws_coordinator.managed_execution import ExecutionRequestError, task_preamble
         script = "set -e\n" + "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
@@ -104,6 +108,14 @@ print(json.dumps({'pid':matches[0]}))
         request = {"container_name": runtime["container_name"], "container_id": runtime["attestation"]["container_id"], "receipt": receipt}
         command = "python3 - " + shlex.quote(json.dumps(request)) + " <<'VAWS_HOST_PID'\n" + code + "\nVAWS_HOST_PID\n"
         return json.loads(self.bash({**runtime["host_endpoint"], "root": "/", "cwd": "/"}, command))["pid"]
+
+    def activate_prepared(self, runtime, request, receipt):
+        """Map the supervisor identity and activate through one host authority call."""
+        return self.host(runtime, {**request, "action": "activate", "prepared_supervisor": {
+            "container_name": runtime["container_name"],
+            "container_id": runtime["attestation"]["container_id"],
+            "receipt": receipt,
+        }})
 
     def catalog(self):
         return self.machines.catalog()
@@ -178,19 +190,36 @@ print(json.dumps({'pid':matches[0]}))
             if self.inspect(runtime, snapshots=snapshots) != expected:
                 raise ValueError("runtime changed before launch")
             return True
-        info = self._inspect_container(runtime)
-        if info["Id"] != expected.get("container_id"):
-            raise ValueError("runtime container changed before launch")
         manifest = {key: value for key, value in expected.items()
                     if key not in {"container_id", "launch_preamble"}}
         if launch_preamble(manifest["profile"], python=runtime.get("python")) != expected.get("launch_preamble"):
             raise ValueError("runtime launch environment changed before launch")
         expected_digest = digest(manifest)
-        reply = self._inspect_manifest(runtime, snapshots=snapshots,
-                                       expected_digest=expected_digest,
-                                       prepared_view=runtime.get('prepared_native_view', False))
-        if reply != {"manifest_digest": expected_digest}:
-            raise ValueError("runtime verification returned no matching manifest digest")
+
+        def check_container():
+            info = self._inspect_container(runtime)
+            if info["Id"] != expected.get("container_id"):
+                raise ValueError("runtime container changed before launch")
+
+        def check_manifest():
+            reply = self._inspect_manifest(runtime, snapshots=snapshots,
+                                           expected_digest=expected_digest,
+                                           prepared_view=runtime.get('prepared_native_view', False))
+            if reply != {"manifest_digest": expected_digest}:
+                raise ValueError("runtime verification returned no matching manifest digest")
+
+        # These read-only observations have no data dependency. Keep both in
+        # this preflight (never across queue waits), and drain both operations
+        # before allowing host preflight or reporting any failure.
+        from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="vaws-preflight") as workers:
+            checks = [workers.submit(copy_context().run, check) for check in (check_container, check_manifest)]
+        errors = [check.exception() for check in checks if check.exception() is not None]
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("runtime preflight checks failed: " + "; ".join(map(str, errors)), errors)
         return True
 
     def _inspect_manifest(self, runtime, *, snapshots=None, expected_digest=None, prepared_view=False):
@@ -355,8 +384,34 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         for step, script in scripts:
             check_cancel()
             log = progress(step)
-            ssh_exec_stream(container, script, stream_progress=False, log_path=log,
-                            process=owned_process(step) if step != "prepare-root" else None)
+            if step == "prepare-root":
+                from remote_dev.core.ssh_transport import run_rpc_script
+                from vaws_coordinator.parity_support import RemoteCommandError
+
+                # A short package-owned filesystem command can establish the
+                # same RPC connection used by the subsequent owned job. The
+                # Python RPC does not require its endpoint root to exist yet.
+                try:
+                    completed = run_rpc_script(resolve_endpoint(endpoint), script, timeout_ms=45000)
+                except Exception as exc:
+                    if log:
+                        with Path(log).open('a', encoding='utf-8') as stream:
+                            stream.write(str(exc) + '\n')
+                    raise
+                if log:
+                    with Path(log).open('a', encoding='utf-8') as stream:
+                        stream.write((completed.stdout or '') + (completed.stderr or ''))
+                if completed.cancelled:
+                    from vaws_coordinator.preparation_process import PreparationCancelled
+                    raise PreparationCancelled('root preparation cancelled after its command stopped')
+                code = 255 if completed.timed_out or completed.returncode is None else completed.returncode
+                if code:
+                    raise RemoteCommandError(code, f'command failed ({code}): prepare-root\n'
+                        f'stdout:\n{completed.stdout or ""}\nstderr:\n{completed.stderr or ""}')
+            else:
+                ssh_exec_stream(container, script, stream_progress=False, log_path=log,
+                                process=owned_process(step))
+            check_cancel()
         identity = spec.get("container_name") or ("vaws-" + spec["user"])
         log = progress("materialize")
         if sources:

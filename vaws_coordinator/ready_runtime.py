@@ -520,11 +520,13 @@ class RuntimePool(ManagedExecution):
         temporary.replace(path)
 
     def control(self, owner: str, run_id: str, action: str, pid: int = 0, *, _managed=False,
-                process_guard=None, completion_confirmed=False):
+                process_guard=None, completion_confirmed=False, _prepared_receipt=None):
         if action not in {"poll", "preflight", "activate", "heartbeat", "release", "cancel"}:
             raise ValueError("unsupported execution action")
         if completion_confirmed and not _managed:
             raise ValueError("only managed supervision can confirm descendant completion")
+        if _prepared_receipt is not None and (not _managed or action != "activate"):
+            raise ValueError("only managed activation can use a prepared supervisor receipt")
         with self._entity_lock("run", run_id):
             with self.lock, self.transaction() as db:
                 run = self.owned(db, "run", run_id, owner)
@@ -540,6 +542,7 @@ class RuntimePool(ManagedExecution):
                 )
             try:
                 pending_status = None
+                admission_reply = None
                 if run["state"] == "uncertain":
                     # A previous timed-out action may have succeeded. Recover by
                     # observing its exact task; never submit a replacement.
@@ -595,7 +598,14 @@ class RuntimePool(ManagedExecution):
                     if intent.get("service_port") is not None:
                         submit["service_port"] = intent["service_port"]
                         submit["service_ports"] = runtime.get("service_ports", [])
-                    reply = self.backend.host(runtime, submit)
+                    combined = getattr(self.backend, "submit_and_acquire", None)
+                    if callable(combined):
+                        # The epoch and exact task ID were persisted before
+                        # this potentially mutating exchange. A lost reply
+                        # follows normal uncertain-task reconciliation.
+                        reply = admission_reply = combined(runtime, submit)
+                    else:
+                        reply = self.backend.host(runtime, submit)
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run["submitted"] = True
                     with self.lock, self.transaction() as db:
@@ -603,7 +613,9 @@ class RuntimePool(ManagedExecution):
                 if run["state"] in TERMINAL:
                     reply = {"task": run.get("task", {"state": run["state"]})}
                 elif action == "poll":
-                    if run["state"] == "queued":
+                    if admission_reply is not None:
+                        reply = admission_reply
+                    elif run["state"] == "queued":
                         reply = self.backend.host(runtime, {**request, "action": "acquire"})
                     else:
                         status = self.backend.host(runtime, {**request, "action": "status", "no_probe": False})
@@ -627,10 +639,21 @@ class RuntimePool(ManagedExecution):
                                 # this exact job after a restart too.
                                 run["preflight_error"] = str(exc)[:500]
                             raise
-                    reply = self.backend.host(runtime, {**request, "action": action,
+                    host_request = {**request, "action": action,
                               "fence_token": run.get("task", {}).get("fence_token"), "pid": pid,
                               **({"completion_confirmed": True} if action == "release" and completion_confirmed else {}),
-                              **({"process_guard": process_guard} if action == "activate" and process_guard else {})})
+                              **({"process_guard": process_guard} if action == "activate" and process_guard else {})}
+                    if action == "activate" and _prepared_receipt is not None:
+                        activate_prepared = getattr(self.backend, "activate_prepared", None)
+                        if callable(activate_prepared):
+                            reply = activate_prepared(runtime, host_request, _prepared_receipt)
+                        else:
+                            # Preserve explicit embedding backends that implement
+                            # the original separate PID resolver and host adapter.
+                            host_request["pid"] = self.backend.job_host_pid(runtime, _prepared_receipt)
+                            reply = self.backend.host(runtime, host_request)
+                    else:
+                        reply = self.backend.host(runtime, host_request)
                 if reply.get("task"):
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run.pop("error", None)

@@ -38,10 +38,12 @@ def test_receipt_saved_before_launch_and_progress_survives_split_chunks(monkeypa
             assert kwargs["authorization"] == {}
             assert kwargs["stdout_offset"] == kwargs["stderr_offset"] == 0
             assert kwargs["max_bytes"] == 32768 and kwargs["yield_time_ms"] == 1000
+            assert kwargs["wait_for_exit"] is True
         else:
             assert action == "exchange"
             assert saved[-1]["receipt"]["pid"] == 123
             assert kwargs["stdout_offset"] == 4 and kwargs["stderr_offset"] == 30
+            assert kwargs["wait_for_exit"] is True and kwargs["yield_time_ms"] == 1000
         return next(chunks)
     monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
     process = PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False)

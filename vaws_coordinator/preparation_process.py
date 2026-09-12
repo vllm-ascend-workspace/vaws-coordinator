@@ -72,9 +72,11 @@ class PreparationProcess:
                         pending[channel] = line
 
         def exchange(wait=1000):
+            # Keep the bounded yield/cancel cadence, but do not add a round
+            # trip just because final output arrived before the exit receipt.
             observation = control(self.endpoint, record["job_id"], "exchange",
                                   stdout_offset=record["stdout_offset"], stderr_offset=record["stderr_offset"],
-                                  max_bytes=32768, yield_time_ms=wait)
+                                  max_bytes=32768, yield_time_ms=wait, wait_for_exit=True)
             emit(observation)
             _remember(record, observation, self.save)
             return observation
@@ -84,7 +86,8 @@ class PreparationProcess:
                 "command": script, "cwd": self.endpoint["cwd"], "env": {},
                 "timeout_seconds": self.timeout_seconds, "interactive": False,
             }, authorization={}, stdout_offset=record["stdout_offset"],
-                stderr_offset=record["stderr_offset"], max_bytes=32768, yield_time_ms=1000)
+                stderr_offset=record["stderr_offset"], max_bytes=32768, yield_time_ms=1000,
+                wait_for_exit=True)
             emit(observation)
             _remember(record, observation, self.save)
             while True:
