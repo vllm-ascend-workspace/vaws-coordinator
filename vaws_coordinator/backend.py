@@ -455,6 +455,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         if sources:
             materialize_fixed_sources(
                 workspace_id=identity, endpoint=endpoint, source_snapshot=source_snapshot,
+                host_endpoint=spec['host_endpoint'],
                 log_path=log, process=owned_process("materialize"),
                 on_progress=lambda event: progress("materialize", event),
             )

@@ -118,7 +118,10 @@ def materialize_command(
 
 def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snapshot: dict,
                               log_path=None, process=None, on_progress=None,
-                              container_cache_root: str | None = None) -> dict:
+                              container_cache_root: str | None = None,
+                              host_endpoint: dict | None = None,
+                              shared_cache_root: str | None = None,
+                              native_publication=None) -> dict:
     """Materialize admitted inputs directly, without the public sync lifecycle.
 
     One completed remote operation pins available objects, checks out the exact
@@ -130,6 +133,7 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
     import inspect
     from vaws_coordinator.execution_sources import validate_source_snapshot
     from vaws_coordinator.parity_support import _materialize_fixed
+    from vaws_coordinator.shared_source_objects import SHARED_SOURCE_CACHE, copy_fixed_objects
 
     validate_source_snapshot(source_snapshot)
     workspace_id = normalize_workspace_id(workspace_id)
@@ -164,10 +168,19 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                'records': [{'relpath': row.relpath, 'commit': row.commit, 'tree': row.tree,
                             'submodules': row.submodules,
                             'mirror': mirror_path_for(cache, workspace_id, row)} for row in records]}
+    if host_endpoint is not None or shared_cache_root is not None:
+        shared = validate_absolute_posix_path(shared_cache_root or SHARED_SOURCE_CACHE,
+                                             label='shared source cache')
+        for row, record in zip(request['records'], records):
+            row['repo_id'] = record.repo_id
+            row['shared_mirror'] = str(PurePosixPath(shared) / (record.repo_id + '.git'))
     def command():
-        return ('python3 - <<\'VAWS_FIXED_SOURCES\'\n' + inspect.getsource(_materialize_fixed)
-                  + '\nimport json\nprint(json.dumps(_materialize_fixed(' + repr(request)
-                  + '), separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
+        program = (inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(_materialize_fixed)
+                   + '\nimport json\nresult = _materialize_fixed(' + repr(request) + ')\n')
+        if native_publication is not None:
+            return native_publication.wrap_program(program)
+        return ("python3 - <<'VAWS_FIXED_SOURCES'\n" + program
+                + '\nprint(json.dumps(result, separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
 
     def run():
         script = command()
@@ -181,15 +194,41 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
             raise ParityUnavailable('fixed source materialization returned an invalid receipt')
         return payload
 
-    result = run()
-    if result.get('status') == 'missing':
+    def missing_rows(result):
         missing = result.get('missing')
         if (not isinstance(missing, list) or not missing
                 or any(not isinstance(row, dict) or type(row.get('index')) is not int
                        or not 0 <= row['index'] < len(records) for row in missing)
                 or len({row['index'] for row in missing}) != len(missing)):
             raise ParityUnavailable('fixed source materialization returned invalid missing objects')
+        return missing
+
+    if native_publication is not None and len(command().encode('utf-8')) > 96 * 1024:
+        # Large native metadata uses the existing separate publication job.
+        # Every later inline pack is budgeted against this entire program.
+        native_publication = None
+    result = run()
+    if result.get('status') == 'missing' and host_endpoint is not None:
+        missing = missing_rows(result)
+        if process is not None and process.cancel_requested():
+            from vaws_coordinator.preparation_process import PreparationCancelled
+            raise PreparationCancelled('fixed object discovery cancelled before launch')
+        cold = [request['records'][row['index']] for row in missing if not row.get('carrier')]
+        # An existing private carrier already enables cheap delta transfer.
+        # A new Python edit must not rediscover every container on the host.
+        if cold:
+            exported = _export_existing_source_objects(host_endpoint, cold, cache)
+            if on_progress:
+                on_progress({'phase': 'shared-source-objects', **exported})
+            if exported['status'] == 'copied':
+                # A new persisted job, not a replay of the completed miss.
+                result = run()
+    if result.get('status') == 'missing':
+        missing = missing_rows(result)
         for row in missing:
+            if process is not None and process.cancel_requested():
+                from vaws_coordinator.preparation_process import PreparationCancelled
+                raise PreparationCancelled('fixed object upload cancelled before launch')
             record = records[row['index']]
             mirror = request['records'][row['index']]['mirror']
             repo = Path(record.source_path)
@@ -228,6 +267,30 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
     if (result.get('status') != 'materialized' or result.get('source_id') != source_snapshot['id']
             or result.get('root') != root or result.get('commits') != expected):
         raise ParityUnavailable('fixed source materialization did not verify the admitted inputs')
+    return result
+
+
+def _export_existing_source_objects(host_endpoint, records, legacy_cache):
+    import inspect
+    from remote_dev.core.endpoint import resolve_endpoint
+    from remote_dev.core.ssh_transport import run_remote_python
+    from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
+    from vaws_coordinator.shared_source_objects import (
+        copy_fixed_objects, export_container_objects, export_existing_objects,
+    )
+    source = inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(export_container_objects)
+    source += '\nimport json,sys\nprint(json.dumps(export_container_objects(json.load(sys.stdin))))\n'
+    script = inspect.getsource(export_existing_objects)
+    script += '\nimport json,sys\nprint(json.dumps(export_existing_objects(json.load(sys.stdin))))\n'
+    result = run_remote_python(resolve_endpoint({**host_endpoint, 'root': '/', 'cwd': '/'}), script,
+        {'records': records, 'legacy_cache': legacy_cache, 'export_source': source}, timeout_ms=360000)
+    if result.get('status') == 'cancelled':
+        raise PreparationCancelled('fixed object export cancelled; it was not replayed')
+    if (result.get('status') == 'failed' and result.get('exit_code') is not None
+            and result.get('remote_outcome') != 'unknown'):
+        raise ParityUnavailable('fixed object export failed: ' + str(result.get('stderr_tail') or result))
+    if result.get('status') not in {'copied', 'miss'} or result.get('remote_outcome') == 'unknown':
+        raise PreparationUncertain('fixed object export did not complete; it was not replayed: ' + str(result))
     return result
 
 

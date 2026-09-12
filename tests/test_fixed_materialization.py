@@ -62,13 +62,104 @@ def peer(tmp_path, monkeypatch):
     monkeypatch.setattr(parity, 'git', transfer)
     monkeypatch.setattr(parity, 'git_remote_url', lambda endpoint, mirror: mirror)
     monkeypatch.setattr(parity, 'git_ssh_environment', lambda endpoint: os.environ.copy())
-    def run(records=None, root='runtime'):
-        return parity.materialize_fixed_sources(workspace_id='test',
+    def run(records=None, root='runtime', *, owner='test', shared_cache=None, host=None):
+        return parity.materialize_fixed_sources(workspace_id=owner,
             endpoint={'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': str(tmp_path / root)},
             source_snapshot=snapshot(records or [make_record(source, 'project')]),
-            container_cache_root=str(tmp_path / 'cache'))
+            container_cache_root=str(tmp_path / 'cache'), shared_cache_root=shared_cache,
+            host_endpoint=host)
     return SimpleNamespace(source=source, commands=commands, transfers=transfers, run=run, stream=stream,
                            cache=tmp_path / 'cache', root=tmp_path / 'runtime')
+
+
+def test_shared_hit_copies_only_exact_objects_to_private_owner(peer, tmp_path):
+    record = make_record(peer.source, 'project')
+    shared = str(tmp_path / 'shared')
+    peer.run([record], shared_cache=shared)
+    original_mirror = parity.mirror_path_for(str(peer.cache), 'test', record)
+    original_refs = git(original_mirror, 'show-ref')
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run([record], root='other-root', owner='other-owner', shared_cache=shared)
+    assert len(peer.commands) == 1 and not peer.transfers
+    private = Path(parity.mirror_path_for(str(peer.cache), 'other-owner', record))
+    assert git(original_mirror, 'show-ref') == original_refs
+    assert set(git(private, 'for-each-ref', '--format=%(refname)').splitlines()) == {
+        'refs/vaws/snapshots/' + record.commit, 'refs/parity/other-owner/transport-carrier'}
+    assert git(Path(shared) / 'project.git', 'for-each-ref', '--format=%(refname)') == 'refs/vaws/snapshots/' + record.commit
+    assert not (private / 'objects/info/alternates').exists()
+    # Clearing a shared cache cannot change an already admitted private tree.
+    import shutil
+    shutil.rmtree(shared)
+    assert git(private, 'cat-file', '-p', record.commit + ':model.py') == 'value = 1'
+    assert git(peer.root.parent / 'other-root/project', 'show', 'HEAD:model.py') == 'value = 1'
+
+
+def test_cold_owner_automatically_exports_legacy_exact_objects(peer, tmp_path, monkeypatch):
+    from vaws_coordinator.shared_source_objects import export_container_objects
+    record = make_record(peer.source, 'project')
+    peer.run([record])  # Historical private mirror, no prior shared publication.
+    shared = str(tmp_path / 'shared')
+    calls = []
+    def export(host, rows, cache):
+        calls.append(rows)
+        result = export_container_objects({'records': rows, 'legacy_cache': cache})
+        return {'status': 'copied', **result}
+    monkeypatch.setattr(parity, '_export_existing_source_objects', export)
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run([record], root='cold-owner', owner='cold', shared_cache=shared, host={'host': 'fixture'})
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert len(calls) == 1 and [r['commit'] for r in calls[0]] == [record.commit]
+    # Its next Python edit uses the imported exact snapshot as a delta base,
+    # with no repeated host discovery and no full Git upload.
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'next Python edit')
+    peer.commands.clear()
+    peer.run([make_record(peer.source, 'project')], root='cold-edit', owner='cold',
+             shared_cache=shared, host={'host': 'fixture'})
+    assert len(calls) == 1 and len(peer.commands) == 2 and not peer.transfers
+
+
+def test_shared_publications_are_serialized_and_keep_both_snapshots(peer, tmp_path):
+    from vaws_coordinator.shared_source_objects import copy_fixed_objects
+    first = make_record(peer.source, 'project')
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    second = make_record(peer.source, 'project')
+    shared = tmp_path / 'shared.git'
+    with ThreadPoolExecutor(2) as executor:
+        results = list(executor.map(lambda record: copy_fixed_objects(peer.source, shared, asdict(record)),
+                                    [first, second]))
+    assert results == [True, True]
+    assert set(git(shared, 'for-each-ref', '--format=%(objectname)').splitlines()) == {first.commit, second.commit}
+    assert not (shared / 'objects/info/alternates').exists()
+
+
+def test_shared_wrong_tree_and_missing_blob_never_publish_success(peer, tmp_path):
+    from vaws_coordinator.shared_source_objects import copy_fixed_objects
+    record = make_record(peer.source, 'project')
+    shared = tmp_path / 'shared.git'
+    with pytest.raises(ValueError, match='wrong tree'):
+        copy_fixed_objects(peer.source, shared, {**asdict(record), 'tree': '0' * 40})
+    assert not shared.exists()
+    assert not copy_fixed_objects(tmp_path / 'absent', shared, asdict(record))
+    blob = git(peer.source, 'rev-parse', 'HEAD:model.py')
+    (peer.source / '.git/objects' / blob[:2] / blob[2:]).unlink()
+    with pytest.raises(RuntimeError, match='fixed object copy failed'):
+        copy_fixed_objects(peer.source, shared, asdict(record))
+    assert not git(shared, 'for-each-ref', '--format=%(refname)')
+
+
+def test_uncertain_legacy_export_does_not_fall_back_to_upload(peer, tmp_path, monkeypatch):
+    from vaws_coordinator.preparation_process import PreparationUncertain
+    def unknown(*args):
+        raise PreparationUncertain('lost export reply')
+    monkeypatch.setattr(parity, '_export_existing_source_objects', unknown)
+    with pytest.raises(PreparationUncertain, match='lost export reply'):
+        peer.run(shared_cache=str(tmp_path / 'shared'), host={'host': 'fixture'})
+    assert len(peer.commands) == 1 and not peer.transfers
+    assert not (peer.root / '.vaws-runtime/source-materialization.json').exists()
 
 
 def test_cold_two_operations_warm_one_without_recapture(peer):

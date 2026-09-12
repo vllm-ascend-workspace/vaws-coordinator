@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from vaws_coordinator.shared_source_objects import copy_fixed_objects
+
 WORKSPACE_ID_PATTERN = re.compile(r'[^A-Za-z0-9._-]+')
 STATE_SUBDIR = Path('.vaws-local/remote-code-parity')
 DEFAULT_DENYLIST = (
@@ -477,6 +479,9 @@ def _materialize_fixed(request):
                 if updated.returncode:
                     raise ValueError('fixed source refs rejected: ' + updated.stderr)
         tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}', check=False)
+        shared = row.get('shared_mirror')
+        if tree.returncode and shared and copy_fixed_objects(shared, mirror, row):
+            tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}')
         if tree.returncode:
             carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
             missing.append({'index': index, 'carrier': carrier.stdout.strip() if not carrier.returncode else None})
@@ -488,6 +493,15 @@ def _materialize_fixed(request):
         pinned = git(mirror, 'rev-parse', '--verify', fixed_ref, check=False)
         if pinned.returncode or pinned.stdout.strip() != row['commit']:
             git(mirror, 'update-ref', fixed_ref, row['commit'])
+        if shared:
+            # Publish immutable objects only. The shared mirror never replaces
+            # this owner's refs/objects or becomes a live alternate dependency.
+            copy_fixed_objects(mirror, shared, row)
+            # A shared hit also provides this owner's first negotiation base.
+            # Create only; concurrent work may already have advanced its ref.
+            # Neither this mutable hint nor any shared ref selects a checkout.
+            git(mirror, 'update-ref', request['carrier_ref'], row['commit'],
+                '0' * len(row['commit']), check=False)
     if missing:
         return {'status': 'missing', 'missing': missing}
 
