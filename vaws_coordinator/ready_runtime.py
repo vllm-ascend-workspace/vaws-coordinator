@@ -695,14 +695,14 @@ class RuntimePool(ManagedExecution):
         return {"run": run, "jobs": jobs, "event": event,
                 "next": "return the runtime for quarantine and re-verification before any reuse"}
 
-    def tick(self, limit: int = 4):
+    def tick(self, limit: int = 4, *, exclude_managed=()):
         """Observe manual leases and supervise explicitly registered jobs."""
         with self.transaction() as db:
             managed = {row["id"] for row in self.rows(db, "job")}
             rows = [row for row in self.rows(db, "run") if row["state"] not in TERMINAL and row["id"] not in managed]
         for row in sorted(rows, key=lambda row: row["last_poll"])[:limit]:
             self.control(row["owner"], row["id"], "poll")
-        self.managed_tick(limit)
+        self.managed_tick(limit, exclude=exclude_managed)
 
     def status(self, owner: str):
         with self.transaction() as db:

@@ -132,6 +132,13 @@ class ManagedExecution:
                     # locally. The complete remote fact check runs after the
                     # grant, before any payload is prepared or authorized.
                     run = self._request_run(job["owner"], **job["request"], check_remote=False)
+                elif runs[0]["state"] in {"active", "orphaned_busy"}:
+                    # A running job needs one authoritative renewal, below,
+                    # after observing its supervisor. Polling the same lease
+                    # first repeats a host round trip and an occupancy scan.
+                    # Completion goes directly to fenced host release; failed
+                    # renewals retain uncertainty and reconcile on the next turn.
+                    run = runs[0]
                 else:
                     run = self.control(job["owner"], key, "poll", _managed=True)
                 if run.get("preflight_error"):
@@ -155,6 +162,7 @@ class ManagedExecution:
                     return self._save_managed(job)
 
                 timed_out = (observed.get("result") or {}).get("state") == "timeout"
+                renewed = False
                 if timed_out:
                     job["timed_out"] = True
                 if (run["state"] == "orphaned_busy" and not job["cancel_requested"]
@@ -163,6 +171,7 @@ class ManagedExecution:
                     # is the only recovery that moves orphaned_busy back to
                     # active; a live marked family is never stopped here.
                     run = self.control(job["owner"], key, "heartbeat", _managed=True)
+                    renewed = run["state"] == "active"
                     job["lease_state"] = run["state"]
                     if run["state"] == "orphaned_busy":
                         job.update(state="uncertain",
@@ -216,10 +225,12 @@ class ManagedExecution:
                     pid = self.backend.job_host_pid(runtime, observed["receipt"])
                     run = self.control(job["owner"], key, "activate", pid, _managed=True,
                                        process_guard=observed["receipt"]["process_guard"])
+                    renewed = run["state"] == "active"
                 if run["state"] == "active":
                     # This renewal belongs to a persisted job, not an idle AI
                     # connection. A manager restart reconciles the same job id.
-                    run = self.control(job["owner"], key, "heartbeat", _managed=True)
+                    if not renewed:
+                        run = self.control(job["owner"], key, "heartbeat", _managed=True)
                     if run["state"] != "active":
                         raise RuntimeError("lease is not active; the start gate remains closed")
                     if observed["state"] == "prepared":
@@ -297,9 +308,9 @@ class ManagedExecution:
             job.pop("error", None)
         return self._save_managed(job)
 
-    def managed_tick(self, limit=4):
+    def managed_tick(self, limit=4, *, exclude=()):
         with self.transaction() as db:
-            jobs = [row for row in self.rows(db, "job") if row["state"] not in JOB_TERMINAL]
+            jobs = [row for row in self.rows(db, "job") if row["state"] not in JOB_TERMINAL and row["id"] not in exclude]
         pending = [row for row in sorted(jobs, key=lambda item: item["last_poll"])
                    if not self._entity_lock("job", row["id"]).locked()][:limit]
         if not pending:

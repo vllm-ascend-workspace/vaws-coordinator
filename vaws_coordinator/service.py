@@ -358,6 +358,20 @@ class CoordinatorService:
         if user and row.get("user") and row["user"] != user:
             raise PermissionError("execution belongs to another principal")
         user = user or row.get("user")
+        if action == "status" and not refresh:
+            # Observation reads persisted facts. A stale sample asks the
+            # existing execution worker to refresh asynchronously, so neither
+            # a slow link nor a dead host blocks status or a bounded wait.
+            stale = not self._observation_freshness(row)["fresh"]
+            deferred = stale and row.get("phase") not in DONE
+            if deferred:
+                self._schedule_progress(sessions_dir, user, execution_id)
+            reply = self._reply(row, role=role)
+            reply["observation_freshness"].update(
+                source="cache" if row.get("jobs_observed_at") else "local",
+                refresh_requested=False, refresh_deferred=deferred,
+            )
+            return reply
         lock = self._lock_for("execution", execution_id)
         acquired = lock.acquire(blocking=False)
         refreshed = False
@@ -589,7 +603,9 @@ class CoordinatorService:
         hold_go = len(row["roles"]) > 1
         def start_role(role):
             if role.get("managed_job"):
-                return self.pool.managed_control(user, role["managed_job"], "status")
+                observed = self.pool.managed_control(user, role["managed_job"], "status")
+                role["status_observed_at"] = time.time()
+                return observed
             if self._adopt_cancel(store, row):
                 return None
             merged_env = {**(spec.get("env") or {}), **(role.get("env") or {})}
@@ -604,6 +620,7 @@ class CoordinatorService:
             with self._lock_for("progress", row["id"]):
                 role["managed_job"] = job["id"]
                 role["observation"] = job
+                role["status_observed_at"] = time.time()
                 store.save_execution(row)
             return job
 
@@ -657,6 +674,7 @@ class CoordinatorService:
 
         row["managed_job"] = jobs[0]["id"]
         row["observation"] = jobs[0]
+        row["jobs_observed_at"] = time.time()
         row["phase"] = aggregate_job_states([job["state"] for job in jobs])
         if row["phase"] == "running":
             self._record_assignment(row, jobs)
@@ -1370,15 +1388,26 @@ class CoordinatorService:
                 self._active_requests -= 1
 
     def _dispatch_progress_active(self) -> None:
-        self.pool.tick()
+        sessions = []
+        execution_jobs = set()
         for directory in list(self._session_dirs):
             try:
                 store = self.store(directory)
+                executions = store.all_executions()
+                sessions.append((directory, store, executions))
+                execution_jobs.update(role["managed_job"] for row in executions
+                                      if row.get("admitted") and row.get("phase") not in DONE
+                                      for role in row.get("roles", []) if role.get("managed_job"))
             except Exception as exc:
                 self._record_daemon_error(f"sessions {directory}: {exc}")
                 continue
+        # Each execution worker supervises its own roles. The pool services
+        # standalone jobs only, avoiding a second status/heartbeat sequence
+        # for every attached execution during the same daemon tick.
+        self.pool.tick(exclude_managed=execution_jobs)
+        for directory, store, executions in sessions:
             finishing = {session["id"] for session in store.sessions() if session.get("state") == "finishing"}
-            for row in store.all_executions():
+            for row in executions:
                 if row.get("session_id") in finishing:
                     continue
                 if not row.get("admitted") or row.get("phase") in DONE:

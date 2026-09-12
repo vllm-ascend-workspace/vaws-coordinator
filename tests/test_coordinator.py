@@ -666,6 +666,21 @@ class PoolTests(unittest.TestCase):
         self.assertFalse(self.backend.jobs[second["job_id"]]["quiet"])
         self.assertEqual(next(row for row in self.pool.catalog() if row["runtime_id"] == a["runtime_id"])["state"], "bound")
 
+    def test_managed_renewal_uses_one_host_request_and_completion_releases_directly(self):
+        binding = self.bind("alice", self.root / "one-renewal")
+        self.backend.calls.clear()
+        job = self.managed("alice", binding)
+        self.assertNotIn(("host", "heartbeat"), self.backend.calls)
+        self.backend.calls.clear()
+        observed = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(observed["state"], "running")
+        self.assertEqual([action for kind, action in self.backend.calls if kind == "host"], ["heartbeat"])
+        self.backend.jobs[job["job_id"]].update(state="succeeded", quiet=True)
+        self.backend.calls.clear()
+        ended = self.pool.managed_control("alice", job["id"])
+        self.assertEqual((ended["state"], ended["lease_state"]), ("succeeded", "released"))
+        self.assertEqual([action for kind, action in self.backend.calls if kind == "host"], ["release"])
+
     def test_managed_stop_is_not_overwritten_by_an_inflight_advance(self):
         import threading
 
