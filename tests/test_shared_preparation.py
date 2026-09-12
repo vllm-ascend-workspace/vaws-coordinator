@@ -127,6 +127,26 @@ def test_shared_lookup_rejects_recipient_hardware_mismatch(bundle, monkeypatch, 
     assert not (target / relative).exists()
 
 
+@pytest.mark.parametrize('requirement,installed,satisfied', [
+    ('numpy>=2', '2.1+image', True), ('numpy>=2', '1.9', False),
+    ('missing>=1', None, False), ('broken=version', '1.0', False),
+    ('torch-npu==2.10.0.post4', '2.10.0.post4.dev20260715', True),
+    ('missing>=1; python_version < "2"', None, True),
+])
+def test_restore_dependency_check_uses_actual_recipient_metadata(monkeypatch, requirement, installed, satisfied):
+    def version(name):
+        if installed is None:
+            raise cache.importlib.metadata.PackageNotFoundError(name)
+        return installed
+    monkeypatch.setattr(cache.importlib.metadata, 'version', version)
+    distributions = {'vllm-ascend': {'files': {'METADATA': 'Name: vllm-ascend\nRequires-Dist: ' + requirement + '\n'}}}
+    result = cache.recipient_dependencies(distributions, {'torch_npu': installed})
+    assert result['satisfied'] is satisfied
+    assert result['interpreter'] == sys.executable and result['prefix'] == sys.prefix
+    assert result['purelib'] == sysconfig.get_paths()['purelib']
+    assert bool(result['errors']) is not satisfied
+
+
 @pytest.mark.parametrize('change', ['native', 'dependencies', 'image', 'abi', 'cann', 'corrupt'])
 def test_mismatches_do_not_copy_artifacts(bundle, monkeypatch, change):
     source, target, shared, request, manifest, relative, versions = bundle
@@ -163,8 +183,8 @@ def test_cached_outputs_can_be_discarded_before_normal_build(bundle):
     assert (next((shared / 'bundles').iterdir()) / relative).is_file()
 
 
-@pytest.mark.parametrize('failure', [None, 'verify-imports', 'profile', 'cache-miss',
-                                    'cancel-imports', 'uncertain-imports', 'cancel-profile', 'uncertain-profile'])
+@pytest.mark.parametrize('failure', [None, 'profile', 'cache-miss', 'missing-dependency', 'broken-dependency',
+                                    'cancel-profile', 'uncertain-profile'])
 def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeypatch, failure):
     import vaws_coordinator.parity as parity
     import vaws_coordinator.parity_support as transport
@@ -188,11 +208,8 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
         nonlocal failed
         step = kwargs['step']
         installed.append(step)
-        if step == 'verify-imports' and failure in ('cancel-imports', 'uncertain-imports'):
-            raise (PreparationCancelled if failure.startswith('cancel') else PreparationUncertain)('owned process interrupted')
-        if failure == step and not failed:
-            failed = True
-            raise RuntimeError('cached import does not load')
+        if step == 'verify-deps' and failure == 'broken-dependency':
+            raise RuntimeError('declared dependency cannot be satisfied')
     def write_profile(*args, **kwargs):
         nonlocal failed
         if failure in ('cancel-profile', 'uncertain-profile'):
@@ -203,11 +220,19 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
     def operation(spec, action, versions, **kwargs):
         operations.append(action)
         return {'status': {'restore': 'miss' if failure == 'cache-miss' else 'hit',
-                           'store': 'miss', 'discard': 'discarded'}[action], 'reason': 'fixture cache unavailable'}
+                           'store': 'miss', 'discard': 'discarded'}[action], 'reason': 'fixture cache unavailable',
+                'dependencies': {'satisfied': failure not in {'missing-dependency', 'broken-dependency'}}}
     monkeypatch.setattr(parity, 'run_runtime_install_step', install)
     monkeypatch.setattr(backend, '_write_ready_profile', write_profile)
     monkeypatch.setattr(backend, '_shared_native', operation)
     monkeypatch.setattr(backend, '_export_shared_native', lambda spec: {'status': 'miss'})
+    if failure == 'broken-dependency':
+        with pytest.raises(RuntimeError, match='dependency cannot be satisfied'):
+            backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
+                                      source_snapshot=snapshot, on_progress=events.append)
+        assert installed == ['install-vllm-ascend-requirements', 'verify-deps']
+        assert operations == ['restore']
+        return
     if failure and failure.startswith(('cancel-', 'uncertain-')):
         with pytest.raises(PreparationCancelled if failure.startswith('cancel') else PreparationUncertain):
             backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
@@ -217,11 +242,14 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
         return
     assert backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
                                      source_snapshot=snapshot, on_progress=events.append) is None
-    assert installed.count('install-vllm-ascend') == (0 if failure is None else 1)
-    assert installed.count('install-vllm-ascend-requirements') == 1
-    assert 'verify-imports' in installed and 'verify-deps' in installed
-    assert operations == (['restore'] if failure is None else ['restore', 'discard', 'store']
-                          if failure in ('verify-imports', 'profile') else ['restore', 'store'])
+    assert installed.count('install-vllm-ascend') == int(failure in {'profile', 'cache-miss'})
+    assert installed.count('install-vllm-ascend-requirements') == int(failure in {'cache-miss', 'missing-dependency'})
+    if failure is None:
+        assert installed == ['write-marker']
+    if failure == 'missing-dependency':
+        assert installed == ['install-vllm-ascend-requirements', 'verify-deps', 'write-marker']
+    assert operations == (['restore', 'discard', 'store'] if failure == 'profile' else ['restore', 'store']
+                          if failure == 'cache-miss' else ['restore'])
     assert spec['python'] == '/bob/.venv/bin/python'
 
 
@@ -235,6 +263,7 @@ def test_known_host_weight_mounts_keep_original_paths():
     assert 'if [ -e "$optional" ]; then' in bootstrap
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='generated shell payload executes in the Linux recipient')
 def test_actual_verification_payload_reads_execution_source_and_metadata(tmp_path):
     from vaws_coordinator.parity import runtime_install_step_script
     root, image = tmp_path / 'execution', tmp_path / 'image-python'
@@ -301,7 +330,8 @@ def test_shared_baseline_recognizes_kernel_delta_and_keeps_its_interpreter(bundl
 
 
 @pytest.mark.parametrize('failure', [None, 'build', 'imports', 'profile', 'export'])
-def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize('dependency_donor', [False, True])
+def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, monkeypatch, failure, dependency_donor):
     import vaws_coordinator.parity as parity
     import vaws_coordinator.parity_support as transport
     from remote_dev.core.ssh_transport import RemoteCompleted
@@ -318,18 +348,17 @@ def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, mo
     installed, operations, process_steps = [], [], []
     def install(**kwargs):
         installed.append(kwargs['step'])
-        if ((failure == 'build' and kwargs['step'] == 'install-vllm-ascend-incremental') or
-                (failure == 'imports' and kwargs['step'] == 'verify-imports')):
+        if failure == 'build' and kwargs['step'] == 'install-vllm-ascend-incremental':
             raise RuntimeError('actual incremental failure')
     def profile(*args, **kwargs):
-        if failure == 'profile':
+        if failure in {'profile', 'imports'}:
             raise RuntimeError('actual incremental failure')
     def operation(spec, action, versions, **kwargs):
         operations.append(action)
         process_steps.append(kwargs['process'].step)
         if failure == 'export' and len(operations) == 1:
             return {'status': 'miss'}
-        return {'status': 'incremental' if action == 'restore' else 'stored'}
+        return {'status': 'incremental' if action == 'restore' else 'stored', 'dependencies': {'satisfied': True}}
     monkeypatch.setattr(parity, 'run_runtime_install_step', install)
     monkeypatch.setattr(backend, '_write_ready_profile', profile)
     monkeypatch.setattr(backend, '_shared_native', operation)
@@ -337,7 +366,8 @@ def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, mo
                         else pytest.fail('cache candidate already available'))
     def prepare():
         return backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
-                                         source_snapshot=snapshot, on_preparation_job=lambda record: None)
+                                         source_snapshot=snapshot, on_preparation_job=lambda record: None,
+                                         reuse={'kind': 'dependencies', 'runtime': {}} if dependency_donor else None)
     if failure and failure != 'export':
         with pytest.raises(RuntimeError, match='actual incremental failure'):
             prepare()
@@ -348,4 +378,6 @@ def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, mo
         if failure == 'export':
             assert process_steps == ['shared-native-restore', 'shared-native-restore-after-export', 'shared-native-store']
     assert 'install-vllm-ascend' not in installed
+    assert 'install-vllm' not in installed and 'install-vllm-ascend-requirements' not in installed
+    assert 'verify-imports' not in installed and 'verify-deps' not in installed
     assert installed.count('install-vllm-ascend-incremental') == 1

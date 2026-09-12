@@ -74,9 +74,20 @@ def create_venv_script(root: str, python: str, donor_python: str | None = None) 
             '  echo "cannot create a task interpreter from the donor python" >&2',
             "  exit 1",
             "fi",
-            f'"$IMAGE_PYTHON" -m venv --system-site-packages {quoted(str(PurePosixPath(root) / ".venv"))}',
+            f'"$IMAGE_PYTHON" -m venv --without-pip --system-site-packages {quoted(str(PurePosixPath(root) / ".venv"))}',
             f"test -x {quoted(python)}",
             f'test {quoted(python)} != "$DONOR"',
+            # Image pip is importable through system-site-packages; its
+            # installation scheme is still this new venv. Seed only if absent.
+            f'if ! {quoted(python)} -c "import pip" >/dev/null 2>&1; then',
+            f'  "$IMAGE_PYTHON" -m venv --system-site-packages {quoted(str(PurePosixPath(root) / ".venv"))}',
+            'fi',
+            f'{quoted(python)} - {quoted(str(PurePosixPath(root) / ".venv"))} <<\'VAWS_VENV\'',
+            'import pathlib, sys, sysconfig',
+            'expected = pathlib.Path(sys.argv[1]).resolve()',
+            'if pathlib.Path(sys.prefix).resolve() != expected or not pathlib.Path(sysconfig.get_paths()["purelib"]).resolve().is_relative_to(expected):',
+            '    raise ValueError("pip installation scheme escaped the owned interpreter")',
+            'VAWS_VENV',
         ]
     )
 

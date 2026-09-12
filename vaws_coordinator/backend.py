@@ -458,7 +458,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             preparation_data = {'versions': versions, 'build_env': source_snapshot.get('build_env', {})}
             write = 'mkdir -p ' + shlex.quote(root + '/.vaws-runtime') + '\nprintf %s ' + shlex.quote(json.dumps(preparation_data)) + ' > ' + shlex.quote(root + '/.vaws-runtime/build-source.json')
             self.bash(endpoint, write)
-        if reuse:
+        def reuse_previous():
             from vaws_coordinator.preparation_cache import REMOTE_REUSE_SUFFIX
             previous = reuse['runtime']
             request = {'kind': reuse['kind'], 'root': root, 'source_root': previous['endpoint']['root'],
@@ -504,38 +504,61 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             if discarded.get('status') != 'discarded':
                 raise RuntimeError('cannot discard incomplete cached outputs: ' + discarded.get('reason', 'unknown'))
             cached_native = False
+            install('check-build-compat')
+            install('install-vllm')
             install('install-vllm-ascend')
             install('verify-imports')
             install('verify-deps')
 
+        def accept_cache(cache):
+            nonlocal cached_native, compiled_native, incremental_native
+            progress('shared-native-cache', cache)
+            cached_native = cache.get('status') in {'hit', 'incremental'}
+            if not cached_native:
+                return False
+            if not cache.get('dependencies', {}).get('satisfied'):
+                if reuse and reuse['kind'] == 'dependencies':
+                    reuse_previous()
+                else:
+                    install('install-vllm-ascend-requirements')
+                install('verify-deps')
+            if cache['status'] == 'incremental':
+                install('install-vllm-ascend-incremental')
+                compiled_native = True
+                incremental_native = True
+            return True
+
+        if native_recipe and steps:
+            # The recipient venv already sees the image packages. Restore and
+            # check their real dependency metadata before any pip/copy work.
+            cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
+            if cache.get('status') == 'miss':
+                exported = self._export_shared_native(spec)
+                progress('shared-native-export', exported)
+                check_cancel()
+                if exported.get('status') == 'stored':
+                    cache = self._shared_native(spec, 'restore', versions,
+                        process=owned_process('shared-native-restore-after-export'))
+            if accept_cache(cache):
+                # Profile capture below performs this execution's real import
+                # once. No editable install or repeated native smoke is needed.
+                steps = ('write-marker',)
+            elif reuse:
+                reuse_previous()
+        elif reuse:
+            reuse_previous()
+
         for step in steps:
-            if step == 'install-vllm-ascend':
-                cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
-                if cache.get('status') == 'miss':
-                    exported = self._export_shared_native(spec)
-                    progress('shared-native-export', exported)
-                    check_cancel()
-                    if exported.get('status') == 'stored':
-                        # A completed missing reply is never replayed with a
-                        # different intent: this is a new owned preparation job.
-                        cache = self._shared_native(spec, 'restore', versions,
-                            process=owned_process('shared-native-restore-after-export'))
-                progress('shared-native-cache', cache)
-                cached_native = cache.get('status') in {'hit', 'incremental'}
-                if cache.get('status') == 'incremental':
-                    install('install-vllm-ascend-incremental')
-                    compiled_native = True
-                    incremental_native = True
-                if cached_native:
+            if step == 'install-vllm-ascend' and reuse and reuse['kind'] == 'dependencies':
+                # Copying a same-container dependency overlay may have repaired
+                # an ABI mismatch from the early image-only lookup.
+                cache = self._shared_native(spec, 'restore', versions,
+                    process=owned_process('shared-native-restore-after-dependencies'))
+                if accept_cache(cache):
                     continue
-            try:
-                install(step)
-            except (PreparationCancelled, PreparationUncertain):
-                raise
-            except Exception as exc:
-                if incremental_native or not cached_native or step not in {'verify-imports', 'verify-deps'}:
-                    raise
-                rebuild(exc)
+            if cached_native and step in {'verify-imports', 'verify-deps'}:
+                continue
+            install(step)
         check_cancel()
         log = progress("verify-profile")
         try:

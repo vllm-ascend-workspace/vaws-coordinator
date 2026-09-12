@@ -191,6 +191,44 @@ def discard_shared_native(root: Path) -> None:
     marker.unlink()
 
 
+def recipient_dependencies(distributions: dict, profile: dict) -> dict:
+    """Check recipe metadata in the actual recipient without importing torch."""
+    from email.parser import Parser
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import InvalidVersion, Version
+
+    metadata = distributions.get('vllm-ascend', {}).get('files', {}).get('METADATA')
+    errors, versions = [], {}
+    if not metadata:
+        errors.append('verified vllm-ascend distribution metadata is missing')
+    for raw in Parser().parsestr(metadata or '').get_all('Requires-Dist', []):
+        try:
+            requirement = Requirement(raw)
+            if requirement.marker and not requirement.marker.evaluate():
+                continue
+            installed = importlib.metadata.version(requirement.name)
+            versions[canonicalize_name(requirement.name)] = installed
+            if not requirement.specifier or requirement.specifier.contains(installed, prereleases=True):
+                continue
+            try:
+                public = Version(installed).public
+            except InvalidVersion:
+                public = installed.split('+', 1)[0]
+            if public != installed and requirement.specifier.contains(public, prereleases=True):
+                continue
+            # The existing recipe accepts the paired image's torch-npu dev
+            # build after import. Restore already verified this exact version
+            # and the donor's original successful smoke, so no repeat import.
+            if canonicalize_name(requirement.name) == 'torch-npu' and installed == profile['torch_npu']:
+                continue
+            errors.append(f'{requirement.name}{requirement.specifier} (installed {installed})')
+        except Exception as exc:
+            errors.append(f'{raw!r}: {exc}')
+    return {'satisfied': not errors, 'errors': errors, 'versions': versions,
+            'interpreter': sys.executable, 'prefix': sys.prefix, 'purelib': sysconfig.get_paths()['purelib']}
+
+
 def restore_shared_native(root: Path, cache: Path, preparation: dict, image_digest: str, versions: dict,
                           machine_type: str | None = None) -> dict:
     """Copy an ABI-compatible cached bundle into this execution's own sources."""
@@ -260,6 +298,8 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
             if file_digest(target) != identity['sha256']:
                 raise ValueError('shared artifact changed while copying: ' + name)
         write_source_metadata(root, versions, manifest['distributions'])
+        receipt['dependencies'] = recipient_dependencies(manifest['distributions'], profile)
+        marker.write_text(json.dumps(receipt))
         reuse = {'kind': 'shared-native', 'native_key': expected['native_key'],
                  'soc': profile['soc'], 'compiler': profile['compiler']}
         safe_destination(root, '.vaws-runtime/reuse.json').write_text(json.dumps(reuse))
