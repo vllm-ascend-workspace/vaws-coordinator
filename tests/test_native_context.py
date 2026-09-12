@@ -10,7 +10,7 @@ from test_execution_inputs import repo
 @pytest.fixture
 def native_env(tmp_path, monkeypatch):
     for name in ("VAWS_CONTEXT_FILE", "VAWS_PARENT_CONTEXT", "VAWS_ATTACH_CONTEXT",
-                 "CODEX_THREAD_ID", "CODEX_SESSION_ID", "GROK_SESSION_ID", "KIMI_SESSION_ID", "KIMI_AGENT_ID"):
+                 "CODEX_THREAD_ID", "CODEX_SESSION_ID", "GROK_SESSION_ID", "KIMI_SESSION_ID", "KIMI_AGENT_ID", "CURSOR_CONVERSATION_ID"):
         monkeypatch.delenv(name, raising=False)
     state = tmp_path / "sessions"
     monkeypatch.setenv("VAWS_AGENT_SESSIONS_DIR", str(state))
@@ -177,6 +177,26 @@ def test_native_cli_without_git_still_attaches_locally(native_env, tmp_path, mon
     context = load_context()
     assert context["source_defaults"]["sources"] == {}
     assert "source reference not yet bound" in capsys.readouterr().err
+
+
+def test_cursor_shell_first_call_and_hook_share_exact_native_context(native_env, tmp_path, monkeypatch):
+    from vaws_coordinator.hooks.vaws_session import handle
+    project = repo(tmp_path / "project")
+    native = "4c009c90-471a-4be5-b9b9-963f0ab6fb4b"
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv("CURSOR_CONVERSATION_ID", native)
+    monkeypatch.chdir(project)
+    first = load_context()
+    store = AgentSessions(native_env)
+    handle("cursor", {"hook_event_name": "sessionStart", "conversation_id": native, "cwd": str(project)}, store)
+    monkeypatch.chdir(tmp_path)
+    assert load_context()["context_file"] == first["context_file"]
+    assert load_context()["source_defaults"]["sources"]["project"]["path"] == str(project)
+    assert len(store.sessions()) == 1
+    monkeypatch.setenv("CURSOR_CONVERSATION_ID", "escaped_2Fid")
+    with pytest.raises(ValueError):
+        load_context()
+    assert len(store.sessions()) == 1
 
 
 def test_existing_user_container_needs_no_image_selection():

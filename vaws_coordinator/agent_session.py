@@ -346,11 +346,12 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
     filename = context_file or os.environ.get("VAWS_CONTEXT_FILE", "")
     if not filename:
         callers = [(client, os.environ.get(key, "").strip()) for client, key in
-                   (("codex", "CODEX_THREAD_ID"), ("grok", "GROK_SESSION_ID"), ("kimi", "KIMI_SESSION_ID"))]
+                   (("codex", "CODEX_THREAD_ID"), ("cursor", "CURSOR_CONVERSATION_ID"),
+                    ("grok", "GROK_SESSION_ID"), ("kimi", "KIMI_SESSION_ID"))]
         callers = [(client, native) for client, native in callers if native]
         if len(callers) > 1:
             raise ValueError("conflicting native client identities; pass context_file explicitly")
-        if callers and callers[0][0] != "codex" and allow_native_context:
+        if callers and callers[0][0] in {"grok", "kimi"} and allow_native_context:
             client, native = callers[0]
             agent = os.environ.get("KIMI_AGENT_ID", "").strip() if client == "kimi" else ""
             if client == "kimi" and agent == "main":
@@ -358,13 +359,17 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
             # These clients attach before tools run. A later shell cd does not
             # create a task or change its sources; an unknown child stays unknown.
             return AgentSessions().native_context(client, native, agent)
-        # Codex exposes a native thread id to local commands even when the
+        # Codex and Cursor expose native ids to local commands even when the
         # session hook cannot export VAWS_CONTEXT_FILE to their environment.
         # Resolve only that identity; cwd is attachment metadata, never a key.
-        native = os.environ.get("CODEX_THREAD_ID", "").strip()
-        session = os.environ.get("CODEX_SESSION_ID", "").strip()
+        client, native = callers[0] if callers else ("codex", "")
+        session = os.environ.get("CODEX_SESSION_ID", "").strip() if client == "codex" else ""
         if not native or not allow_native_context:
             raise ValueError("VAWS context is required; use the native session hook or explicit task association")
+        if client == "cursor" and str(uuid.UUID(native)) != native:
+            # Cursor encodes/truncates arbitrary ids before shell export.
+            # Its native UUID is lossless; never guess an encoded identity.
+            raise ValueError("unsupported native Cursor shell identity; pass context_file explicitly")
         if session and session != native:
             raise ValueError("conflicting native Codex identities; pass context_file explicitly")
         parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
@@ -375,9 +380,9 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
         else:
             store = AgentSessions()
         try:
-            existing = store.native_context("codex", native)
+            existing = store.native_context(client, native)
         except ValueError:
-            context = store.attach("codex", native, str(Path.cwd()),
+            context = store.attach(client, native, str(Path.cwd()),
                                    parent_context=parent, association=association)
             try:
                 return store.bind_native_sources(context)
@@ -389,7 +394,7 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
         if parent or association:
             # Preserve association validation without treating a later shell
             # cd as a native worktree handoff or replacing its source defaults.
-            return store.attach("codex", native, existing["attachment"]["cwd"],
+            return store.attach(client, native, existing["attachment"]["cwd"],
                                 parent_context=parent, association=association)
         return existing
     path = Path(client_path(filename)).expanduser().resolve(strict=True)
