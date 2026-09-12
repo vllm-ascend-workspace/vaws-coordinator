@@ -169,7 +169,7 @@ class TaskClient:
         self._require_execution_id(execution_id)
         deadline = time.monotonic() + timeout_seconds
         while True:
-            reply = self.observe(execution_id)
+            reply = self.observe(execution_id, refresh=False)
             terminal = reply.get("state") in DONE
             if until == "running" and (terminal or reply.get("state") == "running"):
                 return reply

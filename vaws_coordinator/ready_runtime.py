@@ -161,7 +161,24 @@ class RuntimePool(ManagedExecution):
             raise PermissionError("managed preparation must bind the owner's execution root")
         return self._register(runtime_id, spec, checkout=(owner, session, request_id))
 
-    def _register(self, runtime_id, spec, *, checkout=None):
+    def _bind_prepared(self, runtime_id, spec, owner, session, request_id, attestation):
+        """Commit the backend's completed native publication, without adoption.
+
+        This is an internal handoff from prepare_task_environment, never a
+        caller-supplied registration option. A failed or uncertain preparation
+        cannot reach it: the backend requires its owned command's quiet success
+        and matching fixed-view receipt before returning this attestation.
+        """
+        safe_id(request_id)
+        if spec['user'] != owner or spec.get('reuse_only'):
+            raise PermissionError("managed preparation must bind the owner's execution root")
+        if (not attestation.get('container_id')
+                or attestation.get('runtime_root') != spec['endpoint']['root']
+                or attestation.get('execution_view', {}).get('source_id') != spec['source_snapshot']['id']):
+            raise ValueError('prepared result does not describe this fixed execution view')
+        return self._register(runtime_id, spec, checkout=(owner, session, request_id), prepared=attestation)
+
+    def _register(self, runtime_id, spec, *, checkout=None, prepared=None):
         safe_id(runtime_id)
         reuse_only = spec.get('reuse_only', False)
         if type(reuse_only) is not bool:
@@ -213,16 +230,20 @@ class RuntimePool(ManagedExecution):
                             raise ValueError("request id reused with different checkout parameters")
                         if previous["state"] != "bound" or runtime["state"] != "bound":
                             raise ValueError("this checkout request id belongs to a returned binding; use a new request id")
+                        if prepared is not None and runtime['attestation'] != prepared:
+                            raise ValueError('prepared result differs from the already bound view')
                         return {**runtime, "binding": previous}
                 self._check_registration(db, runtime_id, spec)
             # The probe runs outside the global lock; conflicts are re-checked
             # against fresh state before committing. Sibling roots in the same
             # user container are allowed; overlapping mutable roots are not.
-            observed = self.backend.inspect(spec, idle=True)
-            if not reuse_only:
+            observed = prepared if prepared is not None else self.backend.inspect(spec, idle=True)
+            if not reuse_only and prepared is None:
                 self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
                                           "container_name": container_name, "port": spec["endpoint"]["port"]})
             row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed, "draining": False}
+            if prepared is not None:
+                row['prepared_native_view'] = True
             binding = self._checkout_row(owner, session, key, row, observed, requested_runtime=runtime_id) if checkout else None
             with self.lock, self.transaction() as db:
                 self._check_registration(db, runtime_id, spec, container_id=observed.get("container_id"))
@@ -695,14 +716,14 @@ class RuntimePool(ManagedExecution):
         return {"run": run, "jobs": jobs, "event": event,
                 "next": "return the runtime for quarantine and re-verification before any reuse"}
 
-    def tick(self, limit: int = 4):
+    def tick(self, limit: int = 4, *, exclude_managed=()):
         """Observe manual leases and supervise explicitly registered jobs."""
         with self.transaction() as db:
             managed = {row["id"] for row in self.rows(db, "job")}
             rows = [row for row in self.rows(db, "run") if row["state"] not in TERMINAL and row["id"] not in managed]
         for row in sorted(rows, key=lambda row: row["last_poll"])[:limit]:
             self.control(row["owner"], row["id"], "poll")
-        self.managed_tick(limit)
+        self.managed_tick(limit, exclude=exclude_managed)
 
     def status(self, owner: str):
         with self.transaction() as db:

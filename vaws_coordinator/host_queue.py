@@ -39,11 +39,11 @@ from vaws_coordinator.host.vaws_npu_coordination import (  # noqa: F401
 
 HOST_QUEUE_MODULE_ENV = "VAWS_HOST_QUEUE_MODULE"
 SOURCE_DELIMITER = "__VAWS_NPU_COORDINATION_SOURCE__"
-UNRESOLVED = {"failed", "needs_input", "probe_failed"}
+UNRESOLVED = {"failed", "needs_input", "probe_failed", "timeout"}
 RUNNER = """
 import sys as _sys
 try:
-    _request = json.loads(_sys.argv[1])
+    _request = json.loads(_sys.argv[1]) if len(_sys.argv) > 1 else json.load(_sys.stdin)
     _result = handle_request(_request)
     print(json.dumps(_result, indent=2, ensure_ascii=False, sort_keys=True))
 except CoordinationError as _exc:
@@ -90,9 +90,13 @@ def load_host_protocol(path: Path | str | None = None):
 
 
 class HostQueue:
-    """Send one host coordination request through an explicit shell callable."""
+    """Send fixed protocol code with a small per-request JSON payload.
 
-    def __init__(self, run: Callable[[dict[str, Any], str], str], *, module_path=None):
+    The native transport caches code on its existing SSH connection. An
+    explicitly supplied shell callable retains the embedding adapter contract.
+    """
+
+    def __init__(self, run: Callable[[dict[str, Any], str], str] | None = None, *, module_path=None):
         self._run = run
         self._module_path = module_path
         self._source: str | None = None
@@ -115,15 +119,26 @@ class HostQueue:
 
     def request(self, host_endpoint: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         target = {**host_endpoint, "root": "/", "cwd": "/"}
-        command = self.command(request)
+        # Resolve the configured authority before sending anything. Requests
+        # never alter the code key, and uncertain mutations are never replayed
+        # through the shell adapter after a transport failure.
+        source = self.source()
         try:
-            stdout = self._run(target, command)
+            if self._run is None:
+                from remote_dev.core.endpoint import resolve_endpoint
+                from remote_dev.core.ssh_transport import run_remote_python
+
+                payload = run_remote_python(resolve_endpoint(target), source + "\n" + RUNNER,
+                                            request, timeout_ms=45000)
+            else:
+                payload = json.loads(self._run(target, self.command(request)))
         except Exception as exc:
             raise RuntimeError(
                 "host coordination failed; inspect endpoint logs and reconcile before retry: "
                 f"{exc}"
             ) from exc
-        payload = json.loads(stdout)
-        if payload.get("status") in UNRESOLVED:
+        if not isinstance(payload, dict):
+            raise RuntimeError("host coordination returned a non-object response")
+        if payload.get("status") in UNRESOLVED or (payload.get("status") == "cancelled" and "task" not in payload):
             raise RuntimeError(payload.get("error", "host state unknown"))
         return payload

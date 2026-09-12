@@ -158,14 +158,13 @@ class FakeTaskPythonInvocationTests(unittest.TestCase):
             (runtime_root / "vllm-ascend").mkdir(parents=True)
             bindir = base / "task root" / ".venv" / "bin"
             bindir.mkdir(parents=True)
-            log = base / "argv.log"
+            logs = base / "argv"
+            logs.mkdir()
             fake = bindir / "python"
             fake.write_text(
                 "#!/bin/sh\n"
-                f"log={shlex.quote(str(log))}\n"
-                "record=$(printf 'CALL\\nargv0=%s\\n' \"$0\"; "
-                "for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done)\n"
-                "printf '%s\\n' \"$record\" >> \"$log\"\n"
+                f"record=$(mktemp {shlex.quote(str(logs / 'call.XXXXXX'))})\n"
+                "printf '%s\\n' \"$0\" \"$@\" > \"$record\"\n"
                 "exit 0\n",
                 encoding="utf-8",
             )
@@ -181,11 +180,17 @@ class FakeTaskPythonInvocationTests(unittest.TestCase):
                 )
                 result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
-            recorded = log.read_text(encoding="utf-8")
-            self.assertGreaterEqual(recorded.count("CALL\n"), 4)
-            self.assertIn(f"argv0={python}", recorded)
-            self.assertIn("arg=-m\narg=pip\narg=uninstall", recorded)
-            self.assertIn("arg=-m\narg=pip\narg=install", recorded)
+            # Progress reporting and pip run concurrently. Separate files keep
+            # argv boundaries intact even when shell printf uses several writes.
+            recorded = [path.read_text(encoding="utf-8").splitlines() for path in logs.iterdir()]
+            self.assertGreaterEqual(len(recorded), 4)
+            task_calls = [call[1:] for call in recorded if call[0] == python]
+            self.assertCountEqual(task_calls, [
+                ["-m", "pip", "uninstall", "-y", "vllm", "vllm-ascend", "vllm_ascend"],
+                ["-"],
+                ["-"],
+                ["-m", "pip", "install", "--no-deps", "-e", ".", "--no-build-isolation"],
+            ])
             self.assertNotIn("install_consent.py", runtime_install_step_script(
                 runtime_root=str(runtime_root),
                 marker_dirname=DEFAULT_MARKER_DIRNAME,

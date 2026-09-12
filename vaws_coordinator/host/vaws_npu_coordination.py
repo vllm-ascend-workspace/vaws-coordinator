@@ -1698,6 +1698,17 @@ class NpuCoordinator:
             return (bool(int(row["requested_count"]) or _load_devices(row["granted_devices"])),
                     row["requested_service_port"] is not None or bool(self._task_service_ports(connection, task_id)))
 
+    def release_probe(self, task_id, probe, *, samples=2, interval_seconds=2.0):
+        with self._transaction() as connection:
+            row = self._task_row(connection, require_safe_id(task_id, label="task id"))
+            shared = bool(row["allow_external_busy"])
+        # A shared lease explicitly permits unrelated occupancy. One fresh
+        # sample establishes device visibility; repeating a free-device
+        # confirmation cannot add evidence about the owned process family.
+        # release() still requires its guard to be quiet and its ports clear.
+        return probe() if shared else _confirmed_free_probe(
+            samples=samples, interval_seconds=interval_seconds, probe=probe)
+
     def snapshot(
         self,
         observed: dict[str, Any] | None,
@@ -1850,10 +1861,10 @@ def handle_request(
             ),
         )
     if action == "release":
-        observed = _confirmed_free_probe(
+        observed = coordinator.release_probe(
+            request["task_id"], probe,
             samples=int(request.get("free_samples") or 2),
             interval_seconds=float(request.get("interval_seconds") or 2.0),
-            probe=probe,
         ) if needs_npu else None
         return coordinator.release(
             request["task_id"],
