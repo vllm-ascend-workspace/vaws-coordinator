@@ -71,6 +71,11 @@ SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}$")
 class CoordinationError(RuntimeError):
     """Raised for deterministic coordinator input or state failures."""
 
+    def __init__(self, message: str, *, error_code: str | None = None, port: int | None = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.port = port
+
 
 def prepared_supervisor_host_pid(prepared: dict, process_guard: dict | None) -> int:
     """Resolve a container receipt immediately before fenced activation."""
@@ -1368,7 +1373,8 @@ class NpuCoordinator:
         if existing is not None:
             if existing["task_id"] == task_id and existing["kind"] == kind:
                 return port
-            raise CoordinationError(f"port {port} is already reserved as {existing['kind']}")
+            raise CoordinationError(f"port {port} is already reserved as {existing['kind']}",
+                                    error_code="port_reserved", port=port)
         if not allow_listening:
             if listening is None or listening.get("status") != "ok":
                 raise CoordinationError(
@@ -1478,7 +1484,8 @@ class NpuCoordinator:
             if existing is not None:
                 if (port and int(existing["port"]) != port) or existing["owner"] != user:
                     raise CoordinationError(
-                        f"user {user} already has SSH port {existing['port']} reserved"
+                        f"user {user} already has SSH port {existing['port']} reserved",
+                        error_code="container_ssh_port_mismatch", port=int(existing["port"]),
                     )
                 port = int(existing["port"])
                 reused = True
@@ -1486,14 +1493,16 @@ class NpuCoordinator:
                 automatic = port == 0
                 if automatic:
                     if listening is None or listening.get("status") != "ok":
-                        raise CoordinationError("host listening ports are unavailable")
+                        raise CoordinationError("host listening ports are unavailable",
+                                                error_code="listening_unavailable")
                     live = {int(item) for item in listening.get("ports", [])}
                     allocated = self._allocated_ports(connection)
                     first, last = parse_port_range(DEFAULT_CONTAINER_SSH_PORT_RANGE)
                     port = next((candidate for candidate in range(first, last + 1)
                                  if candidate not in live and candidate not in allocated), 0)
                     if not port:
-                        raise CoordinationError("no free container SSH port")
+                        raise CoordinationError("no free container SSH port",
+                                                error_code="container_ssh_port_exhausted")
                 self._claim_port(
                     connection,
                     port=port,

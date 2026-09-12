@@ -108,3 +108,58 @@ def test_explicit_shell_and_host_queue_injection_remain_authoritative(tmp_path, 
     injected = Mock()
     assert RemoteBackend(host_queue=injected).host_queue is injected
     python.assert_not_called()
+
+
+def test_real_host_failure_survives_native_nonzero_wrapper_without_output_leak(tmp_path, monkeypatch):
+    calls = []
+
+    def rpc(endpoint, operation, code, payload, *, timeout_ms):
+        assert operation == 'python'
+        calls.append(payload)
+        program = tmp_path / 'host_failure.py'
+        program.write_text(code, encoding='utf-8')
+        completed = subprocess.run([sys.executable, str(program)], input=json.dumps(payload),
+                                   capture_output=True, text=True, encoding='utf-8', timeout=10)
+        return {'returncode': completed.returncode, 'stdout': completed.stdout,
+                'stderr': completed.stderr}
+
+    # Keep run_remote_python's actual exit-code/JSON handling. Only the SSH
+    # peer is replaced with a local process running the exact shipped source.
+    monkeypatch.setattr('remote_dev.core.rpc_transport.request', rpc)
+    queue = HostQueue()
+    common = {'state_dir': str(tmp_path / 'authority'), 'action': 'container-ssh-reserve', 'port': 46002}
+    queue.request(HOST, {**common, 'user': 'alice', 'container_name': 'vaws-alice'})
+    with pytest.raises(RuntimeError, match=r'already reserved \(port 46002\) \[port_reserved\]'):
+        queue.request(HOST, {**common, 'user': 'bob', 'container_name': 'vaws-bob'})
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('port', [46002, 'SECRET', True, -1, 65536])
+def test_known_reservation_error_uses_only_allowed_code_and_port(monkeypatch, port):
+    reply = {'status': 'failed', 'error': 'remote python failed', 'exit_code': 2,
+             'stdout_tail': json.dumps({'status': 'needs_input', 'error_code': 'port_reserved',
+                                       'port': port, 'error': 'SECRET', 'credentials': 'SECRET'}),
+             'stderr_tail': 'SECRET'}
+    python = Mock(return_value=reply)
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_remote_python', python)
+    with pytest.raises(RuntimeError, match='host port is already reserved') as caught:
+        HostQueue().request(HOST, {'action': 'container-ssh-reserve'})
+    assert 'SECRET' not in str(caught.value)
+    assert ('(port ' in str(caught.value)) is (type(port) is int and 0 < port < 65536)
+    python.assert_called_once()
+
+
+@pytest.mark.parametrize('change', [
+    {'remote_outcome': 'unknown'}, {'status': 'timeout'}, {'status': 'cancelled'}, {'exit_code': 1},
+    {'stdout_tail': 'not JSON'}, {'stdout_tail': '[]'}, {'stdout_tail': 'x' * 4001},
+    {'stdout_tail': json.dumps({'status': 'needs_input', 'error_code': 'SECRET'})},
+])
+def test_unrecognized_or_uncertain_failure_is_not_reinterpreted_or_replayed(monkeypatch, change):
+    reply = {'status': 'failed', 'error': 'original failure', 'exit_code': 2,
+             'stdout_tail': json.dumps({'status': 'needs_input', 'error_code': 'port_reserved', 'port': 46002}),
+             **change}
+    python = Mock(return_value=reply)
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_remote_python', python)
+    with pytest.raises(RuntimeError, match='^original failure$'):
+        HostQueue().request(HOST, {'action': 'container-ssh-reserve'})
+    python.assert_called_once()

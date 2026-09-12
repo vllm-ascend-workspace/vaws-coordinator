@@ -47,12 +47,45 @@ try:
     _result = handle_request(_request)
     print(json.dumps(_result, indent=2, ensure_ascii=False, sort_keys=True))
 except CoordinationError as _exc:
-    print(json.dumps({"status": "needs_input", "error": str(_exc)}, indent=2, ensure_ascii=False, sort_keys=True))
+    _failure = {"status": "needs_input", "error": str(_exc)}
+    if getattr(_exc, 'error_code', None):
+        _failure['error_code'] = _exc.error_code
+        if getattr(_exc, 'port', None) is not None:
+            _failure['port'] = _exc.port
+    print(json.dumps(_failure, indent=2, ensure_ascii=False, sort_keys=True))
     raise SystemExit(2)
 except Exception as _exc:
     print(json.dumps({"status": "failed", "error": str(_exc)}, indent=2, ensure_ascii=False, sort_keys=True))
     raise SystemExit(2)
 """
+
+
+def _reservation_failure(payload: dict[str, Any]) -> str | None:
+    """Decode only known host failure fields; never expose an output tail."""
+    if (payload.get('status') != 'failed' or payload.get('exit_code') != 2
+            or payload.get('remote_outcome') == 'unknown'):
+        return None
+    tail = payload.get('stdout_tail', '')
+    if not isinstance(tail, str) or len(tail) > 4000:
+        return None
+    try:
+        failure = json.loads(tail)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(failure, dict) or failure.get('status') != 'needs_input':
+        return None
+    messages = {
+        'port_reserved': 'host port is already reserved',
+        'container_ssh_port_mismatch': 'user already has a different SSH port reserved',
+        'listening_unavailable': 'host listening ports are unavailable',
+        'container_ssh_port_exhausted': 'no free container SSH port',
+    }
+    code = failure.get('error_code')
+    if not isinstance(code, str) or code not in messages:
+        return None
+    port = failure.get('port')
+    suffix = f' (port {port})' if type(port) is int and 0 < port < 65536 else ''
+    return messages[code] + suffix + f' [{code}]'
 
 
 class HostQueueUnavailable(RuntimeError):
@@ -140,5 +173,5 @@ class HostQueue:
         if not isinstance(payload, dict):
             raise RuntimeError("host coordination returned a non-object response")
         if payload.get("status") in UNRESOLVED or (payload.get("status") == "cancelled" and "task" not in payload):
-            raise RuntimeError(payload.get("error", "host state unknown"))
+            raise RuntimeError(_reservation_failure(payload) or payload.get("error", "host state unknown"))
         return payload
