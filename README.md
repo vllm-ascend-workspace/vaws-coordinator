@@ -352,7 +352,12 @@ the observed host epoch before submitting and acquiring in one host exchange.
 New managed runs read their exact task and container facts together, verify the
 compact source/environment view, then reuse a newly issued grant's occupancy
 sample for host preflight. Queue recovery verifies again; facts are not cached
-across queue waits. Startup and release operations record monotonic durations
+across queue waits. Explicit shared-device admission queries the current physical
+device mapping; external occupancy stays unknown. Strict leases, unsupported
+device queries and conflicting expired reservations retain full occupancy
+probes. Prepared activation uses the exact container, boot, PID, start-time and
+process marker proof without a second scan of every host process.
+Startup and release operations record monotonic durations
 in the existing run events, without command contents or heartbeat log entries.
 Completed managed shared leases retain the host process-guard and port checks;
 they need no whole-device visibility scan to release their own ownership.

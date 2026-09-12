@@ -154,6 +154,8 @@ class Backend:
                                     clock=self.clock,
                                     probe=lambda: {"status": "ok", "devices": [0, 1],
                                                    "busy": {str(d): ["test worker"] for d in self.busy}},
+                                    device_probe=lambda device: {"status": "ok", "devices": [device],
+                                                                 "busy": None, "free": []},
                                     listening_ports=lambda: listening)
         if self.fail_after == request["action"]:
             self.fail_after = None

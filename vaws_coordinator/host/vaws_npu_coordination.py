@@ -510,6 +510,36 @@ def parse_npu_smi_info(output: str) -> dict[str, Any]:
     }
 
 
+def probe_npu_device(device: int) -> dict[str, Any]:
+    """Fresh physical-device visibility without querying unrelated occupancy."""
+    failed = {"status": "failed", "error": "physical device mapping is unknown",
+              "devices": [], "busy": None, "free": []}
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info", "-t", "phyid-remap", "-p", str(device)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if result.returncode != 0:
+            return failed
+        fields = {}
+        for line in result.stdout.splitlines():
+            match = re.fullmatch(r"\s*(Chip Physical ID|Chip Logic ID|NPU ID|Chip ID)\s*:\s*(\d+)\s*", line)
+            if not match or match[1] in fields:
+                if line.strip():
+                    return failed
+                continue
+            fields[match[1]] = int(match[2])
+        if (set(fields) != {"Chip Physical ID", "Chip Logic ID", "NPU ID", "Chip ID"}
+                or fields["Chip Physical ID"] != device):
+            return failed
+        # None deliberately means unobserved: this must never become evidence
+        # that another task's hardware is free during global housekeeping.
+        return {"status": "ok", "collected_at": utc_now_iso(), "devices": [device],
+                "busy": None, "free": []}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return failed
+
+
 def probe_npu_occupancy() -> dict[str, Any]:
     try:
         result = subprocess.run(
@@ -752,7 +782,7 @@ class NpuCoordinator:
 
     @staticmethod
     def _busy_set(observed: dict[str, Any] | None) -> set[int] | None:
-        if observed is None or observed.get("status") != "ok":
+        if observed is None or observed.get("status") != "ok" or observed.get("busy", {}) is None:
             return None
         return {int(key) for key in observed.get("busy", {})}
 
@@ -1492,7 +1522,8 @@ class NpuCoordinator:
         now = self.clock()
         with self._transaction() as connection:
             requested_row = self._task_row(connection, task_id)
-            if int(requested_row["requested_count"]) and (observed is None or observed.get("status") != "ok"):
+            if int(requested_row["requested_count"]) and (observed is None or observed.get("status") != "ok"
+                    or (not requested_row["allow_external_busy"] and self._busy_set(observed) is None)):
                 return {"status": "probe_failed", "error": (observed or {}).get("error", "NPU occupancy is unknown"), "occupancy": observed}
             changes = self._housekeep(connection, observed, now=now)
             row = self._task_row(connection, task_id)
@@ -1620,7 +1651,8 @@ class NpuCoordinator:
         visible = {int(device) for device in (observed or {}).get("devices", [])}
         with self._transaction() as connection:
             requested_row = self._task_row(connection, task_id)
-            if int(requested_row["requested_count"]) and (observed is None or observed.get("status") != "ok"):
+            if int(requested_row["requested_count"]) and (observed is None or observed.get("status") != "ok"
+                    or (not requested_row["allow_external_busy"] and self._busy_set(observed) is None)):
                 return {"status": "probe_failed", "error": (observed or {}).get("error", "NPU occupancy is unknown"), "occupancy": observed}
             changes = self._housekeep(connection, observed, now=now)
             row = self._task_row(connection, task_id)
@@ -1685,13 +1717,12 @@ class NpuCoordinator:
         task_id: str,
         token: int,
         *,
-        pid: int,
+        pid: int | None = None,
         process_guard: dict | None = None,
+        prepared_supervisor: dict | None = None,
         heartbeat_ttl_seconds: int = DEFAULT_HEARTBEAT_TTL_SECONDS,
     ) -> dict[str, Any]:
         task_id = require_safe_id(task_id, label="task id")
-        if pid < 1:
-            raise CoordinationError("pid must be >= 1")
         if heartbeat_ttl_seconds < 1:
             raise CoordinationError("heartbeat_ttl_seconds must be >= 1")
         if process_guard is not None:
@@ -1702,8 +1733,16 @@ class NpuCoordinator:
                     or not isinstance(process_guard.get("boot_id"), str)
                     or ("retain_until_release" in process_guard and not isinstance(process_guard["retain_until_release"], bool))):
                 raise CoordinationError("invalid managed process guard")
+        if prepared_supervisor is not None:
+            # This exact container/boot/PID/start-time/marker proof establishes
+            # the waiting supervisor's presence. Scanning every host process
+            # again adds no identity evidence (and can only report unknown).
+            pid = prepared_supervisor_host_pid(prepared_supervisor, process_guard)
+        elif process_guard is not None:
             if not process_guard_busy(process_guard, completion_confirmed=True):
                 raise CoordinationError("managed supervisor is no longer present")
+        if pid is None or pid < 1:
+            raise CoordinationError("pid must be >= 1")
         now = self.clock()
         with self._transaction() as connection:
             row = self._task_row(connection, task_id)
@@ -1850,6 +1889,32 @@ class NpuCoordinator:
             row = self._task_row(connection, task_id)
         return {"status": next_state, "task": self._serialize_task(row)}
 
+    def admission_probe(self, task_id, probe, device_probe):
+        """Use the immutable sharing policy; unknown and reclamation keep full probes."""
+        with self._transaction() as connection:
+            row = self._task_row(connection, require_safe_id(task_id, label="task id"))
+            requested = _load_devices(row["requested_devices"])
+            shared = bool(row["allow_external_busy"]) and len(requested) == 1
+            # A visibility-only observation cannot reclaim a previous lease.
+            # Retain full observation when this device may need reclamation,
+            # so repeated shared requests cannot strand an expired reservation.
+            reclaim = False
+            if shared:
+                now = self.clock()
+                stale = connection.execute(
+                    """SELECT granted_devices FROM tasks WHERE (
+                        state='orphaned_busy' OR
+                        (state IN ('granted','starting') AND activation_deadline<=?) OR
+                        (state='active' AND heartbeat_deadline<=?))""",
+                    (now, now),
+                ).fetchall()
+                reclaim = any(requested[0] in _load_devices(item["granted_devices"]) for item in stale)
+        if shared and not reclaim:
+            observed = device_probe(requested[0])
+            if observed.get("status") == "ok":
+                return observed
+        return probe()
+
     def probe_requirements(self, task_id: str) -> tuple[bool, bool]:
         """Derive observation needs from immutable host-owned requests, not caller hints."""
         with self._transaction() as connection:
@@ -1991,6 +2056,7 @@ def handle_request(
     request: dict[str, Any],
     *,
     probe: Callable[[], dict[str, Any]] = probe_npu_occupancy,
+    device_probe: Callable[[int], dict[str, Any]] = probe_npu_device,
     clock: Callable[[], float] = time.time,
     listening_ports: Callable[[], dict[str, Any]] = probe_listening_ports,
 ) -> dict[str, Any]:
@@ -2021,7 +2087,7 @@ def handle_request(
         # caller has one reply boundary; partial success stays discoverable
         # under this exact task ID if the probe or transport fails.
         needs_npu, needs_ports = coordinator.probe_requirements(request["task_id"])
-        observed = probe() if needs_npu else None
+        observed = coordinator.admission_probe(request["task_id"], probe, device_probe) if needs_npu else None
         acquired = coordinator.acquire(
             request["task_id"], observed,
             grant_ttl_seconds=int(request.get("grant_ttl_seconds") or DEFAULT_GRANT_TTL_SECONDS),
@@ -2043,7 +2109,7 @@ def handle_request(
     if action == "acquire":
         return coordinator.acquire(
             request["task_id"],
-            probe() if needs_npu else None,
+            coordinator.admission_probe(request["task_id"], probe, device_probe) if needs_npu else None,
             grant_ttl_seconds=int(request.get("grant_ttl_seconds") or DEFAULT_GRANT_TTL_SECONDS),
             listening=listening_ports() if needs_ports else None,
         )
@@ -2051,17 +2117,16 @@ def handle_request(
         return coordinator.preflight(
             request["task_id"],
             int(request["fence_token"]),
-            probe() if needs_npu else None,
+            coordinator.admission_probe(request["task_id"], probe, device_probe) if needs_npu else None,
             start_ttl_seconds=int(request.get("start_ttl_seconds") or DEFAULT_START_TTL_SECONDS),
         )
     if action == "activate":
-        pid = (prepared_supervisor_host_pid(request["prepared_supervisor"], request.get("process_guard"))
-               if "prepared_supervisor" in request else int(request["pid"]))
         return coordinator.activate(
             request["task_id"],
             int(request["fence_token"]),
-            pid=pid,
+            pid=None if "prepared_supervisor" in request else int(request["pid"]),
             process_guard=request.get("process_guard"),
+            prepared_supervisor=request.get("prepared_supervisor"),
             heartbeat_ttl_seconds=int(
                 request.get("heartbeat_ttl_seconds") or DEFAULT_HEARTBEAT_TTL_SECONDS
             ),
