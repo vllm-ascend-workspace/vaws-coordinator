@@ -353,6 +353,7 @@ def test_existing_user_container_verifies_explicit_image_before_returning_donor(
 
 def test_existing_container_image_mismatch_cannot_be_relabelled_as_requested_image(monkeypatch):
     from vaws_coordinator import provision
+    from vaws_coordinator.provision import existing_container
     from vaws_coordinator.provision.host_ops import MachineManagementError, RemoteResult, SshTarget
     from vaws_coordinator.service import CoordinatorService
     service = object.__new__(CoordinatorService)
@@ -362,6 +363,7 @@ def test_existing_container_image_mismatch_cannot_be_relabelled_as_requested_ima
               "container": {"name": "vaws-alice", "ssh_port": 2201}, "user": "alice",
               "image": {"requested": "registry.example/ascend:old"}}
     service._configured_machines = lambda: [record]
+    monkeypatch.setattr(existing_container, 'observe_existing', lambda *a, **k: {'status': 'unknown'})
     target = SshTarget(host="192.0.2.10", user="root", port=22)
     remote = Mock(side_effect=[
         RemoteResult(target, 0, "", "", {"success": True, "suggested_port": 2299}),
