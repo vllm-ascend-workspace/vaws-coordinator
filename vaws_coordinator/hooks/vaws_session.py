@@ -35,6 +35,31 @@ def task_tool(name: str) -> bool:
     return any(name == tool or name.endswith(("__" + tool, ":" + tool)) for tool in TASK_TOOLS)
 
 
+def task_call(client: str, payload: dict) -> tuple[str, object, str, object]:
+    """Read native tool coordinates without opening a task or probing Git."""
+    name = str(payload.get("tool_name") or payload.get("toolName") or "")
+    arguments = payload.get("tool_input", payload.get("toolInput", {}))
+    nested_key = ""
+    selected = arguments
+    if client == "grok" and isinstance(arguments, dict):
+        nested_name = str(arguments.get("tool_name") or arguments.get("toolName") or "")
+        if nested_name:
+            name = nested_name
+            nested_key = "tool_input" if "tool_input" in arguments else "toolInput"
+            selected = arguments.get(nested_key, {})
+    return name, arguments, nested_key, selected
+
+
+def needs_task_context(client: str, payload: dict) -> bool:
+    name, _, _, arguments = task_call(client, payload)
+    return (client in {"claude", "codex", "grok", "cursor"} and task_tool(name)
+            and isinstance(arguments, dict) and not arguments.get("context_file"))
+
+
+def normalized_event(payload: dict) -> str:
+    return re.sub(r"[^a-z]", "", str(payload.get("hook_event_name") or payload.get("hookEventName") or "").lower())
+
+
 def attach_native(store: AgentSessions, client: str, native: str, cwd: str) -> tuple[AgentSessions, dict]:
     parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
     association = os.environ.get("VAWS_ATTACH_CONTEXT", "")
@@ -93,16 +118,11 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     # Grok also imports Cursor hooks by default.
     if client == "cursor" and GROK_EVENT_FIELD in payload and CURSOR_VERSION_FIELD not in payload:
         return {}
-    event = str(payload.get("hook_event_name") or payload.get("hookEventName") or "")
-    normalized = re.sub(r"[^a-z]", "", event.lower())
+    normalized = normalized_event(payload)
     cursor_pretool = client == "cursor" and normalized == "pretooluse"
-    if cursor_pretool:
-        # Cursor SessionStart is asynchronous. Only a VAWS MCP call needs its
-        # local attachment recovered here; ordinary native tools stay untouched.
-        arguments = payload.get("tool_input", {})
-        if (not task_tool(str(payload.get("tool_name") or ""))
-                or not isinstance(arguments, dict) or arguments.get("context_file")):
-            return {}
+    if normalized == "pretooluse" and not needs_task_context(client, payload):
+        # Even an older broad native matcher must leave ordinary tools alone.
+        return {}
     native = str((payload.get("conversation_id") if client == "cursor" else "")
                  or payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "")
     cwd = client_path(payload.get("cwd") or payload.get("workspaceRoot") or (payload.get("workspace_roots") or [str(Path.cwd())])[0])
@@ -149,6 +169,10 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             context = bind_native_defaults(store, context)
 
     context = store.bind_configured_user(context)
+    if client in {"claude", "codex", "grok", "cursor"} and normalized in {"userpromptsubmit", "beforesubmitprompt"}:
+        # Native tool injection retains context. Refresh cwd/user above, but do
+        # not append the same instructions on every user turn.
+        return {}
     if client == "kimi" and normalized == "userpromptsubmit" and payload.get("agent_id"):
         # The SessionSetup extension supplies this native agent id alongside
         # MCP call metadata. Keep cwd/user binding above, without appending a
@@ -160,21 +184,12 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             "otherwise use this context. Local editing needs no remote resources. "
             "For a child or authorized cross-tool handoff, pass this context explicitly.")
     if normalized == "pretooluse":
-        name = str(payload.get("tool_name") or payload.get("toolName") or "")
-        arguments = payload.get("tool_input") or payload.get("toolInput") or {}
         # Grok exposes MCP calls through its native `use_tool` dispatcher. Its
         # PreToolUse payload therefore puts the qualified MCP name and the
         # actual arguments one level deeper than Claude/Codex. Rewrite the
         # dispatcher envelope so the context receipt reaches the MCP server;
         # never flatten or infer the nested call from cwd/history.
-        nested_key = ""
-        nested_arguments = arguments
-        if client == "grok" and isinstance(arguments, dict):
-            nested_name = str(arguments.get("tool_name") or arguments.get("toolName") or "")
-            if nested_name:
-                name = nested_name
-                nested_key = "tool_input" if "tool_input" in arguments else "toolInput"
-                nested_arguments = arguments.get(nested_key) or {}
+        name, arguments, nested_key, nested_arguments = task_call(client, payload)
         if task_tool(name) and client in {"claude", "codex", "grok", "cursor"}:
             if not isinstance(nested_arguments, dict) or nested_arguments.get("context_file"):
                 return {}
@@ -205,6 +220,9 @@ def main():
     args = parser.parse_args()
     try:
         payload = json.load(sys.stdin)
+        if normalized_event(payload) == "pretooluse" and not needs_task_context(args.client, payload):
+            print("{}")
+            return 0
         if args.project:
             cwd = Path(client_path(payload.get("cwd") or payload.get("workspaceRoot") or
                        (payload.get("workspace_roots") or [str(Path.cwd())])[0])).resolve()

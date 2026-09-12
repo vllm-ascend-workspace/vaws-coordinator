@@ -194,6 +194,7 @@ def test_known_host_weight_mounts_keep_original_paths():
     assert 'if [ -e "$optional" ]; then' in bootstrap
 
 
+@pytest.mark.skipif(os.name == "nt", reason="executes the remote POSIX Bash payload with local paths; run on Linux/WSL")
 def test_actual_verification_payload_reads_execution_source_and_metadata(tmp_path):
     from vaws_coordinator.parity import runtime_install_step_script
     root, image = tmp_path / 'execution', tmp_path / 'image-python'
