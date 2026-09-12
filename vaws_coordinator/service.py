@@ -1397,13 +1397,15 @@ class CoordinatorService:
                 sessions.append((directory, store, executions))
                 execution_jobs.update(role["managed_job"] for row in executions
                                       if row.get("admitted") and row.get("phase") not in DONE
+                                      and not self._lock_for("execution", row["id"]).locked()
                                       for role in row.get("roles", []) if role.get("managed_job"))
             except Exception as exc:
                 self._record_daemon_error(f"sessions {directory}: {exc}")
                 continue
         # Each execution worker supervises its own roles. The pool services
-        # standalone jobs only, avoiding a second status/heartbeat sequence
-        # for every attached execution during the same daemon tick.
+        # standalone jobs and free roles of busy executions. One stalled host
+        # must not consume healthy siblings' renewal budget while their shared
+        # execution worker remains busy. Per-job locks prevent overlap.
         self.pool.tick(exclude_managed=execution_jobs)
         for directory, store, executions in sessions:
             finishing = {session["id"] for session in store.sessions() if session.get("state") == "finishing"}

@@ -145,6 +145,43 @@ def test_cached_status_never_admits_a_planned_execution(task):
     assert latest["phase"] == "planned" and not latest.get("admitted")
 
 
+def test_slow_role_does_not_block_a_healthy_siblings_lease_renewal(task):
+    task._seed(task.pool, "runtime-b-host", fixtures.runtime_spec(3, host="192.0.2.8", user="alice", recipe="rc"))
+    reply = task.client.run("unused", sources={}, topology={"distinct_hosts": True, "roles": [
+        {"name": "slow", "command": "slow", "npu_count": 1},
+        {"name": "healthy", "command": "healthy", "npu_count": 1},
+    ]})
+    execution = reply["execution_id"]
+    with task.store.transaction() as db:
+        row = task.store.get(db, "execution", execution)
+    roles = {role["name"]: role for role in row["roles"]}
+    slow_job = roles["slow"]["observation"]["job_id"]
+    healthy_job = roles["healthy"]["observation"]["job_id"]
+    slow_entered, healthy_entered, release = threading.Event(), threading.Event(), threading.Event()
+    original = task.backend.job
+    def delayed(runtime, job, action, **kwargs):
+        if action == "status" and job == slow_job:
+            slow_entered.set()
+            assert release.wait(5)
+        elif action == "status" and job == healthy_job:
+            healthy_entered.set()
+        return original(runtime, job, action, **kwargs)
+    with mock.patch.object(task.backend, "job", side_effect=delayed):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(task.client.observe, execution, refresh=True)
+            try:
+                assert slow_entered.wait(2) and healthy_entered.wait(2)
+                with task.pool._entity_lock("job", roles["healthy"]["managed_job"]):
+                    pass
+                task.backend.calls.clear()
+                task.client.coordinator._dispatch_progress()
+                assert ("host", "heartbeat") in task.backend.calls
+                assert ("job", "stop") not in task.backend.calls
+            finally:
+                release.set()
+                future.result(timeout=3)
+
+
 def test_cached_status_still_rejects_another_task_before_remote_control(task):
     from vaws_coordinator.task_client import TaskClient
     execution = task.client.run("true")["execution_id"]
