@@ -355,6 +355,17 @@ identities without starting a daemon. `--action restart-if-idle` asks the daemon
 to reject restart while work or unreleased leases remain; after an idle exit it
 starts the installed version. MCP tools report their own process identity and
 require a native-client MCP restart when stale. Missing commit metadata is unknown.
+Compact runtime observations retain each package's commit and the actual Python
+interpreter; differing client/daemon identities keep their full scope evidence.
+`current` compares loaded code with that process's installation, not upstream.
+Knowledge runs in a separate component and is not covered by these identities.
+Managed admission requires the daemon to match the caller's coordinator and
+remote-dev code identities, including commit and interpreter. A different idle
+daemon restarts automatically using the caller's interpreter, even when the
+version number is unchanged. Busy daemons keep their existing executions;
+new admission returns `needs_runtime_update` with selected/loaded identities
+and available active execution references. Status, tail and stop continue
+through the existing owner. No new execution is queued by this response.
 
 A run (or each topology role) may supply a `preflight` shell command to validate
 the prepared environment before any NPU lease is allocated. It uses the selected

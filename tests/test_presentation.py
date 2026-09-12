@@ -3,8 +3,10 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from remote_dev.result import make_result
-from vaws_coordinator.presentation import present
+from vaws_coordinator.presentation import compact_runtime, present
 
 
 def test_large_history_and_duplicate_envs_are_bounded_and_readable(tmp_path):
@@ -40,11 +42,12 @@ def test_full_mode_and_write_failure_preserve_operation_result(tmp_path):
 
 
 def test_healthy_runtime_is_small_but_full_and_unhealthy_facts_remain_available(tmp_path):
-    packages = {"vaws-coordinator": "0.4.0", "vaws-remote-dev": "0.7.0"}
-    runtime = {scope: [{"status": "current", "loaded": {"package": name, "version": version,
+    packages = {"vaws-coordinator": {"version": "0.4.0", "commit": "a" * 40},
+                "vaws-remote-dev": {"version": "0.7.0", "commit": None}}
+    runtime = {scope: [{"status": "current", "loaded": {"package": name, **identity,
                         "location": "/workspace/" * 40, "python": "/workspace/python", "pid": index},
-                       "installed": {"package": name, "version": version, "location": "/workspace/" * 40}}
-                      for index, (name, version) in enumerate(packages.items())]
+                       "installed": {"package": name, **identity, "location": "/workspace/" * 40}}
+                      for index, (name, identity) in enumerate(packages.items())]
                for scope in ("client", "daemon")}
 
     def result(facts):
@@ -52,7 +55,7 @@ def test_healthy_runtime_is_small_but_full_and_unhealthy_facts_remain_available(
                            extra={"runtime": facts, "data": {"execution_id": "e", "state": "preparing", "target": {"launch_preamble": "exact"}}})
 
     compact = present(result(runtime), tmp_path)
-    assert compact["runtime"] == {"status": "current", "packages": packages}
+    assert compact["runtime"] == {"status": "current", "packages": packages, "python": "/workspace/python"}
     assert len(json.dumps(compact["runtime"])) < len(json.dumps(runtime)) / 10
     assert json.loads(Path(compact["record_ref"]).read_text())["runtime"] == runtime
     assert present(result(runtime), tmp_path, full=True)["runtime"] == runtime
@@ -61,3 +64,14 @@ def test_healthy_runtime_is_small_but_full_and_unhealthy_facts_remain_available(
     unhealthy["daemon"][0].update(status="restart_required", error="daemon still has the old package loaded")
     preserved = present(result(unhealthy), tmp_path)
     assert preserved["runtime"] == unhealthy
+
+
+@pytest.mark.parametrize("changed,value", [("commit", "different-revision"), ("python", "/other/python"),
+                                         ("location", "/other/site-packages")])
+def test_same_version_in_different_runtimes_keeps_scope_evidence(changed, value):
+    loaded = {"package": "vaws-coordinator", "version": "0.4.1.dev1", "commit": "revision-a",
+              "python": "/env-a/python", "location": "/env-a/site-packages"}
+    other = {**loaded, changed: value}
+    runtime = {"client": [{"status": "current", "loaded": loaded, "installed": loaded}],
+               "daemon": [{"status": "current", "loaded": other, "installed": other}]}
+    assert compact_runtime(runtime) == runtime

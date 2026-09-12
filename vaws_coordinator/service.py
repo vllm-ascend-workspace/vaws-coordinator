@@ -247,14 +247,18 @@ class CoordinatorService(TaskMessages):
             with self._lifecycle_lock:
                 self._active_requests -= 1
 
+    def active_execution_refs(self):
+        return [{"execution_id": row["id"], "session_id": row["session_id"], "state": row["phase"]}
+                for directory in self._session_dirs for row in self.store(directory).all_executions()
+                if row.get("admitted") and row.get("phase") not in DONE]
+
     def restart_if_idle(self):
         with self._lifecycle_lock:
+            active = self.active_execution_refs()
             if self._active_requests or any(lock.locked() for lock in self._lock_registry.values()):
-                return {"status": "busy", "reason": "coordinator work is in progress"}
-            for directory in self._session_dirs:
-                if any(row.get("admitted") and row.get("phase") not in DONE
-                       for row in self.store(directory).all_executions()):
-                    return {"status": "busy", "reason": "nonterminal executions remain"}
+                return {"status": "busy", "reason": "coordinator work is in progress", "active_executions": active}
+            if active:
+                return {"status": "busy", "reason": "nonterminal executions remain", "active_executions": active}
             from vaws_coordinator.ready_runtime import TERMINAL
             with self.pool.transaction() as db:
                 if any(row.get("state") not in TERMINAL for row in self.pool.rows(db, "run")):
@@ -268,6 +272,11 @@ class CoordinatorService(TaskMessages):
             self.reconcile()
             return {"ok": True}
         if op == "admit":
+            selected = request.get("client_runtime") or []
+            if _runtime_identity(selected) != _runtime_identity(LOADED_RUNTIMES):
+                return {"ok": True, "value": _runtime_update(
+                    selected, [{"loaded": row} for row in LOADED_RUNTIMES],
+                    {"reason": "daemon code differs from the selected caller", "active_executions": self.active_execution_refs()})}
             value = self.admit(request["sessions_dir"], request["user"], request["session_id"],
                                request["spec"], restart=bool(request.get("restart")),
                                wait=not self._async_progress)
@@ -1529,8 +1538,14 @@ class CoordinatorClient:
         return reply.get("value")
 
     def admit(self, sessions_dir, user, session_id, spec, restart=False):
+        # A long-lived Python client must also retry an earlier busy upgrade.
+        # Existing execution controls bypass this admission-only boundary.
+        owner = ensure_daemon(self.state_dir)
+        self.runtime = owner.runtime
+        if not _daemon_runtime_matches(self):
+            return _runtime_update(LOADED_RUNTIMES, self.runtime, owner.runtime_update)
         return self.call("admit", sessions_dir=str(sessions_dir), user=user,
-                         session_id=session_id, spec=spec, restart=restart)
+                         session_id=session_id, spec=spec, restart=restart, client_runtime=LOADED_RUNTIMES)
 
     def advance(self, sessions_dir, user, execution_id, action="status", force=False, role=None, refresh=True):
         payload = dict(sessions_dir=str(sessions_dir), user=user,
@@ -1556,24 +1571,20 @@ class CoordinatorClient:
                          recipient=recipient, text=text)
 
 
-_DAEMON_UPGRADE_RETRY_SECONDS = 60.0
-_daemon_upgrade_attempts: dict[str, tuple[int | None, float]] = {}
+def _runtime_identity(rows):
+    return {row["package"]: {key: row.get(key) for key in ("version", "commit", "python", "location")}
+            for row in rows if row.get("package")}
 
 
-def _daemon_upgrade_due(client: CoordinatorClient) -> bool:
-    """Only a newer loaded caller may request the existing idle restart."""
-    from packaging.version import InvalidVersion, Version
+def _daemon_runtime_matches(client: CoordinatorClient) -> bool:
+    return _runtime_identity(LOADED_RUNTIMES) == _runtime_identity(
+        [row.get("loaded") or {} for row in client.runtime or []])
 
-    current = next((row for row in LOADED_RUNTIMES if row.get("package") == "vaws-coordinator"), {})
-    loaded = next((row.get("loaded") or {} for row in client.runtime or []
-                   if (row.get("loaded") or {}).get("package") == "vaws-coordinator"), {})
-    try:
-        if Version(str(current.get("version"))) <= Version(str(loaded.get("version"))):
-            return False
-    except InvalidVersion:
-        return False
-    previous = _daemon_upgrade_attempts.get(str(client.state_dir))
-    return previous is None or previous[0] != loaded.get("pid") or time.monotonic() >= previous[1]
+
+def _runtime_update(selected, daemon, facts):
+    return {"state": "needs_runtime_update", "reason": facts.get("reason", "daemon update is pending"),
+            "runtime_update": {"selected": selected, "daemon": daemon},
+            **({"active_executions": facts["active_executions"]} if "active_executions" in facts else {})}
 
 
 def ensure_daemon(state_dir: Path) -> CoordinatorClient:
@@ -1582,7 +1593,7 @@ def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     client = CoordinatorClient(state_dir)
     try:
         client.runtime = (client.call("ping") or {}).get("runtime")
-        if not _daemon_upgrade_due(client):
+        if _daemon_runtime_matches(client):
             return client
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
@@ -1612,20 +1623,15 @@ def _ensure_daemon_locked(state_dir: Path, client: CoordinatorClient) -> Coordin
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
     else:
-        if not _daemon_upgrade_due(client):
+        if _daemon_runtime_matches(client):
             return client
-        loaded = next((row.get("loaded") or {} for row in client.runtime or []
-                       if (row.get("loaded") or {}).get("package") == "vaws-coordinator"), {})
-        # Busy or unsupported older daemons stay usable. Reuse the ordinary
-        # ping and limit extra restart requests for this state/PID in-process.
-        _daemon_upgrade_attempts[str(state_dir)] = (
-            loaded.get("pid"), time.monotonic() + _DAEMON_UPGRADE_RETRY_SECONDS,
-        )
         try:
             reply = client.call("restart_if_idle")
-        except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+        except (RuntimeError, FileNotFoundError, ConnectionError, OSError) as exc:
+            client.runtime_update = {"reason": f"daemon idle restart unavailable: {exc}"}
             return client
         if not isinstance(reply, dict) or reply.get("status") != "stopping":
+            client.runtime_update = reply if isinstance(reply, dict) else {"reason": "daemon idle restart returned no status"}
             return client
         deadline = time.monotonic() + 5
         while socket_path(state_dir).exists() and time.monotonic() < deadline:

@@ -224,6 +224,20 @@ class DispatchTests(unittest.TestCase):
                 self.assertEqual(result["structuredContent"]["outcome"], outcome)
                 self.assertEqual(result["structuredContent"]["data"]["state"], state)
 
+    def test_pending_runtime_update_preserves_blocking_facts_without_claiming_admission(self):
+        from vaws_coordinator.task_client import TaskClient
+
+        pending = {"state": "needs_runtime_update", "reason": "nonterminal executions remain",
+                   "runtime_update": {"selected": [{"commit": "new"}], "daemon": [{"loaded": {"commit": "old"}}]},
+                   "active_executions": [{"execution_id": "e" * 64, "state": "running"}]}
+        with mock.patch.object(TaskClient, "run", return_value=pending):
+            result = self.call("vaws_run", command="true", sources={})
+        self.assertTrue(result["isError"])
+        observation = result["structuredContent"]
+        self.assertEqual((observation["outcome"], observation["status"]), ("blocked", "needs_runtime_update"))
+        self.assertEqual(observation["data"], pending)
+        self.assertNotIn("execution_id", observation["data"])
+
     def test_vaws_execution_rejects_an_id_it_does_not_own_before_any_network(self):
         result = self.call("vaws_execution", execution_id="not-an-id", action="status")
         self.assertTrue(result["isError"])

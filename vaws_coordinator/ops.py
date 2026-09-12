@@ -121,7 +121,7 @@ def vaws_call(name, args, *, allow_native_context=True):
             outcome = "timeout"
         elif status == "cancelled":
             outcome = "cancelled"
-        elif status in {"uncertain", "waiting_for_runtime"}:
+        elif status in {"uncertain", "waiting_for_runtime", "needs_runtime_update"}:
             outcome = "blocked"
         elif status in {"queued", "preparing", "waiting"} and not value.get("execution_id"):
             outcome = "blocked"
