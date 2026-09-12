@@ -32,8 +32,11 @@ for index, dtype in enumerate(parser[op_type]['input0.dtype'].split(',')):
 '''
 
 CONFIGURATOR = r'''
-import json, pathlib, sys
+import json, os, pathlib, sys
 root, unit = pathlib.Path(sys.argv[2]), sys.argv[4]
+assert root.name == 'bin' and root.parent.name == unit and root.parent.parent.name == 'binary'
+if os.environ.get('FAIL_CONFIG'):
+    raise RuntimeError('configuration failed after all OPC variants completed')
 for directory in root.iterdir():
     if not directory.is_dir():
         continue
@@ -225,7 +228,9 @@ def test_failed_variant_waits_for_siblings_and_never_publishes_or_replays(compil
         recipe.compile_kernel_recipe(root, plan, environment, read_recipe=compiled_opc_recipe)
     assert sorted(completed.read_text().splitlines()) == ['bfloat16', 'float32']
     assert not (root / 'vllm-ascend/csrc/build').exists()
-    assert not list((root / '.vaws-runtime').glob('kernel-recipe-*'))
+    stages = list((root / '.vaws-runtime').glob('kernel-recipe-*'))
+    assert len(stages) == 1
+    assert len(list((stages[0] / 'binary' / plan['unit'] / 'bin/fixture').glob('*.o'))) == 2
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='the real owned compiler commands execute on Linux')
@@ -234,6 +239,21 @@ def test_complete_files_do_not_hide_a_nonzero_opc_exit(compiler):
     environment['FAIL_AFTER_OUTPUT'] = 'float16'
     with pytest.raises(subprocess.CalledProcessError):
         recipe.compile_kernel_recipe(root, plan, environment, read_recipe=compiled_opc_recipe)
+    assert not (root / 'vllm-ascend/csrc/build').exists()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='the real owned compiler commands execute on Linux')
+def test_configuration_failure_preserves_completed_outputs_and_source_proofs(compiler, capsys):
+    root, plan, environment, _ = compiler
+    environment['FAIL_CONFIG'] = '1'
+    with pytest.raises(subprocess.CalledProcessError):
+        recipe.compile_kernel_recipe(root, plan, environment, read_recipe=compiled_opc_recipe)
+    stages = list((root / '.vaws-runtime').glob('kernel-recipe-*'))
+    assert len(stages) == 1
+    assert str(stages[0]) in capsys.readouterr().out
+    output = stages[0] / 'binary' / plan['unit'] / 'bin/fixture'
+    assert len(list(output.glob('*.o'))) == 3 and len(list(output.glob('*.json'))) == 3
+    assert len(list(stages[0].glob('*.source.json'))) == 3
     assert not (root / 'vllm-ascend/csrc/build').exists()
 
 

@@ -183,9 +183,11 @@ def compile_kernel_recipe(root: Path, plan: dict, environment: dict, *, read_rec
         return False
     stage = Path(tempfile.mkdtemp(prefix='kernel-recipe-', dir=root / '.vaws-runtime'))
     started = False
+    completed = False
     try:
-        generated = stage / 'gen'
-        generated.mkdir()
+        binary = stage / 'binary' / plan['unit']
+        generated = binary / 'gen'
+        generated.mkdir(parents=True)
         info = stage / 'operator.ini'
         info.write_text(ini, encoding='utf-8')
         tools = root / 'vllm-ascend/csrc/cmake/scripts/util'
@@ -221,7 +223,7 @@ def compile_kernel_recipe(root: Path, plan: dict, environment: dict, *, read_rec
         staged_source = source_dir / source.name
         dynamic_path.write_text(_guarded_dynamic(_recipe_child(root, dynamic).read_text(encoding='utf-8'),
             staged_source, plan['source_sha256'], root), encoding='utf-8')
-        output = stage / 'bin' / plan['operator']
+        output = binary / 'bin' / plan['operator']
         output.mkdir(parents=True)
         vendor = plan['kernel_root'].split('/op_impl/ai_core/tbe/', 1)[0]
         environment = {**environment, 'ASCEND_CUSTOM_OPP_PATH': str(_recipe_child(root, vendor)) +
@@ -264,17 +266,18 @@ def compile_kernel_recipe(root: Path, plan: dict, environment: dict, *, read_rec
         if ({path.name for path in output.iterdir()} != expected
                 or any(not path.is_file() or path.is_symlink() for path in output.iterdir())):
             raise ValueError('compiler did not produce every complete variant output')
-        subprocess.run([sys.executable, str(tools / 'ascendc_ops_config.py'), '-p', str(stage / 'bin'),
+        subprocess.run([sys.executable, str(tools / 'ascendc_ops_config.py'), '-p', str(binary / 'bin'),
                         '-s', plan['unit']], env=environment, check=True)
         destination = _recipe_child(root, 'vllm-ascend/csrc/build/binary/' + plan['unit'])
         destination.mkdir(parents=True)
-        (stage / 'bin').rename(destination / 'bin')
+        (binary / 'bin').rename(destination / 'bin')
         final_gen = destination / 'gen'
         for script in scripts:
             script.write_text(script.read_text(encoding='utf-8').replace(str(generated.resolve()), str(final_gen.resolve())), encoding='utf-8')
         generated.rename(final_gen)
         if [read_recipe(path) for path in sorted(final_gen.glob('*.sh'))] != generated_recipes:
             raise ValueError('relocated compiler evidence changed its effective recipe')
+        completed = True
         return True
     except RecipeUnavailable as exc:
         if started:
@@ -282,4 +285,7 @@ def compile_kernel_recipe(root: Path, plan: dict, environment: dict, *, read_rec
         print('native-incremental: recipe fallback: ' + str(exc), flush=True)
         return False
     finally:
-        shutil.rmtree(stage)
+        if started and not completed:
+            print('native-incremental: retained failed compiler stage: ' + str(stage), flush=True)
+        else:
+            shutil.rmtree(stage)
