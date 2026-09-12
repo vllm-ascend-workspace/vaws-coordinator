@@ -27,6 +27,21 @@ from vaws_coordinator.client_paths import client_path
 # Only the client's own adapter may create a root attachment.
 GROK_EVENT_FIELD = "hookEventName"
 CURSOR_VERSION_FIELD = "cursor_version"
+TASK_TOOLS = ("vaws_session", "vaws_run", "vaws_execution", "vaws_finish", "vaws_message")
+
+
+def task_tool(name: str) -> bool:
+    """Recognize the task tool itself, including native MCP-qualified names."""
+    return any(name == tool or name.endswith(("__" + tool, ":" + tool)) for tool in TASK_TOOLS)
+
+
+def attach_native(store: AgentSessions, client: str, native: str, cwd: str) -> tuple[AgentSessions, dict]:
+    parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
+    association = os.environ.get("VAWS_ATTACH_CONTEXT", "")
+    if parent or association:
+        inherited = load_context(parent or association)
+        store = AgentSessions(Path(inherited["state_dir"]))
+    return store, store.attach(client, native, cwd, parent_context=parent, association=association)
 
 
 def in_project_scope(cwd: Path, project: Path) -> bool:
@@ -78,13 +93,22 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     # Grok also imports Cursor hooks by default.
     if client == "cursor" and GROK_EVENT_FIELD in payload and CURSOR_VERSION_FIELD not in payload:
         return {}
-    store = store or AgentSessions()
     event = str(payload.get("hook_event_name") or payload.get("hookEventName") or "")
     normalized = re.sub(r"[^a-z]", "", event.lower())
-    native = str(payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "")
+    cursor_pretool = client == "cursor" and normalized == "pretooluse"
+    if cursor_pretool:
+        # Cursor SessionStart is asynchronous. Only a VAWS MCP call needs its
+        # local attachment recovered here; ordinary native tools stay untouched.
+        arguments = payload.get("tool_input", {})
+        if (not task_tool(str(payload.get("tool_name") or ""))
+                or not isinstance(arguments, dict) or arguments.get("context_file")):
+            return {}
+    native = str((payload.get("conversation_id") if client == "cursor" else "")
+                 or payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "")
     cwd = client_path(payload.get("cwd") or payload.get("workspaceRoot") or (payload.get("workspace_roots") or [str(Path.cwd())])[0])
     if not native:
         raise ValueError("hook has no native session identity; no task association was guessed")
+    store = store or AgentSessions()
 
     if normalized == "sessionstart":
         if payload.get("source") == "compact":
@@ -92,12 +116,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             if context["attachment"]["cwd"] != str(Path(cwd).resolve()):
                 context = store.attach(client, native, str(cwd))
         else:
-            parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
-            association = os.environ.get("VAWS_ATTACH_CONTEXT", "")
-            if parent or association:
-                inherited = load_context(parent or association)
-                store = AgentSessions(Path(inherited["state_dir"]))
-            context = store.attach(client, native, str(cwd), parent_context=parent, association=association)
+            store, context = attach_native(store, client, native, str(cwd))
         context = bind_native_defaults(store, context)
     elif normalized in {"subagentstart", "subagentstop"}:
         parent_native = str(payload.get("parent_conversation_id") or payload.get("parentSessionId") or native)
@@ -111,7 +130,14 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             return {}
         context = bind_native_defaults(store, context)
     else:
-        context = store.native_context(client, native, str(payload.get("agent_id") or ""))
+        agent_id = str(payload.get("agent_id") or "")
+        try:
+            context = store.native_context(client, native, agent_id)
+        except ValueError:
+            if not cursor_pretool or agent_id:
+                raise
+            store, context = attach_native(store, client, native, str(cwd))
+            context = bind_native_defaults(store, context)
         if normalized == "sessionend":
             store.detach(context)
             return {}
@@ -120,10 +146,10 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             context = bind_native_defaults(store, context)
 
     context = store.bind_configured_user(context)
-    hint = ("VAWS task context:\n" + context["context_file"] + "\n"
-            "Pass this as context_file to vaws_session/vaws_run/vaws_execution/vaws_finish. "
-            "Local editing needs no remote resources. For a child or authorized cross-tool handoff, "
-            "pass this context explicitly; a new user-initiated task must create its own VAWS session.")
+    hint = ("VAWS task automatically attached to this native session. Context:\n" + context["context_file"] + "\n"
+            "No session-creation call is needed. Native hooks supply context_file to supported task tools; "
+            "otherwise use this context. Local editing needs no remote resources. "
+            "For a child or authorized cross-tool handoff, pass this context explicitly.")
     if normalized == "pretooluse":
         name = str(payload.get("tool_name") or payload.get("toolName") or "")
         arguments = payload.get("tool_input") or payload.get("toolInput") or {}
@@ -140,10 +166,14 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
                 name = nested_name
                 nested_key = "tool_input" if "tool_input" in arguments else "toolInput"
                 nested_arguments = arguments.get(nested_key) or {}
-        if any(tool in name for tool in ("vaws_session", "vaws_run", "vaws_execution", "vaws_finish")) and client in {"claude", "codex", "grok"}:
+        if task_tool(name) and client in {"claude", "codex", "grok", "cursor"}:
             if not isinstance(nested_arguments, dict) or nested_arguments.get("context_file"):
                 return {}
             updated = {**nested_arguments, "context_file": context["context_file"]}
+            if client == "cursor":
+                # https://cursor.com/docs/hooks#pretooluse uses snake_case at
+                # the root, not Claude's hookSpecificOutput envelope.
+                return {"updated_input": updated}
             if nested_key:
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {**arguments, nested_key: updated}}}
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {**arguments, "context_file": context["context_file"]}}}

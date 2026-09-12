@@ -24,8 +24,9 @@ SERVICE_NAME = "vaws-coordinator-task"
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 ALIASES = {name.replace(".", "_"): name for name in TOOL_SCHEMAS}
 INSTRUCTIONS = (
-    "VAWS task tools. Pass the context_file supplied by the native session "
-    "hook; never guess a task from cwd or history. Sessions with no managed "
+    "VAWS task tools. Native hooks automatically attach the task; no session-creation call is needed. "
+    "Supported tool hooks supply context_file; otherwise use the native hook's context. "
+    "Never guess a task from cwd or history. Sessions with no managed "
     "hosts stay local. Normal run/status calls receive coordination messages "
     "opportunistically; use vaws_message only for a substantive request or reply."
 )
