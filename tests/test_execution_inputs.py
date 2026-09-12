@@ -78,17 +78,17 @@ def test_dirty_capture_preserves_head_index_and_ignored_files(tmp_path):
 
 def test_capture_retries_an_edit_during_capture_then_pins_the_stable_tree(tmp_path):
     source = repo(tmp_path / "repo")
-    from vaws_coordinator.parity import build_snapshot_records
+    from vaws_coordinator.parity import build_synthetic_snapshot
     calls = []
 
     def changing(*args, **kwargs):
-        result = build_snapshot_records(*args, **kwargs)
+        result = build_synthetic_snapshot(*args, **kwargs)
         calls.append(result)
         if len(calls) == 1:
             (source / "value.txt").write_text("B", encoding="utf-8")
         return result
 
-    with patch("vaws_coordinator.parity.build_snapshot_records", side_effect=changing):
+    with patch("vaws_coordinator.parity.build_synthetic_snapshot", side_effect=changing):
         fixed = capture_sources({"app": str(source)}, tmp_path / "state")
     assert len(calls) == 2
     assert git(source, "show", fixed["records"][0]["commit"] + ":value.txt") == "B"
@@ -96,17 +96,17 @@ def test_capture_retries_an_edit_during_capture_then_pins_the_stable_tree(tmp_pa
 
 def test_unstable_capture_is_not_admitted_and_cleans_temporary_refs(client, tmp_path):
     source = repo(tmp_path / "repo")
-    from vaws_coordinator.parity import build_snapshot_records
+    from vaws_coordinator.parity import build_synthetic_snapshot
     count = 0
 
     def changing(*args, **kwargs):
         nonlocal count
-        result = build_snapshot_records(*args, **kwargs)
+        result = build_synthetic_snapshot(*args, **kwargs)
         count += 1
         (source / "value.txt").write_text(str(count), encoding="utf-8")
         return result
 
-    with patch("vaws_coordinator.parity.build_snapshot_records", side_effect=changing):
+    with patch("vaws_coordinator.parity.build_synthetic_snapshot", side_effect=changing):
         with pytest.raises(ValueError, match="execution was not admitted"):
             client.run("true", sources={"app": str(source)})
     assert count == 3
