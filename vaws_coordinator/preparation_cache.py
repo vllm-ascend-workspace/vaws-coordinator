@@ -368,6 +368,10 @@ try:
                                        args.get('machine_type'), args.get('candidate'))
 except Exception as exc:
     result = {'status': 'miss', 'reason': str(exc)}
+if args['action'] == 'restore' and result.get('status') in {'hit', 'incremental'}:
+    # Rollback owns this full list in shared-native.json. The coordinator
+    # needs the outcome/compatibility facts, not every copied artifact path.
+    result = {key: value for key, value in result.items() if key != 'copied'}
 print(json.dumps(result))
 '''
 
