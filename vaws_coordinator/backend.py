@@ -69,6 +69,10 @@ class RemoteBackend:
         """Use the already persisted epoch for one host admission exchange."""
         return self.host(runtime, {**request, "action": "submit-acquire"})
 
+    def submit_and_preflight(self, runtime, request):
+        """The caller just verified this new run's fixed runtime inputs."""
+        return self.host(runtime, {**request, "action": "submit-acquire-preflight"})
+
     def preflight(self, binding, command, env):
         from vaws_coordinator.managed_execution import ExecutionRequestError, task_preamble
         script = "set -e\n" + "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())

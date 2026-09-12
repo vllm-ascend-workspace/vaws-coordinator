@@ -1579,6 +1579,7 @@ class NpuCoordinator:
             environment["VAWS_SERVICE_PORT"] = str(granted_service_port)
         return {
             "status": "granted",
+            "granted_now": True,
             "task": self._serialize_task(row),
             "environment": environment,
             "occupancy": observed,
@@ -1959,8 +1960,8 @@ def handle_request(
 ) -> dict[str, Any]:
     """Execute one structured coordinator request on the host."""
     action = request.get("action")
-    if action == "submit-acquire" and not request.get("coordination_epoch"):
-        raise CoordinationError("submit-acquire requires a previously observed coordination epoch")
+    if action in {"submit-acquire", "submit-acquire-preflight"} and not request.get("coordination_epoch"):
+        raise CoordinationError(f"{action} requires a previously observed coordination epoch")
     coordinator = NpuCoordinator(
         resolve_host_state_dir(request.get("state_dir")),
         clock=clock,
@@ -1974,7 +1975,7 @@ def handle_request(
         return coordinator.message_events(request)
     if action == "submit":
         return coordinator.submit(request)
-    if action == "submit-acquire":
+    if action in {"submit-acquire", "submit-acquire-preflight"}:
         submitted = coordinator.submit(request)
         if submitted["task"]["state"] != "queued":
             return submitted
@@ -1982,11 +1983,22 @@ def handle_request(
         # caller has one reply boundary; partial success stays discoverable
         # under this exact task ID if the probe or transport fails.
         needs_npu, needs_ports = coordinator.probe_requirements(request["task_id"])
-        return coordinator.acquire(
-            request["task_id"], probe() if needs_npu else None,
+        observed = probe() if needs_npu else None
+        acquired = coordinator.acquire(
+            request["task_id"], observed,
             grant_ttl_seconds=int(request.get("grant_ttl_seconds") or DEFAULT_GRANT_TTL_SECONDS),
             listening=listening_ports() if needs_ports else None,
         )
+        if action != "submit-acquire-preflight" or acquired.get("granted_now") is not True:
+            return acquired
+        # Only this acquire's new grant uses its immediately preceding sample.
+        # Existing grants returned above and queued retries keep normal preflight.
+        # The original transition still checks epoch, fence, expiry and conflicts.
+        started = coordinator.preflight(
+            request["task_id"], int(acquired["task"]["fence_token"]), observed,
+            start_ttl_seconds=int(request.get("start_ttl_seconds") or DEFAULT_START_TTL_SECONDS),
+        )
+        return {**started, "granted_task": acquired["task"]}
     needs_npu, needs_ports = (coordinator.probe_requirements(request["task_id"])
                               if action in {"acquire", "preflight", "release", "cancel", "status", "gc"} and request.get("task_id")
                               else (True, True))

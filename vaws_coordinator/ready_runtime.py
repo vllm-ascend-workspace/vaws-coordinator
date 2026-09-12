@@ -420,7 +420,7 @@ class RuntimePool(ManagedExecution):
     def _request_run(self, owner: str, binding_id: str, request_id: str, snapshots: dict[str, str],
                      expected_build_key: str, devices: list[int], npu_count: int,
                      priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None,
-                     allow_external_busy: bool = False, *, check_remote=True):
+                     allow_external_busy: bool = False, *, check_remote=True, _managed=False):
         try:
             safe_id(request_id)
         except ValueError as exc:
@@ -477,7 +477,7 @@ class RuntimePool(ManagedExecution):
                 self.put(db, "run", run)  # durable intent BEFORE the first host request
                 self.event(db, owner, "run-queued", run=key)
             self.export_execution_record(run, binding)
-            return self.control(owner, key, "poll")
+            return self.control(owner, key, "poll", _managed=_managed, _preflight_new=_managed)
 
     def owned_source_names(self, owner, session):
         with self.transaction() as db:
@@ -519,14 +519,32 @@ class RuntimePool(ManagedExecution):
         temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)
 
+    def _verify_run_preflight(self, run, runtime, *, managed):
+        try:
+            compact_verify = getattr(self.backend, "verify_preflight", None) if managed else None
+            if callable(compact_verify):
+                if compact_verify(runtime, snapshots=run["intent"]["snapshots"]) is not True:
+                    raise ValueError("runtime verification did not confirm the registered view")
+            else:
+                observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
+                if observed != runtime["attestation"]:
+                    raise ValueError("runtime changed before launch")
+        except Exception as exc:
+            if managed:
+                # Validation precedes any prepare; its failure survives restart.
+                run["preflight_error"] = str(exc)[:500]
+            raise
+
     def control(self, owner: str, run_id: str, action: str, pid: int = 0, *, _managed=False,
-                process_guard=None, completion_confirmed=False, _prepared_receipt=None):
+                process_guard=None, completion_confirmed=False, _prepared_receipt=None, _preflight_new=False):
         if action not in {"poll", "preflight", "activate", "heartbeat", "release", "cancel"}:
             raise ValueError("unsupported execution action")
         if completion_confirmed and not _managed:
             raise ValueError("only managed supervision can confirm descendant completion")
         if _prepared_receipt is not None and (not _managed or action != "activate"):
             raise ValueError("only managed activation can use a prepared supervisor receipt")
+        if _preflight_new and (not _managed or action != "poll"):
+            raise ValueError("only a new managed run can combine admission and preflight")
         with self._entity_lock("run", run_id):
             with self.lock, self.transaction() as db:
                 run = self.owned(db, "run", run_id, owner)
@@ -543,6 +561,7 @@ class RuntimePool(ManagedExecution):
             try:
                 pending_status = None
                 admission_reply = None
+                fresh_preflight = None
                 if run["state"] == "uncertain":
                     # A previous timed-out action may have succeeded. Recover by
                     # observing its exact task; never submit a replacement.
@@ -586,6 +605,18 @@ class RuntimePool(ManagedExecution):
                         run["task"], run["state"], run["submitted"] = existing[0], existing[0]["state"], True
                     elif self.clock() >= run["deadline"] or action == "cancel":
                         run["state"] = "expired" if action != "cancel" else "cancelled"
+                if run["state"] == "pending" and action == "poll" and _preflight_new:
+                    candidate = getattr(self.backend, "submit_and_preflight", None)
+                    if callable(candidate):
+                        self._verify_run_preflight(run, runtime, managed=True)
+                        # A cancellation may have arrived while the two runtime
+                        # reads joined. No host task has been submitted yet.
+                        with self.transaction() as db:
+                            cancelled = self.owned(db, "job", run_id, owner).get("cancel_requested")
+                        if cancelled:
+                            run["state"] = "cancelled"
+                        else:
+                            fresh_preflight = candidate
                 if run["state"] == "pending" and action == "poll":
                     intent = run["intent"]
                     submit = {**request, "action": "submit", "agent_id": "mcp-" + digest(owner)[:32],
@@ -598,7 +629,7 @@ class RuntimePool(ManagedExecution):
                     if intent.get("service_port") is not None:
                         submit["service_port"] = intent["service_port"]
                         submit["service_ports"] = runtime.get("service_ports", [])
-                    combined = getattr(self.backend, "submit_and_acquire", None)
+                    combined = fresh_preflight or getattr(self.backend, "submit_and_acquire", None)
                     if callable(combined):
                         # The epoch and exact task ID were persisted before
                         # this potentially mutating exchange. A lost reply
@@ -613,6 +644,8 @@ class RuntimePool(ManagedExecution):
                     with self.lock, self.transaction() as db:
                         previous = self.get(db, "run", run_id)
                         self.put(db, "run", run)
+                        if fresh_preflight and admission_reply.get("granted_task"):
+                            self.event(db, owner, "run-state", run=run_id, state="granted", error=None)
                         if admission_reply is not None and previous["state"] != run["state"]:
                             self.event(db, owner, "run-state", run=run_id,
                                        state=run["state"], error=run.get("error"))
@@ -628,23 +661,7 @@ class RuntimePool(ManagedExecution):
                         reply = {"task": status["tasks"][0]}
                 else:
                     if action == "preflight":
-                        try:
-                            compact_verify = getattr(self.backend, "verify_preflight", None) if _managed else None
-                            if callable(compact_verify):
-                                if compact_verify(runtime, snapshots=run["intent"]["snapshots"]) is not True:
-                                    raise ValueError("runtime verification did not confirm the registered view")
-                            else:
-                                observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
-                                if observed != runtime["attestation"]:
-                                    raise ValueError("runtime changed before launch")
-                        except Exception as exc:
-                            if _managed:
-                                # This read-only validation precedes host
-                                # preflight and payload preparation. Persist
-                                # rejection so supervision can drain/cancel
-                                # this exact job after a restart too.
-                                run["preflight_error"] = str(exc)[:500]
-                            raise
+                        self._verify_run_preflight(run, runtime, managed=_managed)
                     host_request = {**request, "action": action,
                               "fence_token": run.get("task", {}).get("fence_token"), "pid": pid,
                               **({"completion_confirmed": True} if action == "release" and completion_confirmed else {}),
@@ -672,7 +689,7 @@ class RuntimePool(ManagedExecution):
                     run["service_port"] = int(service_port)
             except Exception as exc:
                 # No host epoch means no mutating host request was sent yet.
-                if not (_managed and action == "preflight" and run.get("preflight_error")):
+                if not (_managed and (action == "preflight" or _preflight_new) and run.get("preflight_error")):
                     run["state"] = "uncertain" if run["epoch"] is not None else "pending"
                 run["error"] = str(exc)[:500]
             run["last_poll"] = self.clock()

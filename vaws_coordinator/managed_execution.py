@@ -129,9 +129,9 @@ class ManagedExecution:
                         job["runtime_returned"] = False
                         return self._save_managed(job)
                     # Fixed inputs and binding/lease parameters are admitted
-                    # locally. The complete remote fact check runs after the
-                    # grant, before any payload is prepared or authorized.
-                    run = self._request_run(job["owner"], **job["request"], check_remote=False)
+                    # locally. A new run can verify inputs immediately before
+                    # combined admission/preflight; queue recovery rechecks them.
+                    run = self._request_run(job["owner"], **job["request"], check_remote=False, _managed=True)
                 elif runs[0]["state"] in {"active", "orphaned_busy"}:
                     # A running job needs one authoritative renewal, below,
                     # after observing its supervisor. Polling the same lease
@@ -151,7 +151,7 @@ class ManagedExecution:
                 # This owner persists a run before its only prepare path. With
                 # no run on entry, no supervisor can have been sent yet. Any
                 # resumed run (even without a saved remote receipt) is observed.
-                known_absent = (not runs and run["state"] in {"pending", "queued", "granted"}
+                known_absent = (not runs and run["state"] in {"pending", "queued", "granted", "starting", "cancelled"}
                                 and not job.get("had_receipt") and not (job.get("remote") or {}).get("receipt"))
                 observed = ({"state": "absent", "quiet": True} if known_absent
                             else self.backend.job(runtime, job["job_id"], "status"))
@@ -163,6 +163,7 @@ class ManagedExecution:
                     # completion_confirmed or disable retain_until_release.
                     observed = {**observed, "quiet": False}
                 job["remote"] = observed
+                self._refresh_managed_cancel(job)
                 if run["state"] in {"uncertain", "pending"} and not job.get("preflight_error"):
                     job.update(state="waiting" if run["state"] == "pending" else "uncertain", error=run.get("error"))
                     return self._save_managed(job)
@@ -210,6 +211,8 @@ class ManagedExecution:
                             return self._save_managed(job)
                         return self._finish_managed(job, run, binding, runtime, observed)
                 if run["state"] == "starting":
+                    if self._refresh_managed_cancel(job):
+                        return self._cancel_managed_launch(job, run, binding, runtime, observed)
                     receipt = launch_observation(binding, job["request"], job["spec"], run["environment"])
                     job["launch_observation"] = receipt
                     command = task_preamble(binding)
@@ -248,6 +251,8 @@ class ManagedExecution:
                             job.update(state="waiting", remote=observed, lease_state="active")
                             return self._save_managed(job)
                         else:
+                            if self._refresh_managed_cancel(job):
+                                return self._cancel_managed_launch(job, run, binding, runtime, observed)
                             authorization = {"run_id": key, "epoch": run["epoch"], "fence": run["task"]["fence_token"]}
                             observed = self.backend.job(runtime, job["job_id"], "go", authorization=authorization)
                     elif observed["state"] == "absent":
@@ -267,6 +272,21 @@ class ManagedExecution:
             return self._save_managed(job)
         finally:
             lock.release()
+
+    def _refresh_managed_cancel(self, job):
+        with self.transaction() as db:
+            current = self.get(db, "job", job["id"])
+        if current.get("cancel_requested"):
+            job["cancel_requested"] = True
+            job["force"] = bool(job.get("force") or current.get("force"))
+        return job.get("cancel_requested", False)
+
+    def _cancel_managed_launch(self, job, run, binding, runtime, observed):
+        if not observed["quiet"]:
+            job["remote"] = self.backend.job(runtime, job["job_id"], "stop", force=job["force"])
+            job["state"] = "stopping"
+            return self._save_managed(job)
+        return self._finish_managed(job, run, binding, runtime, observed)
 
     def _save_managed(self, job):
         job["last_poll"] = self.clock()
