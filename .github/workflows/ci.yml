@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   developer-setup:
     # Fresh checkout: nothing before the README commands may touch `.venv`.
@@ -19,7 +26,6 @@ jobs:
         with:
           python-version: '3.12'
           activate-environment: false
-          enable-cache: false
 
       - name: Documented developer setup
         # remote-dev is public. Fetch it anonymously; do not reintroduce a
@@ -32,7 +38,13 @@ jobs:
           uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@862e9ae4ab5e4bb8252a99cfee8629dbfeeb2597"
           uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
           uv pip install -e . --no-deps
-          .venv/bin/python -m pytest -q
+          .venv/bin/python -m pytest -q --durations=20 --junitxml=linux-coordinator.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-coordinator-results
+          path: linux-coordinator.xml
 
   wheel:
     # P14: build the wheel, install it into a clean venv, import the
@@ -48,7 +60,6 @@ jobs:
         with:
           python-version: '3.12'
           activate-environment: false
-          enable-cache: false
 
       - name: Build, install the wheel, import, and --help
         env:
@@ -93,9 +104,34 @@ jobs:
           uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
           uv pip install -e . --no-deps
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .venv/Scripts/python.exe -m pytest -q tests --junitxml=windows-coordinator.xml
+          .venv/Scripts/python.exe -m pytest -q tests --durations=20 --junitxml=windows-coordinator.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: windows-coordinator-results
           path: windows-coordinator.xml
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          activate-environment: false
+      - name: Validate the native macOS control plane
+        env:
+          HOME: ${{ runner.temp }}/coordinator-test-home
+        run: |
+          mkdir -p "$HOME"
+          uv venv
+          uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@862e9ae4ab5e4bb8252a99cfee8629dbfeeb2597"
+          uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
+          uv pip install -e . --no-deps
+          .venv/bin/python -m pytest -q tests --durations=20 --junitxml=macos-coordinator.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-coordinator-results
+          path: macos-coordinator.xml

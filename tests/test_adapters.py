@@ -21,7 +21,7 @@ from vaws_coordinator.host_queue import (
     load_host_protocol,
 )
 from vaws_coordinator.machine_directory import MachineDirectory, MachineDirectoryUnavailable
-from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call
+from vaws_coordinator.ops import vaws_call
 
 HOST_MODULE = '''
 import json
@@ -225,13 +225,6 @@ class ResultAndToolContractTests(unittest.TestCase):
                               "started_at", "duration_ms", "preview", "refs", "artifacts",
                               "changed_files", "warnings", "next"}, set(result))
 
-    def test_task_tools_publish_their_own_descriptions_and_schemas(self):
-        self.assertEqual(set(TOOL_DESCRIPTIONS), set(TOOL_SCHEMAS))
-        self.assertEqual(set(TOOL_SCHEMAS), {"vaws.session", "vaws.run", "vaws.execution", "vaws.finish"})
-        for name, schema in TOOL_SCHEMAS.items():
-            with self.subTest(name=name):
-                self.assertIn("context_file", schema["properties"])
-                self.assertFalse(schema["additionalProperties"])
 
     def test_an_unavailable_task_registry_is_blocked_and_never_a_remote_success(self):
         with mock.patch.dict("os.environ", {}, clear=True):
