@@ -243,7 +243,9 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
         assert isinstance(kwargs['process'], PreparationProcess)
         seen.append('materialize')
     monkeypatch.setattr(parity, 'materialize_fixed_sources', materialize)
-    monkeypatch.setattr(parity_support, 'ssh_exec_stream', lambda *a, **k: seen.append('prepare-root'))
+    from remote_dev.core.ssh_transport import RemoteCompleted
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script',
+                        lambda *a, **k: seen.append('prepare-root') or RemoteCompleted(0, '', ''))
     monkeypatch.setattr(adapters, 'native_compatibility_key', lambda manifest: 'existing-proof')
     monkeypatch.setattr(backend, '_prepare_native_view', lambda *a, **k: seen.append('publish') or published)
     monkeypatch.setattr(backend, 'bash', lambda *a, **k: pytest.fail('hot preparation has no extra shell probe'))

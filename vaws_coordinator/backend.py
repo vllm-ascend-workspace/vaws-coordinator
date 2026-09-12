@@ -376,8 +376,34 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         for step, script in scripts:
             check_cancel()
             log = progress(step)
-            ssh_exec_stream(container, script, stream_progress=False, log_path=log,
-                            process=owned_process(step) if step != "prepare-root" else None)
+            if step == "prepare-root":
+                from remote_dev.core.ssh_transport import run_rpc_script
+                from vaws_coordinator.parity_support import RemoteCommandError
+
+                # A short package-owned filesystem command can establish the
+                # same RPC connection used by the subsequent owned job. The
+                # Python RPC does not require its endpoint root to exist yet.
+                try:
+                    completed = run_rpc_script(resolve_endpoint(endpoint), script, timeout_ms=45000)
+                except Exception as exc:
+                    if log:
+                        with Path(log).open('a', encoding='utf-8') as stream:
+                            stream.write(str(exc) + '\n')
+                    raise
+                if log:
+                    with Path(log).open('a', encoding='utf-8') as stream:
+                        stream.write((completed.stdout or '') + (completed.stderr or ''))
+                if completed.cancelled:
+                    from vaws_coordinator.preparation_process import PreparationCancelled
+                    raise PreparationCancelled('root preparation cancelled after its command stopped')
+                code = 255 if completed.timed_out or completed.returncode is None else completed.returncode
+                if code:
+                    raise RemoteCommandError(code, f'command failed ({code}): prepare-root\n'
+                        f'stdout:\n{completed.stdout or ""}\nstderr:\n{completed.stderr or ""}')
+            else:
+                ssh_exec_stream(container, script, stream_progress=False, log_path=log,
+                                process=owned_process(step))
+            check_cancel()
         identity = spec.get("container_name") or ("vaws-" + spec["user"])
         log = progress("materialize")
         if sources:
