@@ -71,6 +71,11 @@ SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}$")
 class CoordinationError(RuntimeError):
     """Raised for deterministic coordinator input or state failures."""
 
+    def __init__(self, message: str, *, error_code: str | None = None, port: int | None = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.port = port
+
 
 def prepared_supervisor_host_pid(prepared: dict, process_guard: dict | None) -> int:
     """Resolve a container receipt immediately before fenced activation."""
@@ -1368,7 +1373,8 @@ class NpuCoordinator:
         if existing is not None:
             if existing["task_id"] == task_id and existing["kind"] == kind:
                 return port
-            raise CoordinationError(f"port {port} is already reserved as {existing['kind']}")
+            raise CoordinationError(f"port {port} is already reserved as {existing['kind']}",
+                                    error_code="port_reserved", port=port)
         if not allow_listening:
             if listening is None or listening.get("status") != "ok":
                 raise CoordinationError(
@@ -1457,14 +1463,16 @@ class NpuCoordinator:
             (task_id,),
         )
 
-    def reserve_container_ssh(self, request: dict[str, Any]) -> dict[str, Any]:
+    def reserve_container_ssh(
+        self, request: dict[str, Any], *, listening: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         user = require_safe_id(request.get("user"), label="user")
         container_name = require_safe_id(request.get("container_name"), label="container name")
         expected = user_container_name(user)
         if container_name != expected:
             raise CoordinationError(f"container name must be {expected}")
         port = int(request["port"])
-        if not 0 < port < 65536:
+        if not 0 <= port < 65536:
             raise CoordinationError(f"invalid TCP port: {port}")
         task_id = container_ssh_task_id(user)
         now = self.clock()
@@ -1474,13 +1482,27 @@ class NpuCoordinator:
                 (task_id,),
             ).fetchone()
             if existing is not None:
-                if int(existing["port"]) != port or existing["owner"] != user:
+                if (port and int(existing["port"]) != port) or existing["owner"] != user:
                     raise CoordinationError(
-                        f"user {user} already has SSH port {existing['port']} reserved"
+                        f"user {user} already has SSH port {existing['port']} reserved",
+                        error_code="container_ssh_port_mismatch", port=int(existing["port"]),
                     )
                 port = int(existing["port"])
                 reused = True
             else:
+                automatic = port == 0
+                if automatic:
+                    if listening is None or listening.get("status") != "ok":
+                        raise CoordinationError("host listening ports are unavailable",
+                                                error_code="listening_unavailable")
+                    live = {int(item) for item in listening.get("ports", [])}
+                    allocated = self._allocated_ports(connection)
+                    first, last = parse_port_range(DEFAULT_CONTAINER_SSH_PORT_RANGE)
+                    port = next((candidate for candidate in range(first, last + 1)
+                                 if candidate not in live and candidate not in allocated), 0)
+                    if not port:
+                        raise CoordinationError("no free container SSH port",
+                                                error_code="container_ssh_port_exhausted")
                 self._claim_port(
                     connection,
                     port=port,
@@ -1488,7 +1510,8 @@ class NpuCoordinator:
                     task_id=task_id,
                     owner=user,
                     now=now,
-                    allow_listening=True,
+                    listening=listening,
+                    allow_listening=not automatic,
                 )
                 reused = False
             self._event(
@@ -2168,5 +2191,10 @@ def handle_request(
             event_limit=int(request.get("event_limit") or 50),
         )
     if action == "container-ssh-reserve":
-        return coordinator.reserve_container_ssh(request)
+        # Fixed ports can describe an existing container listener. Automatic
+        # selection excludes both the live sample and reservations, under the
+        # same write transaction that claims the chosen port.
+        return coordinator.reserve_container_ssh(
+            request, listening=listening_ports() if int(request["port"]) == 0 else None,
+        )
     raise CoordinationError(f"unsupported action: {action!r}")

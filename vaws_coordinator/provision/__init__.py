@@ -125,11 +125,16 @@ def provision_user_container(
     )
     chosen_port = int(ssh_port or probe_payload.get("free_port") or probe_payload.get("suggested_port") or probe_payload.get("ssh_port")
                       or probe_payload.get("container_ssh_port") or 0)
-    if chosen_port <= 0:
-        raise host_ops.MachineManagementError("host probe did not offer a container SSH port")
     if reserve_port is not None:
-        reserved = measured('ssh-port-reservation', lambda: reserve_port(user=user, container_name=container, port=chosen_port))
-        chosen_port = int(reserved.get("port") or chosen_port)
+        # A probe's free port is only a live observation, not a reservation.
+        # Let the host owner select and claim an automatic port atomically.
+        requested_port = int(ssh_port or 0)
+        reserved = measured('ssh-port-reservation', lambda: reserve_port(user=user, container_name=container, port=requested_port))
+        chosen_port = int(reserved.get("port") or 0)
+        if requested_port and chosen_port != requested_port:
+            raise host_ops.MachineManagementError("reserved SSH port differs from the requested fixed port")
+    if chosen_port <= 0:
+        raise host_ops.MachineManagementError("host did not reserve or offer a container SSH port")
     key_path = host_ops.find_public_key(None)
     public_key = host_ops.load_public_key(key_path)
     remote('container-bootstrap',
