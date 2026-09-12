@@ -44,8 +44,9 @@ changes defaults for future submissions. It does not affect active executions
 or require their bindings to be returned.
 
 `client.run(command, sources={"app": "/actual/worktree"})` captures fixed Git
-content and SCM provenance before admission. Omitted `sources` uses the task's
-current defaults; `sources={}` explicitly runs without source dependencies.
+content and SCM provenance before admission. Omitted `sources` uses explicit
+task defaults, or this native attachment's automatic cwd binding when no
+explicit defaults were set; `sources={}` runs without source dependencies.
 Defaults are replaced by `client.sources(mapping)`, including `{}` to clear
 them. All roles consume one accepted snapshot; later edits affect only later
 submissions. Replies expose `source_snapshot_id` and the selected source map.

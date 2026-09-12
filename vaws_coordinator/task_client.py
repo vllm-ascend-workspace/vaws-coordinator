@@ -71,10 +71,13 @@ class TaskClient:
             raise ValueError("preflight must be a nonempty shell command")
         from vaws_coordinator.execution_sources import capture_sources
         if sources is None:
-            # Resolve defaults once. Accepted work never consults this mutable
-            # session mapping again, even if another attached client changes it.
+            # Resolve this attachment's automatic sources or explicit task
+            # override once. Accepted work never consults either mapping again.
             context = self.store.context(self.context["attachment"]["id"])
-            sources = {name: source["path"] for name, source in context["session"].get("sources", {}).items()}
+            defaults = context["source_defaults"]
+            if defaults["origin"] == "unknown":
+                raise ValueError(defaults["reason"])
+            sources = {name: source["path"] for name, source in defaults["sources"].items()}
         source_snapshot = capture_sources(sources, self.store.state_dir)
         spec = {
             "command": command, "env": env, "environment": environment or {},

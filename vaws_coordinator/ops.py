@@ -19,7 +19,7 @@ LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws
 
 TOOL_DESCRIPTIONS = {
     "vaws.session": "Inspect this native session's VAWS task or replace source defaults for future submissions. Local only: no machine is required. Active executions retain their submitted inputs.",
-    "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Sources omitted uses task defaults; sources={} runs without source dependencies. Devices default to zero. The coordinator places, prepares, launches and supervises the execution.",
+    "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Omitted sources uses explicit task defaults or this native attachment's automatic cwd binding; sources={} runs without source dependencies. Devices default to zero. The coordinator places, prepares, launches and supervises the execution.",
     "vaws.execution": "Use action=status (default), tail, stop or target with an execution_id or task-scoped service name belonging to this VAWS task. Status reads current progress; stop releases that execution's devices and ports. The container and execution root remain.",
     "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
 }
@@ -48,7 +48,7 @@ TOOL_SCHEMAS = {
     "vaws.session": task_schema({"sources": {"type": "object", "additionalProperties": {"type": "string"}}}),
     "vaws.run": task_schema({
         "command": {"type": "string"},
-        "sources": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Actual worktrees to capture once for this execution. Omit to use task defaults; {} explicitly selects no sources."},
+        "sources": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Actual worktrees to capture once. Omit to use explicit task defaults or this attachment's automatic cwd binding; {} selects no sources."},
         "preflight": {"type": "string", "description": "Optional validation command in the prepared root before NPU allocation. It must not require devices or start a service."},
         "env": {"type": "object", "additionalProperties": {"type": "string"}},
         "environment": {"type": "object", "additionalProperties": False, "properties": {

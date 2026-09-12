@@ -23,6 +23,29 @@ from vaws_coordinator.client_paths import client_path
 CLIENTS = {"claude", "grok", "kimi", "codex", "cursor"}
 
 
+def git_common_directory(path: str | Path) -> Path:
+    """Resolve repository identity with Git, including linked-worktree subdirs."""
+    directory = Path(client_path(path)).expanduser().resolve(strict=True)
+    result = subprocess.run(
+        ["git", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+    )
+    return Path(client_path(result.stdout.strip())).resolve(strict=True)
+
+
+def source_defaults(session: dict, attachment: dict) -> dict:
+    """Select proven explicit task defaults or this native attachment's sources."""
+    if session.get("source_mode") == "explicit":
+        return {"origin": "explicit", "sources": session.get("sources", {})}
+    if session.get("sources"):
+        # Previous releases mixed automatic and explicit mappings. Neither a
+        # matching path nor a one-entry map establishes which one was intended.
+        return {"origin": "unknown", "sources": {},
+                "reason": "Saved source defaults have no provenance; set sources explicitly before submitting, "
+                          "or pass sources on this run. No legacy mapping was assumed to follow the native cwd."}
+    return {"origin": attachment.get("source_mode", "none"), "sources": attachment.get("sources", {})}
+
+
 def worktree_reference(path: str) -> dict:
     """Inspect an actual repository; never materialize a second source copy."""
     source = Path(client_path(path)).expanduser().resolve(strict=True)
@@ -77,6 +100,7 @@ class AgentSessions:
             session = self.get(db, "session", attachment["session_id"])
         return {"schema_version": "vaws.agent-context.v1", "state_dir": str(self.state_dir),
                 "session": session, "attachment": attachment,
+                "source_defaults": source_defaults(session, attachment),
                 "context_file": str(self.state_dir / "contexts" / (attachment_id + ".json"))}
 
     def _publish(self, attachment_id):
@@ -108,6 +132,7 @@ class AgentSessions:
         # parent's native session id for child conversations.
         identity = [client, native_session_id, agent_id]
         key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        actual_cwd = str(Path(client_path(cwd)).expanduser().resolve())
         with self.transaction() as db:
             existing = [row for row in self.rows(db, "attachment") if row["id"] == key]
             if not existing:
@@ -117,13 +142,14 @@ class AgentSessions:
                     if session["state"] != "open":
                         raise ValueError("task is finished; explicitly reopen it before attaching")
                 else:
-                    self.put(db, "session", {"id": session_id, "state": "open", "created_at": now, "sources": {}})
+                    self.put(db, "session", {"id": session_id, "state": "open", "created_at": now,
+                                             "sources": {}, "source_mode": "automatic"})
                 self.put(db, "attachment", {
                     "id": key, "session_id": session_id, "client": client,
                     "native_session_id": native_session_id, "agent_id": agent_id or None,
                     "parent_id": parent["attachment"]["id"] if parent_context else None,
                     "association": "child" if parent_context else "explicit" if association else "new-task",
-                    "cwd": str(Path(client_path(cwd)).expanduser().resolve()), "state": "attached", "created_at": now,
+                    "cwd": actual_cwd, "state": "attached", "created_at": now,
                 })
             else:
                 old = existing[0]
@@ -140,7 +166,12 @@ class AgentSessions:
                 elif session["state"] == "finished":
                     session["state"] = "open"
                     self.put(db, "session", session)
-                old.update(state="attached", resumed_at=now)
+                if old.get("cwd") != actual_cwd:
+                    # A native handoff can move this attachment. Never retain
+                    # the previous mutable automatic source after that move.
+                    old.pop("sources", None)
+                    old.pop("source_mode", None)
+                old.update(state="attached", resumed_at=now, cwd=actual_cwd)
                 self.put(db, "attachment", old)
         return self._publish(key)
 
@@ -167,8 +198,23 @@ class AgentSessions:
             # Defaults apply only to future submissions. Replace the mapping
             # so {} can deliberately clear it and removed repos do not linger.
             session["sources"] = references
+            session["source_mode"] = "explicit"
             self.put(db, "session", session)
         return self.context(context["attachment"]["id"])
+
+    def bind_native_sources(self, context: dict) -> dict:
+        """Bind only this attachment's actual cwd, without changing task defaults."""
+        attachment = self.context(context["attachment"]["id"])["attachment"]
+        reference = worktree_reference(attachment["cwd"])
+        common = Path(reference["git_common_dir"])
+        name = common.parent.name if common.name == ".git" else common.stem
+        with self.transaction() as db:
+            current = self.get(db, "attachment", attachment["id"])
+            if current["cwd"] != attachment["cwd"]:
+                raise ValueError("native working directory changed while binding its source")
+            current.update(sources={name: reference}, source_mode="native-cwd")
+            self.put(db, "attachment", current)
+        return self.context(attachment["id"])
 
     def detach(self, context: dict) -> dict:
         with self.transaction() as db:

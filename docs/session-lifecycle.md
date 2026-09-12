@@ -63,11 +63,27 @@ maintenance and explicit deletion are separate from task completion.
 
 ## Operations
 
-**Set defaults.** Native identity is associated lazily. Source defaults can be
-replaced while executions are active; this does not prepare anything or reserve
-devices. An explicit empty source map clears the defaults.
+**Set defaults.** Native identity is associated lazily. Hook-discovered source
+defaults belong to that native attachment, using its actual cwd. Resume or
+handoff refreshes that attachment's cwd and automatic sources while preserving
+the native task identity. Sibling attachments do not overwrite one another.
+Explicit task source defaults override automatic sources, including an explicit
+empty map. Changing either default affects future submissions only.
 
-**Submit.** Resolve sources from the current call or task defaults and capture
+Scoped hooks recognize external Git linked worktrees through the actual common
+Git directory, and existing registered submodules through Git's superproject
+chain. A repository URL or directory name is not an identity proof. The owner
+must be able to read the paths and Git metadata; a native client's independent
+repository copy is not automatically associated as a linked worktree. These
+hooks observe the client-selected workspace. They do not create a worktree or
+change the parent client's cwd before its first tool call.
+
+`source_defaults` reports the effective map and its provenance. Saved task
+maps from older versions without provenance are reported as unknown; the
+coordinator does not guess whether they were explicit or automatic. A new
+explicit task binding or per-run `sources` resolves that ambiguity.
+
+**Submit.** Resolve sources from the current call or effective defaults and capture
 their Git content and true SCM version once, before durable admission. Edits
 during capture receive bounded retries; unstable input is not admitted. Each
 role uses the same fixed descriptor. Source-free commands need no vLLM trees;

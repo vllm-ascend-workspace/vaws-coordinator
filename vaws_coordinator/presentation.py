@@ -34,6 +34,8 @@ def compact_data(value: dict, *, target=False) -> dict:
         result = {"session": {key: session[key] for key in ("id", "state", "sources") if key in session},
                   "context_file": value.get("context_file"),
                   "attachments_count": len(value.get("attachments") or [])}
+        if "source_defaults" in value:
+            result["source_defaults"] = value["source_defaults"]
     else:
         result = execution_summary(value, target=target)
     if "executions" in value:
