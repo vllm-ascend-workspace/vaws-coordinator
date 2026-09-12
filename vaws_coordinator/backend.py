@@ -522,6 +522,13 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                 else:
                     install('install-vllm-ascend-requirements')
                 install('verify-deps')
+                validated = self._shared_native(spec, 'revalidate', versions,
+                    process=owned_process('shared-native-revalidate-after-dependencies'))
+                if validated.get('status') != 'validated':
+                    # Imports or broad requirement ranges cannot establish the
+                    # original bundle's ABI after a dependency overlay changed.
+                    rebuild(validated.get('reason', 'cached native environment changed during dependency repair'))
+                    return True
             if cache['status'] == 'incremental':
                 install('install-vllm-ascend-incremental')
                 compiled_native = True

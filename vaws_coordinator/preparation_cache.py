@@ -229,6 +229,37 @@ def recipient_dependencies(distributions: dict, profile: dict) -> dict:
             'interpreter': sys.executable, 'prefix': sys.prefix, 'purelib': sysconfig.get_paths()['purelib']}
 
 
+def verify_recipient_native_abi(profile: dict) -> None:
+    """A dependency repair must preserve the environment that built the bundle."""
+    if profile['python_abi'] != sysconfig.get_config_var('SOABI'):
+        raise ValueError('cached Python ABI differs')
+    for field, package in (('torch', 'torch'), ('torch_npu', 'torch-npu')):
+        if importlib.metadata.version(package) != profile[field]:
+            raise ValueError('cached package ABI differs: ' + package)
+    for row in profile['system_files'].values():
+        if file_digest(Path(row['path'])) != row['sha256']:
+            raise ValueError('cached CANN/driver support differs')
+
+
+def revalidate_shared_native(root: Path, cache: Path) -> dict:
+    """Recheck the fixed selected bundle after pip or dependency-overlay repair."""
+    receipt = json.loads(safe_destination(root, '.vaws-runtime/shared-native.json').read_text())
+    name = receipt.get('bundle', '')
+    if not re.fullmatch('[0-9a-f]{64}', name):
+        raise ValueError('shared native receipt has no fixed bundle')
+    data = (cache / 'bundles' / name / 'manifest.json').read_bytes()
+    if hashlib.sha256(data).hexdigest() != receipt.get('bundle_manifest_sha256'):
+        raise ValueError('selected shared native bundle manifest changed')
+    profile = json.loads(data)['profile']
+    verify_recipient_native_abi(profile)
+    # Dependency copying has its own receipt. Keep the original native proof
+    # so later profile capture cannot lose the bundle's SoC/compiler evidence.
+    safe_destination(root, '.vaws-runtime/reuse.json').write_text(json.dumps({
+        'kind': 'shared-native', 'native_key': receipt['native_key'],
+        'soc': profile['soc'], 'compiler': profile['compiler']}))
+    return {'status': 'validated', 'bundle': name}
+
+
 def restore_shared_native(root: Path, cache: Path, preparation: dict, image_digest: str, versions: dict,
                           machine_type: str | None = None) -> dict:
     """Copy an ABI-compatible cached bundle into this execution's own sources."""
@@ -242,7 +273,8 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
     if not re.fullmatch('[0-9a-f]{64}', pointer.get('bundle', '')):
         raise ValueError('invalid shared native cache pointer')
     bundle = cache / 'bundles' / pointer['bundle']
-    manifest = json.loads((bundle / 'manifest.json').read_text())
+    manifest_bytes = (bundle / 'manifest.json').read_bytes()
+    manifest = json.loads(manifest_bytes)
     profile = manifest['profile']
     expected = verified_preparation(preparation, profile)
     baseline = manifest.get('preparation', {})
@@ -271,14 +303,7 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
         plan = kernel_rebuild_plan(root, bundle, manifest, preparation, entries)
         if plan is None:
             return {'status': 'miss', 'reason': 'native changes require a complete build'}
-    if profile['python_abi'] != sysconfig.get_config_var('SOABI'):
-        raise ValueError('cached Python ABI differs')
-    for field, package in (('torch', 'torch'), ('torch_npu', 'torch-npu')):
-        if importlib.metadata.version(package) != profile[field]:
-            raise ValueError('cached package ABI differs: ' + package)
-    for row in profile['system_files'].values():
-        if file_digest(Path(row['path'])) != row['sha256']:
-            raise ValueError('cached CANN/driver support differs')
+    verify_recipient_native_abi(profile)
     verify(bundle, manifest, check_environment=False)
     if 'vllm-ascend/vllm_ascend/_build_info.py' not in manifest['files']:
         raise ValueError('cached generated build metadata is missing')
@@ -286,7 +311,9 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
     for name in manifest['files']:
         if safe_destination(root, name).exists():
             raise ValueError('native output already exists in fresh view: ' + name)
-    receipt = {'status': 'incremental' if plan else 'hit', 'native_key': expected['native_key'], 'copied': list(manifest['files'])}
+    receipt = {'status': 'incremental' if plan else 'hit', 'native_key': expected['native_key'],
+               'copied': list(manifest['files']), 'bundle': pointer['bundle'],
+               'bundle_manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest()}
     marker = safe_destination(root, '.vaws-runtime/shared-native.json')
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(receipt))
@@ -323,6 +350,8 @@ try:
     elif args['action'] == 'discard':
         discard_shared_native(root)
         result = {'status': 'discarded'}
+    elif args['action'] == 'revalidate':
+        result = revalidate_shared_native(root, cache)
     else:
         result = restore_shared_native(root, cache, args['preparation'], args['image_digest'], args['versions'], args.get('machine_type'))
 except Exception as exc:

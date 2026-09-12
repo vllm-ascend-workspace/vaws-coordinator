@@ -183,8 +183,8 @@ def test_cached_outputs_can_be_discarded_before_normal_build(bundle):
     assert (next((shared / 'bundles').iterdir()) / relative).is_file()
 
 
-@pytest.mark.parametrize('failure', [None, 'profile', 'cache-miss', 'missing-dependency', 'broken-dependency',
-                                    'cancel-profile', 'uncertain-profile'])
+@pytest.mark.parametrize('failure', [None, 'profile', 'cache-miss', 'missing-dependency', 'broken-dependency', 'repaired-abi',
+                                    'cancel-profile', 'uncertain-profile', 'cancel-revalidate', 'uncertain-revalidate'])
 def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeypatch, failure):
     import vaws_coordinator.parity as parity
     import vaws_coordinator.parity_support as transport
@@ -219,9 +219,14 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
             raise RuntimeError('cached profile import does not load')
     def operation(spec, action, versions, **kwargs):
         operations.append(action)
+        if action == 'revalidate' and failure in ('cancel-revalidate', 'uncertain-revalidate'):
+            raise (PreparationCancelled if failure.startswith('cancel') else PreparationUncertain)('owned process interrupted')
         return {'status': {'restore': 'miss' if failure == 'cache-miss' else 'hit',
-                           'store': 'miss', 'discard': 'discarded'}[action], 'reason': 'fixture cache unavailable',
-                'dependencies': {'satisfied': failure not in {'missing-dependency', 'broken-dependency'}}}
+                           'store': 'miss', 'discard': 'discarded',
+                           'revalidate': 'miss' if failure == 'repaired-abi' else 'validated'}[action],
+                'reason': 'fixture cache unavailable',
+                'dependencies': {'satisfied': failure not in {'missing-dependency', 'broken-dependency', 'repaired-abi',
+                                                              'cancel-revalidate', 'uncertain-revalidate'}}}
     monkeypatch.setattr(parity, 'run_runtime_install_step', install)
     monkeypatch.setattr(backend, '_write_ready_profile', write_profile)
     monkeypatch.setattr(backend, '_shared_native', operation)
@@ -237,20 +242,56 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
         with pytest.raises(PreparationCancelled if failure.startswith('cancel') else PreparationUncertain):
             backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
                                       source_snapshot=snapshot, on_progress=events.append)
-        assert operations == ['restore']
+        assert operations == (['restore', 'revalidate'] if failure.endswith('-revalidate') else ['restore'])
         assert 'install-vllm-ascend' not in installed
         return
     assert backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
                                      source_snapshot=snapshot, on_progress=events.append) is None
-    assert installed.count('install-vllm-ascend') == int(failure in {'profile', 'cache-miss'})
-    assert installed.count('install-vllm-ascend-requirements') == int(failure in {'cache-miss', 'missing-dependency'})
+    assert installed.count('install-vllm-ascend') == int(failure in {'profile', 'cache-miss', 'repaired-abi'})
+    assert installed.count('install-vllm-ascend-requirements') == int(failure in {'cache-miss', 'missing-dependency', 'repaired-abi'})
     if failure is None:
         assert installed == ['write-marker']
     if failure == 'missing-dependency':
         assert installed == ['install-vllm-ascend-requirements', 'verify-deps', 'write-marker']
     assert operations == (['restore', 'discard', 'store'] if failure == 'profile' else ['restore', 'store']
-                          if failure == 'cache-miss' else ['restore'])
+                          if failure == 'cache-miss' else ['restore', 'revalidate', 'discard', 'store']
+                          if failure == 'repaired-abi' else ['restore', 'revalidate']
+                          if failure == 'missing-dependency' else ['restore'])
     assert spec['python'] == '/bob/.venv/bin/python'
+
+
+@pytest.mark.parametrize('change', [None, 'torch', 'torch-npu', 'python', 'cann', 'manifest', 'index'])
+def test_dependency_repair_rechecks_fixed_bundle_and_preserves_native_proof(bundle, monkeypatch, change):
+    source, target, shared, request, manifest, relative, versions = bundle
+    cache.store_shared_native(source, shared)
+    restored = cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions)
+    receipt = target / '.vaws-runtime/reuse.json'
+    receipt.write_text(json.dumps({'kind': 'dependencies', 'copied_packages': ['torch']}))
+    original = (source / relative).read_bytes()
+    if change in {'torch', 'torch-npu'}:
+        monkeypatch.setattr(cache.importlib.metadata, 'version', lambda name: '2.0' if name == change else '1.0')
+    elif change == 'python':
+        monkeypatch.setattr(cache.sysconfig, 'get_config_var', lambda _: 'different-abi')
+    elif change == 'cann':
+        Path(manifest['profile']['system_files']['cann']['path']).write_text('changed during repair')
+    elif change == 'manifest':
+        path = shared / 'bundles' / restored['bundle'] / 'manifest.json'
+        path.write_text(path.read_text() + '\n')
+    elif change == 'index':
+        # A newer publisher can update discovery indexes, not this selection.
+        for path in shared.glob('*.json'):
+            path.write_text(json.dumps({'bundle': 'f' * 64}))
+    if change not in {None, 'index'}:
+        with pytest.raises(ValueError, match='ABI|support|manifest changed'):
+            cache.revalidate_shared_native(target, shared)
+        assert json.loads(receipt.read_text())['kind'] == 'dependencies'
+    else:
+        assert cache.revalidate_shared_native(target, shared) == {'status': 'validated', 'bundle': restored['bundle']}
+        proof = json.loads(receipt.read_text())
+        assert proof == {'kind': 'shared-native', 'native_key': restored['native_key'],
+                         'soc': manifest['profile']['soc'], 'compiler': manifest['profile']['compiler']}
+    assert (source / relative).read_bytes() == original
+    assert (target / relative).read_bytes() == original
 
 
 def test_known_host_weight_mounts_keep_original_paths():
