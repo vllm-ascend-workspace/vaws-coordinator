@@ -38,6 +38,9 @@ def test_native_admission_persists_epoch_then_uses_one_mutating_exchange(case):
     run = case.request('alice', binding)
     assert run['state'] == 'granted'
     assert [action for kind, action in case.backend.calls if kind == 'host'] == ['status', 'submit-acquire']
+    events = [item for item in case.pool.events('alice')['events']
+              if item.get('kind') == 'run-state' and item.get('run') == run['id']]
+    assert [item['state'] for item in events] == ['granted']
 
 
 def test_lost_combined_reply_reconciles_same_grant_without_repeating_submission(case):
@@ -49,6 +52,19 @@ def test_lost_combined_reply_reconciles_same_grant_without_repeating_submission(
     recovered = restarted.control('alice', run['id'], 'poll')
     assert recovered['state'] == 'granted' and recovered['task_id'] == run['task_id']
     assert case.backend.calls.count(('host', 'submit-acquire')) == 1
+
+
+def test_recovered_initial_discovery_emits_one_clean_granted_event(case):
+    binding = case.bind('alice', case.root / 'a')
+    case.backend.fail_after = 'status'
+    run = case.request('alice', binding)
+    assert run['state'] == 'pending' and run['error']
+    recovered = case.pool.control('alice', run['id'], 'poll')
+    assert recovered['state'] == 'granted' and 'error' not in recovered
+    events = [item for item in case.pool.events('alice')['events']
+              if item.get('kind') == 'run-state' and item.get('run') == run['id']
+              and item.get('state') == 'granted']
+    assert len(events) == 1 and events[0]['error'] is None
 
 
 def test_epoch_changed_after_discovery_creates_no_task(case):
