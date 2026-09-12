@@ -7,4 +7,4 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("vaws-coordinator")
 except PackageNotFoundError:  # pragma: no cover - source tree without install
-    __version__ = "0.3.1"
+    __version__ = "0.4.0"

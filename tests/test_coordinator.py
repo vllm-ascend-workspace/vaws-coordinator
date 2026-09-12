@@ -60,6 +60,7 @@ handle_request = host_protocol.handle_request
 _confirmed_free_probe = host_protocol._confirmed_free_probe
 CoordinationError = host_protocol.CoordinationError
 from vaws_coordinator.ready_runtime import RuntimePool
+from vaws_coordinator.execution_sources import capture_sources
 from vaws_coordinator.runtime_profile import capture, digest, publish, restore, verify
 
 
@@ -76,6 +77,8 @@ class Backend:
         self.prepared = {}
         self.require_prepared = False
         self.machines = None
+        self.clock = time.time
+        self.protocol_lock = threading.RLock()
         self.attestation = {"profile_key": "profile-a", "build_key": "native-a",
                             "profile": {"launch_env": {"VLLM_VERSION": "test"}}}
 
@@ -93,10 +96,8 @@ class Backend:
     def prepare_task_root(self, spec, *, sources, environment, donor_python=None, **kwargs):
         root = spec["endpoint"]["root"]
         python = spec["python"]
-        if donor_python and python == donor_python:
+        if {"vllm", "vllm-ascend"}.issubset(sources) and donor_python and python == donor_python:
             raise ValueError("task-owned interpreter must not be the donor interpreter")
-        if not sources or not {"vllm", "vllm-ascend"}.issubset(sources):
-            raise ValueError("bind the actual vllm and vllm-ascend worktrees before preparation")
         recipe = (environment or {}).get("recipe") or (environment or {}).get("image") or spec.get("recipe")
         profile = {"launch_env": {"VLLM_VERSION": "test"}, "recipe": recipe}
         for key in ("python_abi", "cann", "soc", "machine_type"):
@@ -110,6 +111,9 @@ class Backend:
             "build_key": "native-" + (recipe or "prepared"),
         }
         return self.inspect(spec)
+
+    def command_environment(self, donor):
+        return {"python": "/usr/local/bin/python3", "launch_env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}
 
     def inspect(self, runtime, **kwargs):
         if self.fail:
@@ -145,8 +149,9 @@ class Backend:
         host = runtime["host_endpoint"]["host"]
         state = Path(self.state) / host.replace(".", "_")
         state.mkdir(parents=True, exist_ok=True)
-        with mock.patch("vaws_npu_coordination.process_guard_busy", side_effect=guarded):
+        with self.protocol_lock, mock.patch("vaws_npu_coordination.process_guard_busy", side_effect=guarded):
             result = handle_request({**request, "state_dir": str(state), "interval_seconds": 0.001},
+                                    clock=self.clock,
                                     probe=lambda: {"status": "ok", "devices": [0, 1],
                                                    "busy": {str(d): ["test worker"] for d in self.busy}},
                                     listening_ports=lambda: listening)
@@ -273,7 +278,7 @@ class BackendTests(unittest.TestCase):
                                       environment={"recipe": "rc"}, donor_python=spec["python"])
         spec = runtime_spec(1, user="alice", python="/vllm-workspace/tasks/s/h/r/.venv/bin/python",
                             root="/vllm-workspace/tasks/s/h/r")
-        with self.assertRaisesRegex(ValueError, "worktrees"):
+        with self.assertRaisesRegex(ValueError, "fixed execution source inputs"):
             backend.prepare_task_root(spec, sources={}, environment={"recipe": "rc"},
                                       donor_python="/opt/alice/venvs/root-1/bin/python")
 
@@ -362,10 +367,9 @@ class PoolTests(unittest.TestCase):
         recovered = self.pool.control("alice", run["id"], "poll")
         self.assertEqual(recovered["state"], "granted")
         self.assertEqual(recovered["task_id"], run["task_id"])
-        from vaws_coordinator.run_manifest import load_manifest
-        manifest = load_manifest(self.root / "manager/runs" / (run["id"] + ".json"))
-        self.assertEqual(manifest["status"], "planned")
-        self.assertEqual(manifest["environment"]["coordination"]["state"], "granted")
+        record = json.loads((self.root / "manager/runs" / (run["id"] + ".json")).read_text())
+        self.assertEqual(record["resources"]["state"], "granted")
+        self.assertFalse(record["resources"]["released"])
         other = self.bind("bob", self.root / "b")
         self.backend.fail_after = "status"
         pending = self.request("bob", other)
@@ -591,8 +595,9 @@ class PoolTests(unittest.TestCase):
         result = self.pool.managed_control("alice", job["id"])
         self.assertEqual(result["state"], "succeeded")
         manifest = json.loads((self.root / "manager/runs" / (job["id"] + ".json")).read_text())
-        self.assertEqual(manifest["status"], "inconclusive")
-        self.assertEqual(manifest["environment"]["managed_execution"]["result"]["exit_code"], 0)
+        self.assertEqual(manifest["process"]["state"], "succeeded")
+        self.assertTrue(manifest["resources"]["released"])
+        self.assertEqual(manifest["process"]["result"]["exit_code"], 0)
 
     def test_orphaned_busy_recovers_via_heartbeat_without_stopping_live_family(self):
         binding = self.bind("alice", self.root / "a")
@@ -1117,10 +1122,10 @@ class TaskClientTests(unittest.TestCase):
         self.assertTrue(reply["target"]["live"])
         self.assertEqual(reply["target"]["user"], "alice")
         self.assertEqual(reply["target"]["container_name"], "vaws-alice")
-        self.assertEqual(reply["target"]["python"], runtime_spec(1, user="alice")["python"])
-        self.assertEqual(reply["target"]["endpoint"]["cwd"], "/vllm-workspace/alice/1")
+        self.assertTrue(reply["target"]["python"].endswith("/.venv/bin/python"))
+        self.assertNotEqual(reply["target"]["endpoint"]["cwd"], "/vllm-workspace/alice/1")
         observed = self.client.observe(reply["execution_id"], "target")
-        self.assertEqual(observed["target"]["runtime_id"], "runtime-a")
+        self.assertEqual(observed["target"]["runtime_id"], reply["target"]["runtime_id"])
         self.assertEqual(self.client.target(reply["execution_id"])["container_id"], "cid-vaws-alice")
 
     def test_running_execution_stays_running_during_background_probe(self):
@@ -1167,11 +1172,11 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "running")
         self.assertEqual(recovered["execution_id"], reply["execution_id"])
 
-    def test_two_executions_keep_task_root_and_other_task_cannot_overwrite(self):
+    def test_each_execution_and_other_task_have_distinct_work_roots(self):
         first = self.client.run("true")
         self.client.observe(first["execution_id"], "stop")
         second = self.client.run("sleep 1")
-        self.assertEqual(second["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
+        self.assertNotEqual(second["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
         other_context = self.store.attach("codex", "native-alice-2", str(self.root))
         self.store.bind_sources(other_context, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
         from vaws_coordinator.task_client import TaskClient
@@ -1197,7 +1202,7 @@ class TaskClientTests(unittest.TestCase):
 
     def test_two_role_request_runs_both_or_neither(self):
         self._seed(self.pool, "runtime-b-host", runtime_spec(3, user="alice", host="192.0.2.8", recipe="rc"))
-        topology = {"roles": [{"name": "prefill", "npu_count": 1, "command": "run-prefill"},
+        topology = {"distinct_hosts": True, "roles": [{"name": "prefill", "npu_count": 1, "command": "run-prefill"},
                               {"name": "decode", "npu_count": 1, "command": "run-decode"}]}
         both = self.client.run("unused", topology=topology)
         self.assertEqual(both["state"], "running")
@@ -1228,7 +1233,7 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(first["state"], "running")
         again = self.client.run("serve-vllm", service="vllm", timeout_seconds=None)
         self.assertEqual(again["execution_id"], first["execution_id"])
-        with self.assertRaisesRegex(ValueError, "different command"):
+        with self.assertRaisesRegex(ValueError, "different inputs: command"):
             self.client.run("serve-other", service="vllm", timeout_seconds=None)
         replaced = self.client.run("serve-other", service="vllm", timeout_seconds=None, restart=True)
         self.assertNotEqual(replaced["execution_id"], first["execution_id"])
@@ -1277,18 +1282,18 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(prepared["state"], "running")
         self.assertNotEqual(prepared["target"]["python"], donor_python)
         self.assertTrue(str(prepared["target"]["python"]).endswith("/.venv/bin/python"))
-        self.assertIn("/tasks/", prepared["target"]["endpoint"]["cwd"])
+        self.assertIn("/executions/", prepared["target"]["endpoint"]["cwd"])
         self.assertNotEqual(prepared["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
 
-    def test_existing_binding_is_reused_for_the_same_task(self):
+    def test_same_task_gets_a_new_binding_and_root_for_each_execution(self):
         first = self.client.run("true")
         binding_id = first["target"]["binding_id"]
         runtime_id = first["target"]["runtime_id"]
         self.client.observe(first["execution_id"], "stop")
         second = self.client.run("sleep 1")
         self.assertEqual(second["state"], "running")
-        self.assertEqual(second["target"]["binding_id"], binding_id)
-        self.assertEqual(second["target"]["runtime_id"], runtime_id)
+        self.assertNotEqual(second["target"]["binding_id"], binding_id)
+        self.assertNotEqual(second["target"]["runtime_id"], runtime_id)
 
     def test_resumed_task_checks_out_returned_runtime_with_fresh_identity(self):
         previous = self.client.run("true")
@@ -1301,7 +1306,7 @@ class TaskClientTests(unittest.TestCase):
                 self.store.attach("codex", "native-alice", str(self.root))
                 current = self.client.run("true")
                 self.assertEqual(current["state"], "running", current.get("error"))
-                self.assertEqual(current["target"]["runtime_id"], previous["target"]["runtime_id"])
+                self.assertNotEqual(current["target"]["runtime_id"], previous["target"]["runtime_id"])
                 self.assertNotEqual(current["target"]["binding_id"], previous["target"]["binding_id"])
                 previous = current
 
@@ -1340,7 +1345,7 @@ class TaskClientTests(unittest.TestCase):
         mixed = self.client.observe(again["execution_id"])
         self.assertEqual(mixed["state"], "failed")
 
-    def test_same_task_does_not_materialize_concurrently(self):
+    def test_same_task_materializes_independent_execution_roots_concurrently(self):
         started = threading.Event()
         release = threading.Event()
         syncs = []
@@ -1364,8 +1369,8 @@ class TaskClientTests(unittest.TestCase):
         try:
             self.assertTrue(started.wait(30))
             second = self.client.run("sleep 1")
-            self.assertEqual(second["state"], "waiting")
-            self.assertEqual(len(syncs), 1)
+            self.assertEqual(second["state"], "running")
+            self.assertEqual(len(syncs), 2)
         finally:
             release.set()
             worker.join(60)
@@ -1664,6 +1669,8 @@ class DaemonProcessTests(unittest.TestCase):
                 )
                 deadline = time.time() + 5
                 while time.time() < deadline:
+                    if proc.poll() is not None:
+                        self.fail("daemon exited before restart: " + proc.stdout.read().decode(errors="replace"))
                     try:
                         client.call("ping")
                         break
@@ -1737,6 +1744,8 @@ class DaemonProcessTests(unittest.TestCase):
                     "roles": [{"name": "default", "command": "true", "npu_count": 1}],
                     "timeout_seconds": 1800, "service": None,
                 }
+                spec["source_snapshot"] = capture_sources(
+                    {name: str(root / name) for name in ("vllm", "vllm-ascend")}, sessions.state_dir)
                 t0 = time.time()
                 admitted = client.admit(str(sessions.state_dir), "alice", context["session"]["id"], spec)
                 self.assertLess(time.time() - t0, 0.8)
@@ -1807,6 +1816,8 @@ class DaemonProcessTests(unittest.TestCase):
                 "roles": [{"name": "default", "command": "true", "npu_count": 1}],
                 "timeout_seconds": 1800, "service": None,
             }
+            run_spec["source_snapshot"] = capture_sources(
+                {name: str(root / name) for name in ("vllm", "vllm-ascend")}, sessions.state_dir)
             row = sessions.execution(context, "pending-prep", run_spec)
             row.update(phase="queued", admitted=True, user="alice")
             sessions.save_execution(row)
@@ -1911,6 +1922,7 @@ class ProfileTests(unittest.TestCase):
             root.mkdir()
             for name in ["kernels.so", "binary_info_config.json", "cann.txt", "driver.txt", "smoke.txt"]:
                 (root / name).write_text(name)
+            (root / 'smoke.txt').write_text(json.dumps({'passed': True}))
             profile = {key: "test-version" for key in PROFILE_FIELDS}
             profile.update(build_env={}, launch_env={"VLLM_VERSION": "test"}, compatibility_evidence="smoke.txt")
             profile["system_files"] = {name: {"path": str(root / (name + ".txt")), "sha256": hashlib.sha256((name + ".txt").encode()).hexdigest()} for name in ["cann", "driver"]}
@@ -1920,7 +1932,7 @@ class ProfileTests(unittest.TestCase):
             with mock.patch("vaws_coordinator.runtime_profile.importlib.metadata.version", return_value="test-version"), mock.patch("vaws_coordinator.runtime_profile.sysconfig.get_config_var", return_value="test-version"):
                 bundle = publish(root, Path(tmp) / "bundles", manifest)
                 self.assertEqual(publish(root, Path(tmp) / "bundles", manifest), bundle)
-                (root / "smoke.txt").write_text("same passed smoke, new timestamp")
+                (root / "smoke.txt").write_text(json.dumps({'passed': True, 'timestamp': 'new'}))
                 refreshed = copy.deepcopy(manifest)
                 refreshed["evidence"]["smoke"]["sha256"] = hashlib.sha256((root / "smoke.txt").read_bytes()).hexdigest()
                 self.assertEqual(publish(root, Path(tmp) / "bundles", refreshed), bundle)

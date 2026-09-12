@@ -1,8 +1,8 @@
 # Task lifecycle in a persistent user container
 
-Status: current control-plane contract. The persistent
-daemon owns admitted execution progression, multi-role reservation, and
-task-owned roots. Actual NPU/recipe evidence still requires remote runs.
+Status: current control-plane contract, 2026-09-12. The persistent daemon owns
+fixed execution inputs, isolated execution roots, multi-role reservation and
+confirmed cleanup. Actual NPU/recipe evidence still requires remote runs.
 
 This is the contract for the breaking lifecycle change. Task completion
 preserves the container and its prepared
@@ -16,11 +16,11 @@ ready-runtime registry and managed executions.
 
 | Object | Owns | Lifetime |
 |---|---|---|
-| Local task | Worktree references, run history, evidence | Independent of remote execution |
+| Local task | Mutable source defaults, execution references and evidence | Independent of remote execution |
 | User container | Stable container identity and SSH endpoint on one host | Independent of tasks |
-| Prepared runtime | A task's isolated work/environment root and its Python/CANN/build selection inside the user container | Stable until task finish; immutable caches may be shared |
-| Runtime binding | One task's use of that prepared work/environment root | Checkout through return |
-| Execution | Managed process family, NPU lease, service-port use | Admission through confirmed cleanup |
+| Prepared runtime | One execution's work root and selected Python/CANN/build inside the user container | Evidence retained; compatible dependency/native artifacts may be shared |
+| Runtime binding | One execution's use of that prepared root | Checkout through return |
+| Execution | Fixed source inputs, managed process family, requested devices and service-port use | Admission through confirmed cleanup |
 
 A container's existence and device mounts do not reserve NPUs. The host
 coordinator is the only NPU and host-port authority. SSH endpoint reservations
@@ -63,13 +63,38 @@ maintenance and explicit deletion are separate from task completion.
 
 ## Operations
 
-**Open task.** Create local task identity and bind actual business worktrees.
-This does not create a container or reserve NPUs.
+**Set defaults.** Native identity is associated lazily. Hook-discovered source
+defaults belong to that native attachment, using its actual cwd. Resume or
+handoff refreshes that attachment's cwd and automatic sources while preserving
+the native task identity. Sibling attachments do not overwrite one another.
+Explicit task source defaults override automatic sources, including an explicit
+empty map. Changing either default affects future submissions only.
 
-**Prepare and borrow.** Select a compatible prepared root in the user's fixed
-container through the existing registry. If preparation is necessary, install into a separate environment/build
-directory while no execution uses that directory, then verify it. A cache miss
-is reported as such; it is not permission to overwrite an active environment.
+Scoped hooks recognize external Git linked worktrees through the actual common
+Git directory, and existing registered submodules through Git's superproject
+chain. A repository URL or directory name is not an identity proof. The owner
+must be able to read the paths and Git metadata; a native client's independent
+repository copy is not automatically associated as a linked worktree. These
+hooks observe the client-selected workspace. They do not create a worktree or
+change the parent client's cwd before its first tool call.
+
+`source_defaults` reports the effective map and its provenance. Saved task
+maps from older versions without provenance are reported as unknown; the
+coordinator does not guess whether they were explicit or automatic. A new
+explicit task binding or per-run `sources` resolves that ambiguity.
+
+**Submit.** Resolve sources from the current call or effective defaults and capture
+their Git content and true SCM version once, before durable admission. Edits
+during capture receive bounded retries; unstable input is not admitted. Each
+role uses the same fixed descriptor. Source-free commands need no vLLM trees;
+CPU commands default to zero NPUs. Status and connection lookups never capture.
+
+**Prepare.** Create an execution work root in the user's fixed container and
+reuse compatible dependency/native artifacts through the existing registry.
+Never select an unrelated writable root and overwrite its source content.
+Independent hosts prepare concurrently; preparation acquires no running NPU
+lease. Successful preparation's fixed-source attestation is reused for launch,
+without a second capture or materialization.
 
 **Execute or serve.** Use the existing managed execution path. Persist the
 request and process identity, obtain the host lease and service-port use, then
@@ -77,6 +102,11 @@ launch with the selected environment. Validate the current binding and fencing
 information at admission. A long-running model service keeps its execution
 lease for its entire process lifetime. All managed device use follows this
 path; an interactive NPU command also needs an execution lease.
+
+Named-service ensure compares fixed sources, command, environment, topology,
+resources and preflight. Different inputs are reported explicitly; replacement
+requires `restart=True` and confirmed old-process cleanup. An execution/service
+reference connects to the original execution without rereading local sources.
 
 **Stop or finish.** Stop only this execution's managed process family, including
 children. Confirm it is terminal, its assigned devices are observable and free,
@@ -86,8 +116,14 @@ the container, SSH endpoint, prepared environments, worktrees and evidence.
 Thus stopping a model releases that model execution's NPUs; an idle local task
 does not keep cards reserved.
 
-**Close task.** Close admission under the existing binding lock, persist the
-finish intent (owner/`force`), and stop/cancel admitted executions. The
+**Close task.** A task that has never admitted managed work finishes directly
+in the local registry without loading a coordinator service or remote runtime.
+Its close check/state change and managed execution admission use the same
+database write transaction boundary. If close commits first, admission fails;
+if admission commits first, finish delegates to the coordinator. Admission
+checks the task's open state and writes its complete admitted execution record
+atomically, without an intermediate unadmitted row. For managed tasks, persist
+the finish intent (owner/`force`) and stop/cancel admitted executions. The
 daemon's existing tick/reconcile path returns remaining bindings and marks
 the task finished once execution stop has drained. A frontend exit does not
 require a second finish; the same pending finish continues after daemon
@@ -102,8 +138,9 @@ checkout. An admitted finish continues on the daemon; do not require the
 frontend to retry finish. Unknown or still-running processes keep the task
 `finishing` until the existing return path can complete. GC reports unresolved
 ownership; age, local PID death and missing local metadata
-are not release evidence. Request retries are idempotent; new executions use
-new request identities. No container deletion is required to prove completion.
+are not release evidence. The existing job identity is used to reconcile an
+uncertain launch; a new explicit submission creates a new execution. No
+container deletion is required to prove completion.
 
 ## Breaking cutover and deletion
 

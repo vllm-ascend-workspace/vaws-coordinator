@@ -1,6 +1,7 @@
 """Run Manifest v1 and the ready_runtime → validate_manifest round trip."""
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -132,79 +133,40 @@ class RunManifestTests(unittest.TestCase):
             )
 
 
-class ReadyRuntimeManifestRoundTripTests(unittest.TestCase):
-    def test_export_manifest_writes_nonzero_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp) / "workspace"
-            head = _init_repo(workspace)
-            vllm = workspace / "vllm"
-            ascend = workspace / "vllm-ascend"
-            vllm.mkdir()
-            ascend.mkdir()
-            pool = RuntimePool(Path(tmp) / "state", backend=object())
-            session = pool.session_open(
-                "owner1",
-                "sid1",
-                {"vllm": str(vllm.resolve()), "vllm-ascend": str(ascend.resolve())},
-            )
-            run = {
-                "id": "testrun1",
-                "created_at": NOW,
-                "state": "pending",
-                "intent": {
-                    "snapshots": {
-                        "vllm": "a" * 40,
-                        "vllm-ascend": "b" * 40,
-                    }
-                },
-                "task_id": "pool-testrun1",
-                "epoch": None,
-            }
-            binding = {
-                "profile_key": "profile-a",
-                "build_key": "native-a",
-                "endpoint": {"host": "host.invalid", "port": 22, "root": "/vllm-workspace"},
-                "runtime_id": "runtime-a",
-                "intent": {"session": session["id"]},
-            }
-            pool.export_manifest(run, binding)
-            path = Path(tmp) / "state" / "runs" / "testrun1.json"
-            manifest = load_manifest(path)
-            validate_manifest(manifest)
-            self.assertEqual(manifest["run_type"], "debug")
-            self.assertEqual(manifest["status"], "planned")
-            self.assertEqual(manifest["code"]["source_head"], head)
-            self.assertEqual(manifest["code"]["snapshot_commit"], head)
-            self.assertNotEqual(manifest["code"]["source_head"], ZERO_SHA)
-            self.assertNotEqual(manifest["code"]["snapshot_commit"], ZERO_SHA)
-            self.assertEqual(
-                manifest["workspace_snapshot"],
-                {"vllm": "a" * 40, "vllm-ascend": "b" * 40},
-            )
-            self.assertEqual(
-                manifest["environment"]["coordination"]["state"], "pending"
-            )
-            self.assertEqual(manifest["run_id"], "pool-testrun1")
-
-    def test_export_manifest_without_session_is_refused(self) -> None:
+class ReadyRuntimeExecutionRecordTests(unittest.TestCase):
+    def test_record_preserves_fixed_snapshots_without_reading_sources(self):
+        from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
             pool = RuntimePool(Path(tmp), backend=object())
-            run = {
-                "id": "testrun1",
-                "created_at": NOW,
-                "state": "pending",
-                "intent": {"snapshots": {}},
-                "task_id": "pool-testrun1",
-                "epoch": None,
-            }
-            binding = {
-                "profile_key": "profile-a",
-                "build_key": "native-a",
-                "endpoint": {"host": "host.invalid", "port": 22, "root": "/vllm-workspace"},
-                "runtime_id": "runtime-a",
-            }
-            with self.assertRaisesRegex(ValueError, "no session"):
-                pool.export_manifest(run, binding)
+            run = {"id": "testrun1", "created_at": NOW, "state": "granted",
+                   "intent": {"snapshots": {"arbitrary": "a" * 40}},
+                   "task_id": "pool-testrun1", "epoch": "epoch"}
+            binding = {"profile_key": "profile-a", "build_key": "native-a",
+                       "endpoint": {"host": "host.invalid", "port": 22}, "runtime_id": "runtime-a"}
+            with mock.patch("vaws_coordinator.code_identity.manifest_code", side_effect=AssertionError("no recapture")):
+                pool.export_execution_record(run, binding)
+            record = json.loads((Path(tmp)/"runs/testrun1.json").read_text())
+            self.assertEqual(record["schema_version"], "vaws.managed-run.v2")
+            self.assertEqual(record["snapshots"], {"arbitrary": "a" * 40})
+            self.assertFalse(record["resources"]["released"])
+            self.assertIsNone(record["process"])
+            self.assertNotIn("code", record)
+
+    def test_source_free_command_has_no_fabricated_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = RuntimePool(Path(tmp), backend=object())
+            run = {"id": "cpu", "created_at": NOW, "state": "released",
+                   "intent": {"snapshots": {}}, "task_id": "pool-cpu", "epoch": "epoch"}
+            binding = {"profile_key": "profile", "build_key": "command",
+                       "endpoint": {}, "runtime_id": "runtime"}
+            job = {"job_id": "job-cpu", "state": "failed", "spec": {"command": "exit 7"},
+                   "remote": {"result": {"exit_code": 7}}}
+            pool.export_execution_record(run, binding, job=job)
+            record = json.loads((Path(tmp)/"runs/cpu.json").read_text())
+            self.assertEqual(record["snapshots"], {})
+            self.assertTrue(record["resources"]["released"])
+            self.assertEqual(record["process"]["result"]["exit_code"], 7)
+            self.assertEqual(record["process"]["state"], "failed")
 
 
 class IdentityWorkspaceTests(unittest.TestCase):

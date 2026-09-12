@@ -105,6 +105,12 @@ def process_guard_busy(value: str | dict | None, *, completion_confirmed: bool =
         return True
 
 
+def unguarded_cpu_process(row: sqlite3.Row) -> bool:
+    """Legacy pid-only CPU activations have no reliable completion evidence."""
+    return (int(row['requested_count']) == 0 and not row['process_guard']
+            and (row['state'] == 'active' or (row['state'] == 'orphaned_busy' and row['pid'] is not None)))
+
+
 def utc_now_iso(epoch: float | None = None) -> str:
     value = time.time() if epoch is None else epoch
     return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -726,9 +732,9 @@ class NpuCoordinator:
         if devices is not None and count_raw is not None:
             raise CoordinationError("use only one of devices or npu_count")
         if devices is None:
-            count = int(count_raw or 0)
-            if count < 1:
-                raise CoordinationError("npu_count must be >= 1 when devices are not specified")
+            count = 0 if count_raw is None else count_raw
+            if type(count) is not int or count < 0:
+                raise CoordinationError("npu_count must be a nonnegative integer")
         else:
             count = len(devices)
         requested_service_port = request.get("service_port")
@@ -978,10 +984,11 @@ class NpuCoordinator:
                 or visible is None
                 or not devices.issubset(visible)
                 or bool(devices & busy)
+                or unguarded_cpu_process(row)
                 or process_guard_busy(row["process_guard"])
             )
             next_state = "orphaned_busy" if still_busy else "released"
-            message = (
+            message = 'CPU task has no process guard; process completion is unknown' if unguarded_cpu_process(row) else (
                 "heartbeat expired while hardware remained busy or unknown"
                 if still_busy
                 else "heartbeat expired and hardware was observed free"
@@ -1000,7 +1007,8 @@ class NpuCoordinator:
                 # listener is gone. Age and occupancy alone are not enough.
                 if self._task_service_ports(connection, row["task_id"]):
                     continue
-                if devices.issubset(visible) and not devices.intersection(busy) and not process_guard_busy(row["process_guard"]):
+                if (devices.issubset(visible) and not devices.intersection(busy)
+                        and not unguarded_cpu_process(row) and not process_guard_busy(row["process_guard"])):
                     connection.execute(
                         "UPDATE tasks SET state='released', process_guard=NULL, updated_at=?, message=? WHERE task_id=?",
                         (now, "orphaned task hardware is now free", row["task_id"]),
@@ -1290,7 +1298,7 @@ class NpuCoordinator:
     def acquire(
         self,
         task_id: str,
-        observed: dict[str, Any],
+        observed: dict[str, Any] | None,
         *,
         grant_ttl_seconds: int = DEFAULT_GRANT_TTL_SECONDS,
         listening: dict[str, Any] | None = None,
@@ -1298,10 +1306,11 @@ class NpuCoordinator:
         task_id = require_safe_id(task_id, label="task id")
         if grant_ttl_seconds < 1:
             raise CoordinationError("grant_ttl_seconds must be >= 1")
-        if observed.get("status") != "ok":
-            return {"status": "probe_failed", "error": observed.get("error"), "occupancy": observed}
         now = self.clock()
         with self._transaction() as connection:
+            requested_row = self._task_row(connection, task_id)
+            if int(requested_row["requested_count"]) and (observed is None or observed.get("status") != "ok"):
+                return {"status": "probe_failed", "error": (observed or {}).get("error", "NPU occupancy is unknown"), "occupancy": observed}
             changes = self._housekeep(connection, observed, now=now)
             row = self._task_row(connection, task_id)
             if row["state"] != "queued":
@@ -1317,7 +1326,7 @@ class NpuCoordinator:
                 """,
                 (now, now),
             ).fetchone()
-            if head is None or head["task_id"] != task_id:
+            if int(row["requested_count"]) and (head is None or head["task_id"] != task_id):
                 return {
                     "status": "waiting",
                     "reason": "strict_fifo",
@@ -1332,7 +1341,7 @@ class NpuCoordinator:
                 exclude_task=task_id,
                 start_at=now,
                 end_at=estimated_end,
-            )
+            ) if int(row["requested_count"]) else set()
             requested = _load_devices(row["requested_devices"])
             selected, missing = self._select_granted_devices(
                 requested=requested,
@@ -1414,19 +1423,20 @@ class NpuCoordinator:
         self,
         task_id: str,
         token: int,
-        observed: dict[str, Any],
+        observed: dict[str, Any] | None,
         *,
         start_ttl_seconds: int = DEFAULT_START_TTL_SECONDS,
     ) -> dict[str, Any]:
         task_id = require_safe_id(task_id, label="task id")
         if start_ttl_seconds < 1:
             raise CoordinationError("start_ttl_seconds must be >= 1")
-        if observed.get("status") != "ok":
-            return {"status": "probe_failed", "error": observed.get("error"), "occupancy": observed}
         now = self.clock()
         busy = self._busy_set(observed) or set()
-        visible = {int(device) for device in observed.get("devices", [])}
+        visible = {int(device) for device in (observed or {}).get("devices", [])}
         with self._transaction() as connection:
+            requested_row = self._task_row(connection, task_id)
+            if int(requested_row["requested_count"]) and (observed is None or observed.get("status") != "ok"):
+                return {"status": "probe_failed", "error": (observed or {}).get("error", "NPU occupancy is unknown"), "occupancy": observed}
             changes = self._housekeep(connection, observed, now=now)
             row = self._task_row(connection, task_id)
             self._check_token(row, token)
@@ -1508,6 +1518,8 @@ class NpuCoordinator:
             self._check_token(row, token)
             if row["state"] != "starting":
                 raise CoordinationError(f"task {task_id} is {row['state']}, expected starting")
+            if int(row['requested_count']) == 0 and process_guard is None:
+                raise CoordinationError('CPU task activation requires a valid process_guard; a PID alone cannot prove process completion')
             if row["activation_deadline"] is not None and float(row["activation_deadline"]) <= now:
                 raise CoordinationError(f"activation deadline elapsed for task {task_id}")
             expected_end = now + int(row["estimated_duration_seconds"])
@@ -1555,14 +1567,14 @@ class NpuCoordinator:
             row = self._task_row(connection, task_id)
         return {"status": "active", "task": self._serialize_task(row)}
 
-    def release(self, task_id: str, token: int, observed: dict[str, Any], *,
+    def release(self, task_id: str, token: int, observed: dict[str, Any] | None, *,
                 completion_confirmed: bool = False, listening: dict[str, Any] | None = None) -> dict[str, Any]:
         task_id = require_safe_id(task_id, label="task id")
         now = self.clock()
         busy = self._busy_set(observed)
         visible = (
             {int(device) for device in observed.get("devices", [])}
-            if observed.get("status") == "ok"
+            if observed is not None and observed.get("status") == "ok"
             else None
         )
         with self._transaction() as connection:
@@ -1575,11 +1587,12 @@ class NpuCoordinator:
                 else sorted(devices)
             )
             busy_ports = self._service_ports_busy(connection, task_id, listening)
-            if (busy is None or visible is None or conflicts or busy_ports
+            if ((devices and (busy is None or visible is None or conflicts)) or busy_ports or unguarded_cpu_process(row)
                     or process_guard_busy(row["process_guard"], completion_confirmed=completion_confirmed)):
                 connection.execute(
                     "UPDATE tasks SET state='orphaned_busy', updated_at=?, message=? WHERE task_id=?",
-                    (now, "release requested but processes or hardware remained busy or unknown", task_id),
+                    (now, 'CPU task has no process guard; process completion is unknown' if unguarded_cpu_process(row)
+                     else "release requested but processes or hardware remained busy or unknown", task_id),
                 )
                 self._event(connection, "release-deferred", task_id=task_id,
                             data={"devices": conflicts, "service_ports": busy_ports}, now=now)
@@ -1594,7 +1607,7 @@ class NpuCoordinator:
             self._clear_service_ports(connection, task_id)
             connection.execute(
                 "UPDATE tasks SET state='released', process_guard=NULL, updated_at=?, message=? WHERE task_id=?",
-                (now, "hardware observed free; cooperative lease released", task_id),
+                (now, "requested resources are free; cooperative lease released", task_id),
             )
             self._event(connection, "task-released", task_id=task_id, now=now)
             row = self._task_row(connection, task_id)
@@ -1627,6 +1640,7 @@ class NpuCoordinator:
                     )
                 )
                 or bool(busy_ports)
+                or unguarded_cpu_process(row)
                 or process_guard_busy(row["process_guard"])
             )
             next_state = "orphaned_busy" if still_busy else "cancelled"
@@ -1639,6 +1653,13 @@ class NpuCoordinator:
             self._event(connection, "task-cancelled", task_id=task_id, data={"to": next_state}, now=now)
             row = self._task_row(connection, task_id)
         return {"status": next_state, "task": self._serialize_task(row)}
+
+    def probe_requirements(self, task_id: str) -> tuple[bool, bool]:
+        """Derive observation needs from immutable host-owned requests, not caller hints."""
+        with self._transaction() as connection:
+            row = self._task_row(connection, require_safe_id(task_id, label="task id"))
+            return (bool(int(row["requested_count"]) or _load_devices(row["granted_devices"])),
+                    row["requested_service_port"] is not None or bool(self._task_service_ports(connection, task_id)))
 
     def snapshot(
         self,
@@ -1756,18 +1777,21 @@ def handle_request(
     )
     if action == "submit":
         return coordinator.submit(request)
+    needs_npu, needs_ports = (coordinator.probe_requirements(request["task_id"])
+                              if action in {"acquire", "preflight", "release", "cancel", "status", "gc"} and request.get("task_id")
+                              else (True, True))
     if action == "acquire":
         return coordinator.acquire(
             request["task_id"],
-            probe(),
+            probe() if needs_npu else None,
             grant_ttl_seconds=int(request.get("grant_ttl_seconds") or DEFAULT_GRANT_TTL_SECONDS),
-            listening=listening_ports(),
+            listening=listening_ports() if needs_ports else None,
         )
     if action == "preflight":
         return coordinator.preflight(
             request["task_id"],
             int(request["fence_token"]),
-            probe(),
+            probe() if needs_npu else None,
             start_ttl_seconds=int(request.get("start_ttl_seconds") or DEFAULT_START_TTL_SECONDS),
         )
     if action == "activate":
@@ -1793,22 +1817,23 @@ def handle_request(
             samples=int(request.get("free_samples") or 2),
             interval_seconds=float(request.get("interval_seconds") or 2.0),
             probe=probe,
-        )
+        ) if needs_npu else None
         return coordinator.release(
             request["task_id"],
             int(request["fence_token"]),
             observed,
             completion_confirmed=request.get("completion_confirmed") is True,
-            listening=listening_ports(),
+            listening=listening_ports() if needs_ports else None,
         )
     if action == "cancel":
-        return coordinator.cancel(request["task_id"], probe(), listening=listening_ports())
+        return coordinator.cancel(request["task_id"], probe() if needs_npu else None,
+                                  listening=listening_ports() if needs_ports else None)
     if action == "hold-add":
         return coordinator.add_hold(request, probe())
     if action == "hold-remove":
         return coordinator.remove_hold(request["hold_id"])
     if action in {"status", "gc"}:
-        observed = None if request.get("no_probe") else probe()
+        observed = None if request.get("no_probe") or not needs_npu else probe()
         return coordinator.snapshot(
             observed,
             task_id=request.get("task_id"),

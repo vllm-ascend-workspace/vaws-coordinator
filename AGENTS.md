@@ -35,7 +35,7 @@ that named its git URL would pin every consumer to that tag.
 ```bash
 uv venv
 uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@c24a64a55e877904c9d539de4544ade0cc76cbac"
-uv pip install pytest
+uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
 uv pip install -e . --no-deps
 ```
 

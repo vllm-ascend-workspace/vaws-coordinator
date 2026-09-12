@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import json
 import shlex
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 
 from vaws_coordinator.runtime_profile import digest
@@ -27,8 +28,11 @@ def task_preamble(binding):
     if binding.get("python"):
         command += "\nexport VAWS_PYTHON=" + shlex.quote(binding["python"])
     # Repository directories under the task root otherwise shadow editable packages.
-    sources = ":".join(str(PurePosixPath(binding["endpoint"]["cwd"]) / name)
-                       for name in ("vllm", "vllm-ascend"))
+    source_names = binding.get("source_names", ())
+    if not source_names:
+        return command
+    root = PurePosixPath(binding["endpoint"]["cwd"])
+    sources = ":".join(str(root / name) for name in (".vaws-runtime/metadata", *source_names))
     return command + "\nexport PYTHONPATH=" + shlex.quote(sources) + '"${PYTHONPATH:+:$PYTHONPATH}"'
 
 
@@ -45,6 +49,8 @@ class ManagedExecution:
             raise ValueError("invalid environment or attempted override of managed device or service-port ownership")
         if timeout_seconds is not None and (type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 86400):
             raise ValueError("timeout_seconds must be None or 1..86400")
+        if type(queue_seconds) is not int or not 1 <= queue_seconds <= 86400:
+            raise ValueError("queue_seconds must be 1..86400")
         if service_port is not None and (type(service_port) is not int or service_port < 0):
             raise ValueError("service_port must be None, 0, or a positive declared runtime service port")
         key = digest([owner, binding_id, request_id])
@@ -94,10 +100,14 @@ class ManagedExecution:
             self.put(db, "job", job)
         return self.managed_advance(job_id)
 
-    def managed_advance(self, key):
+    def managed_advance(self, key, *, wait=True):
         # Per-job lock: remote probes/supervision for one job never block
         # another job's advancement; the global lock guards only DB sections.
-        with self._entity_lock("job", key):
+        lock = self._entity_lock("job", key)
+        if not lock.acquire(blocking=wait):
+            with self.transaction() as db:
+                return self.get(db, "job", key)
+        try:
             with self.lock, self.transaction() as db:
                 job = self.get(db, "job", key)
                 binding = self.owned(db, "binding", job["binding_id"], job["owner"])
@@ -162,9 +172,6 @@ class ManagedExecution:
                 if run["state"] == "queued":
                     job["state"] = "queued"
                     return self._save_managed(job)
-                if job.get("hold_go") and run["state"] == "granted" and not job.get("cancel_requested"):
-                    job.update(state="waiting", lease_state="granted")
-                    return self._save_managed(job)
                 if run["state"] == "granted":
                     run = self.control(job["owner"], key, "preflight", _managed=True)
                 if run["state"] == "starting":
@@ -178,7 +185,9 @@ class ManagedExecution:
                     command += "\n" + job["spec"]["command"]
                     specification = {**job["spec"], "command": command, "cwd": binding["endpoint"]["cwd"],
                                      "env": {**job["spec"]["env"], **run["environment"],
-                                             ENV_NAME: json.dumps(receipt, sort_keys=True)}}
+                                             ENV_NAME: json.dumps(receipt, sort_keys=True)},
+                                     "prepared_timeout_seconds": max(120, job["request"]["queue_seconds"])
+                                     if job.get("hold_go") else 120}
                     job["service_port"] = run.get("service_port")
                     observed = self.backend.job(runtime, job["job_id"], "prepare", spec=specification)
                     job["remote"] = observed
@@ -194,8 +203,16 @@ class ManagedExecution:
                     if run["state"] != "active":
                         raise RuntimeError("lease is not active; the start gate remains closed")
                     if observed["state"] == "prepared":
-                        authorization = {"run_id": key, "epoch": run["epoch"], "fence": run["task"]["fence_token"]}
-                        observed = self.backend.job(runtime, job["job_id"], "go", authorization=authorization)
+                        if job.get("hold_go"):
+                            # A role waiting for its group has a supervised
+                            # closed start gate and a renewable active lease.
+                            # Do not hold a short-lived unactivated grant while
+                            # another host prepares or waits for its devices.
+                            job.update(state="waiting", remote=observed, lease_state="active")
+                            return self._save_managed(job)
+                        else:
+                            authorization = {"run_id": key, "epoch": run["epoch"], "fence": run["task"]["fence_token"]}
+                            observed = self.backend.job(runtime, job["job_id"], "go", authorization=authorization)
                     elif observed["state"] == "absent":
                         raise RuntimeError("active lease lost its job receipt; do not relaunch")
                     job.update(state="running", remote=observed, lease_state=run["state"])
@@ -211,6 +228,8 @@ class ManagedExecution:
             except Exception as exc:
                 job.update(state="uncertain", error=str(exc)[:500])
             return self._save_managed(job)
+        finally:
+            lock.release()
 
     def _save_managed(self, job):
         job["last_poll"] = self.clock()
@@ -222,11 +241,13 @@ class ManagedExecution:
             if current.get("cancel_requested"):
                 job["cancel_requested"] = True
                 job["force"] = bool(job.get("force") or current.get("force"))
+            if not current.get("hold_go"):
+                job["hold_go"] = False
             self.put(db, "job", job)
             runs = [row for row in self.rows(db, "run") if row["id"] == job["id"]]
             binding = self.get(db, "binding", job["binding_id"])
         if runs:
-            self.export_manifest(runs[0], binding, job=job)
+            self.export_execution_record(runs[0], binding, job=job)
         return job
 
     def _finish_managed(self, job, run, binding, runtime, observed):
@@ -248,11 +269,20 @@ class ManagedExecution:
         job["state"] = state if state in JOB_TERMINAL else "inconclusive"
         job["remote"] = observed
         job["runtime_returned"] = False
-        job.pop("error", None)
+        if job["state"] == "inconclusive" and run["state"] == "expired" and not job.get("had_receipt"):
+            job["error"] = "lease expired before the command started: " + (run.get("task", {}).get("message") or "activation deadline elapsed")
+        else:
+            job.pop("error", None)
         return self._save_managed(job)
 
     def managed_tick(self, limit=4):
         with self.transaction() as db:
             jobs = [row for row in self.rows(db, "job") if row["state"] not in JOB_TERMINAL]
-        for row in sorted(jobs, key=lambda item: item["last_poll"])[:limit]:
-            self.managed_advance(row["id"])
+        pending = [row for row in sorted(jobs, key=lambda item: item["last_poll"])
+                   if not self._entity_lock("job", row["id"]).locked()][:limit]
+        if not pending:
+            return
+        # A slow role or an advancement already in progress must not consume
+        # another host's lease heartbeat budget.
+        with ThreadPoolExecutor(max_workers=min(4, len(pending)), thread_name_prefix="vaws-supervise") as workers:
+            list(workers.map(lambda row: self.managed_advance(row["id"], wait=False), pending))

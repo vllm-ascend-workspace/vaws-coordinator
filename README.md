@@ -17,6 +17,12 @@ Conflicting native identities require an explicit context. This does not bind
 sources, discover machines, or allocate devices; ordinary code review needs no
 task client.
 
+`client.finish()` closes a task that has never admitted managed work directly
+in the local registry, without starting or importing the coordinator service
+or remote-dev. Local close and execution admission share one database write
+transaction boundary: if close wins, submission is rejected; if admission wins,
+finish delegates to the coordinator for owned-execution cleanup.
+
 A configured existing user container can prepare a task without selecting an
 image recipe again. Creating a container still requires an explicit recipe.
 Preparation checks source/image build compatibility before installing vLLM.
@@ -34,8 +40,28 @@ Library workflows can use `client.wait(execution_id, until="running")` or
 `until="released"`, with a bounded `timeout_seconds`. A timeout returns the
 last observation with `wait_timed_out: true`; a release wait requires confirmed
 termination and resource release. Changing bound business worktree paths
-returns idle runtime bindings internally before preparing the next code state;
-live execution leases still prevent that transition.
+changes defaults for future submissions. It does not affect active executions
+or require their bindings to be returned.
+
+`client.run(command, sources={"app": "/actual/worktree"})` captures fixed Git
+content and SCM provenance before admission. Omitted `sources` uses explicit
+task defaults, or this native attachment's automatic cwd binding when no
+explicit defaults were set; `sources={}` runs without source dependencies.
+Defaults are replaced by `client.sources(mapping)`, including `{}` to clear
+them. All roles consume one accepted snapshot; later edits affect only later
+submissions. Replies expose `source_snapshot_id` and the selected source map.
+Capture pins Git objects without moving HEAD or changing the user's index.
+
+Resources default to `npu_count=0`. A CPU command or compiler therefore reserves
+no NPU; declare a positive `npu_count` or specific `devices` for NPU work. Each
+execution has its own work directory, while compatible prepared artifacts can
+be reused. Independent host preparations run concurrently, bounded to four
+workers and one active preparation per host.
+
+`run(..., service="model")` ensures identical fixed sources and configuration.
+Changed inputs report the differing fields; `restart=True` replaces the service
+only after the old execution has stopped and released resources. Connecting
+with `observe(service="model")` does not capture the current worktree.
 
 Managed launch injects `VAWS_EXECUTION_OBSERVATION` and retains the same receipt
 as `target.launch_observation`. It records the source snapshots, attested
@@ -48,12 +74,19 @@ topology and input parameters; missing facts remain unknown.
 
 ## Status observations
 
+`vaws-coordinator runtime-register` sends verification and registration to the
+running coordinator, which owns all catalog writes. Register an existing native
+artifact donor with `--reuse-only --source vllm=PATH --source vllm-ascend=PATH`;
+the source inputs are fixed before verification and the donor work root cannot
+be checked out for execution. Library clients can submit the same explicit
+specification with `CoordinatorClient.runtime_register(runtime_id, spec)`.
+
 Task MCP/CLI execution status may reuse a managed-job snapshot for up to two
 seconds. `vaws execution --refresh` (or tool argument `refresh: true`) requests
 a new status observation. Replies include `observation_freshness` with snapshot
 completion time, age, freshness, source and whether a busy execution deferred
 refresh. Per-role `status_observed_at` preserves individual sampling times;
-roles are sampled sequentially. The existing top-level `observed_at` is the
+roles are sampled concurrently with at most four workers. The top-level `observed_at` is the
 response-generation time, not proof of a new remote query.
 
 `TaskClient.observe()` preserves its fresh-by-default library behavior; pass
@@ -79,7 +112,7 @@ uvx --from git+https://github.com/vllm-ascend-workspace/vaws-coordinator@main va
 Replace `@main` with a commit or tag when you pin. `python -m vaws_coordinator`
 is the same entry as `vaws-coordinator`.
 
-The package depends on `vaws-remote-dev>=0.6.0` (import `remote_dev`). It
+The package depends on `vaws-remote-dev>=0.7.0` (import `remote_dev`). It
 does not pin that package's git source; the workspace that installs this
 library chooses the tag. `uv sync` / `uv lock` are not the developer path
 here: a library that named remote-dev's git source in `pyproject.toml`
@@ -122,8 +155,8 @@ the daemon places, prepares, launches and observes it. Pass the `context_file` s
 native session hook; never guess a task from cwd or history. Do not pass
 request IDs, profile hashes, or runtime IDs.
 
-Managed launches prepend their verified task-local `vllm` and `vllm-ascend`
-source directories to Python's import path. This prevents repository directories
+Managed launches prepend their selected source directories to Python's import
+path. This prevents repository directories
 in the task cwd from shadowing editable packages, while preserving the CANN
 and other support paths already supplied by the environment.
 
@@ -174,7 +207,7 @@ executed on the physical host. Durable host state defaults to
 ## Development
 
 `uv sync` is not the setup path. This library declares
-`vaws-remote-dev>=0.6.0` without a git source: remote-dev is not on PyPI,
+`vaws-remote-dev>=0.7.0` without a git source: remote-dev is not on PyPI,
 so `uv sync` / `uv lock` fail with an unsatisfiable-dependency error.
 That is intentional. A library that pinned remote-dev's git URL would
 take the upgrade decision away from every consumer, and
@@ -185,8 +218,8 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@68ced0cc4fc16e805da8cd46bdf97bc1eccdd2ce"
-uv pip install pytest
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@862e9ae4ab5e4bb8252a99cfee8629dbfeeb2597"
+uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
 ```
@@ -213,6 +246,15 @@ its timestamps and log reference. Installation heartbeat events reach status
 while compilation is in progress. Full install logs remain in the task root;
 role errors, lease state and descendant quietness remain visible after failure.
 `resources_released` is separate from execution state.
+Long install, native reuse and profile verification commands have persisted
+remote-dev job references and receipts. Stop interrupts their owned process
+families and requires verified quiet before reporting cancellation or release;
+an unknown transport or ownership outcome remains uncertain. A restarted daemon
+can observe and stop these retained jobs without replaying preparation or
+replacing sources beneath a compiler. Queued preparation can cancel while
+another execution holds the host's preparation lock. Tail includes the current
+local preparation log. Source materialization retains its existing bounded
+upload/command deadlines and checks cancellation at its completion boundary.
 Completed build-compatibility failures end preparation before editable installs
 and do not retry automatically. Completed source-sync failures retain their
 original cause; lost transport remains uncertain. Remote profile paths are

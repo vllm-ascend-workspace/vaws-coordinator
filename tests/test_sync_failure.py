@@ -19,4 +19,4 @@ def test_completed_sync_failure_preserves_reason_and_recovery(tmp_path, monkeypa
     monkeypatch.setattr("vaws_coordinator.service.subprocess.run", run)
     binding = {"runtime_id": "runtime", "endpoint": {}, "intent": {"session": "task"}, "environment": {}}
     with pytest.raises(error, match="nested source path too long"):
-        service.sync_binding(binding, {"vllm": "one", "vllm-ascend": "two"}, "execution")
+        service.sync_binding(binding, {"sources": {"vllm": {"path": "one"}, "vllm-ascend": {"path": "two"}}}, "execution")

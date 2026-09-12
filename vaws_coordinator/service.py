@@ -19,13 +19,17 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from remote_dev.runtime import process_identity, runtime_status
+from remote_dev.processes import control as preparation_control
 
 from vaws_coordinator.agent_session import AgentSessions
 from vaws_coordinator.backend import RemoteBackend
 from vaws_coordinator.build_inputs import BUILD_INPUT_ENV_KEYS
+from vaws_coordinator.client_paths import client_path
+from vaws_coordinator.execution_sources import source_paths, validate_source_snapshot
 from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMINAL
 from vaws_coordinator.parity import materialize_command
 from vaws_coordinator.parity_support import RemoteCommandError
@@ -36,9 +40,11 @@ from vaws_coordinator.placement import (
     host_key,
     role_plan,
     runtime_matches,
-    select_runtimes,
 )
 from vaws_coordinator.provision.task_environment import TaskRootBusy
+from vaws_coordinator.preparation_process import (
+    PreparationCancelled, PreparationUncertain, stop_preparation_process,
+)
 from vaws_coordinator.ready_runtime import RuntimePool, user_container_name
 from vaws_coordinator.state_paths import coordinator_state_dir
 
@@ -85,9 +91,36 @@ def lock_path(state_dir: Path) -> Path:
     return Path(state_dir) / LOCK_NAME
 
 
+def require_native_owner(state_dir: Path, *, platform: str | None = None) -> None:
+    if (platform or os.name) == "nt":
+        return
+    try:
+        address = json.loads((Path(state_dir) / IPC_NAME).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("cannot determine coordinator ownership from its IPC marker") from exc
+    if isinstance(address, dict) and "port" in address:
+        raise RuntimeError(
+            "this shared state directory belongs to a Windows coordinator; configure the WSL "
+            "coordinator MCP and session hooks to invoke the managed Windows Python executable "
+            "on /mnt/<drive>. A second Linux coordinator cannot manage the same state."
+        )
+
+
 def _service_spec_key(spec: dict) -> dict:
-    return {key: spec.get(key) for key in ("command", "env", "environment", "resources", "topology",
-                                           "timeout_seconds", "service", "preflight")}
+    result = {key: spec.get(key) for key in ("command", "env", "environment", "resources", "topology",
+                                            "roles", "timeout_seconds", "service", "preflight")}
+    result["sources"] = (spec.get("source_snapshot") or {}).get("id")
+    return result
+
+
+def _map_roles(operation, roles):
+    """Keep independent remote role I/O within one bounded worker group."""
+    if len(roles) <= 1:
+        return [operation(role) for role in roles]
+    with ThreadPoolExecutor(max_workers=min(4, len(roles)), thread_name_prefix="vaws-role") as workers:
+        return list(workers.map(operation, roles))
 
 
 def aggregate_job_states(states: list[str | None]) -> str:
@@ -125,7 +158,8 @@ def aggregate_job_states(states: list[str | None]) -> str:
 class CoordinatorService:
     def __init__(self, state_dir: Path, *, pool: RuntimePool | None = None, backend=None,
                  sessions: AgentSessions | None = None):
-        self.state_dir = Path(state_dir)
+        self.state_dir = Path(client_path(state_dir)).expanduser().resolve()
+        require_native_owner(self.state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.backend = backend or (pool.backend if pool is not None else RemoteBackend())
         self.pool = pool or RuntimePool(self.state_dir, self.backend)
@@ -248,6 +282,8 @@ class CoordinatorService:
             method = getattr(self.pool, request["method"])
             value = method(*request.get("args", []), **request.get("kwargs", {}))
             return {"ok": True, "value": value}
+        if op == "runtime_register":
+            return {"ok": True, "value": self.pool.register(request["runtime_id"], request["spec"])}
         if op == "provision":
             from vaws_coordinator.provision import provision_user_container
             return {"ok": True, "value": provision_user_container(**request.get("kwargs", {}))}
@@ -259,9 +295,7 @@ class CoordinatorService:
             session = store.get(db, "session", session_id)
         if session["state"] != "open":
             raise ValueError("task admission is closed; resume the task before starting another execution")
-        sources = {name: source["path"] for name, source in session.get("sources", {}).items()}
-        if not {"vllm", "vllm-ascend"}.issubset(sources):
-            raise ValueError("bind the actual vllm and vllm-ascend worktrees before an Ascend execution")
+        validate_source_snapshot(spec.get("source_snapshot"))
         execution_id = None
         created = False
         with self._lock_for("session", session_id):
@@ -275,19 +309,19 @@ class CoordinatorService:
                     if same and not restart:
                         execution_id = existing["id"]
                     elif not same and not restart:
+                        previous, wanted = _service_spec_key(existing.get("spec") or {}), _service_spec_key(spec)
+                        changed = [key for key in wanted if previous.get(key) != wanted[key]]
                         raise ValueError(
-                            "service is already running with a different command/environment/resources; "
+                            "service is already running with different inputs: " + ", ".join(changed) + "; "
                             "pass restart=True to replace it"
                         )
                     else:
                         stopped = self._stop_and_wait(store, sessions_dir, user, existing)
-                        if stopped.get("state") not in DONE:
+                        if stopped.get("state") not in DONE or stopped.get("resources_released") is not True:
                             return stopped
             if execution_id is None:
                 request_id = uuid.uuid4().hex
-                row = store.execution({"session": {"id": session_id}}, request_id, spec)
-                row.update(phase="queued", admitted=True, user=user)
-                store.save_execution(row)
+                row = store.admit_execution(session_id, request_id, spec, user=user)
                 execution_id = row["id"]
                 created = True
         if wait is None:
@@ -337,6 +371,8 @@ class CoordinatorService:
                 if row.get("roles") and (action != "status" or refresh or not current):
                     row = self._refresh_jobs(store, user, row)
                     refreshed = bool(row.get("jobs_observed_at"))
+                elif row.get("preparation_jobs") and not row.get("roles") and (action != "status" or refresh):
+                    self._refresh_preparation_jobs(store, row)
             if action == "tail":
                 return self._tail(store, user, row, role=role)
             reply = self._reply(row, role=role)
@@ -428,18 +464,23 @@ class CoordinatorService:
                     bool(row.get("force")) or bool((session.get("finish") or {}).get("force")),
                 )
             raise ValueError("task admission is closed; resume the task before starting another execution")
-        sources = {name: source["path"] for name, source in session.get("sources", {}).items()}
-        if not {"vllm", "vllm-ascend"}.issubset(sources):
-            raise ValueError("bind the actual vllm and vllm-ascend worktrees before an Ascend execution")
+        source_snapshot = validate_source_snapshot(spec["source_snapshot"])
+        sources = source_paths(source_snapshot)
         if "remote_session" not in row:
-            row["remote_session"] = self.pool.session_open(user, session["id"], sources)
+            # Remote ownership is per execution. A task only supplies mutable
+            # defaults and never owns a rematerializable shared source root.
+            row["remote_session"] = self.pool.session_open(user, row["id"], sources)
             row["sources"] = sources
             store.save_execution(row)
-        row["sources"] = sources
 
         roles = spec.get("roles") or role_plan(spec.get("topology"), spec.get("resources") or {}, spec["command"])
         environment = spec.get("environment") or {}
         if not row.get("roles"):
+            if row.get("preparation_jobs"):
+                row["phase"] = "uncertain"
+                row["error"] = "retained preparation jobs require stop/quiet cleanup before a new execution"
+                store.save_execution(row)
+                return self._reply(row)
             row["phase"] = "preparing"
             store.save_execution(row)
             placed = self._place_or_prepare(store, user, row, roles, environment)
@@ -489,6 +530,9 @@ class CoordinatorService:
                                   "devices": role.get("devices") or [],
                                   "service_port": role.get("service_port"),
                                   "env": dict(role.get("env") or {})})
+                prepared_snapshots = placed.get("snapshots") or {}
+                if runtime_id in prepared_snapshots:
+                    role_rows[-1]["snapshots"] = prepared_snapshots[runtime_id]
             row["roles"] = role_rows
             row["assignment"] = {"runtime_ids": placed["runtime_ids"],
                                  "roles": [{"name": item["name"], "runtime_id": item["runtime_id"],
@@ -501,7 +545,11 @@ class CoordinatorService:
             store.save_execution(row)
 
         for role in row["roles"]:
-            if role.get("snapshots"):
+            if "snapshots" in role:
+                continue
+            if not source_snapshot["records"]:
+                role["snapshots"] = {}
+                store.save_execution(row)
                 continue
             cwd = role["binding"]["endpoint"]["cwd"]
             with self._lock_for("root", cwd):
@@ -512,7 +560,8 @@ class CoordinatorService:
                     return self._reply(row)
                 self._save_progress(store, row, role["name"], {
                     "step": "sync-sources", "log_ref": str(self.state_dir / "runs" / row["id"] / role["runtime_id"] / "parity.log")})
-                role["snapshots"] = self.sync_binding(role["binding"], row["sources"], row["id"])
+                role["snapshots"] = self.sync_binding(role["binding"], source_snapshot, row["id"])
+                store.save_execution(row)
                 halted = self._halt_if_cancelled(store, user, row)
                 if halted is not None:
                     return halted
@@ -537,12 +586,11 @@ class CoordinatorService:
             return halted
 
         hold_go = len(row["roles"]) > 1
-        for role in row["roles"]:
+        def start_role(role):
             if role.get("managed_job"):
-                continue
-            halted = self._halt_if_cancelled(store, user, row)
-            if halted is not None:
-                return halted
+                return self.pool.managed_control(user, role["managed_job"], "status")
+            if self._adopt_cancel(store, row):
+                return None
             merged_env = {**(spec.get("env") or {}), **(role.get("env") or {})}
             job = self.pool.managed_start(
                 user, role["binding"]["id"], row["id"] + "-" + role["name"] if hold_go else row["id"],
@@ -551,39 +599,53 @@ class CoordinatorService:
                 role["command"], merged_env, spec.get("timeout_seconds"),
                 service_port=role.get("service_port"), hold_go=hold_go,
             )
-            role["managed_job"] = job["id"]
-            role["observation"] = job
-        store.save_execution(row)
+            with self._lock_for("progress", row["id"]):
+                role["managed_job"] = job["id"]
+                role["observation"] = job
+                store.save_execution(row)
+            return job
 
-        jobs = []
-        for role in row["roles"]:
-            job = self.pool.managed_control(user, role["managed_job"], "status")
-            role["observation"] = job
-            jobs.append(job)
-
+        jobs = _map_roles(start_role, row["roles"])
         halted = self._halt_if_cancelled(store, user, row)
         if halted is not None:
             return halted
+        for role, job in zip(row["roles"], jobs):
+            role["observation"] = job
         if hold_go:
-            leases = [job.get("lease_state") or job["state"] for job in jobs]
-            failed = [job for job in jobs if job["state"] in {"failed", "timeout", "inconclusive"}]
+            # Same-host acquisitions honor the host FIFO. A later role may
+            # have observed its sibling still queued during parallel submit;
+            # recheck only those queued roles once after all submissions finish.
+            if any(job.get("lease_state") == "queued" for job in jobs):
+                def recheck_queued(role):
+                    job = role["observation"]
+                    return self.pool.managed_control(user, role["managed_job"], "status") if job.get("lease_state") == "queued" else job
+                jobs = _map_roles(recheck_queued, row["roles"])
+                for role, job in zip(row["roles"], jobs):
+                    role["observation"] = job
+            failed = [job for job in jobs if job["state"] in {"failed", "timeout", "cancelled", "inconclusive"}]
             if failed:
                 self._stop_jobs(user, row, False)
                 row["phase"] = "failed"
                 store.save_execution(row)
                 return self._reply(row)
-            if all(state in LEASE_READY or job["state"] == "running" for state, job in zip(leases, jobs)):
-                if all(job["state"] == "running" for job in jobs):
-                    pass
-                elif all(job.get("lease_state") == "granted" or job["state"] == "waiting" for job in jobs):
-                    halted = self._halt_if_cancelled(store, user, row)
-                    if halted is not None:
-                        return halted
-                    jobs = []
-                    for role in row["roles"]:
-                        job = self.pool.managed_release_gate(user, role["managed_job"])
-                        role["observation"] = job
-                        jobs.append(job)
+            if not row.get("group_start_authorized") and all(
+                    job.get("lease_state") == "active" and job.get("remote", {}).get("state") in {"prepared", "running"}
+                    for job in jobs):
+                # Persist the group decision before sending any go command.
+                # Partial replies/restarts retain this authorization and the
+                # original jobs; already completed members are never relaunched.
+                row["group_start_authorized"] = True
+                store.save_execution(row)
+            if row.get("group_start_authorized"):
+                def release_role(role):
+                    job = role["observation"]
+                    if job["state"] in JOB_TERMINAL or job["state"] == "running":
+                        return job
+                    return self.pool.managed_release_gate(user, role["managed_job"])
+
+                jobs = _map_roles(release_role, row["roles"])
+                for role, job in zip(row["roles"], jobs):
+                    role["observation"] = job
             elif not all(job["state"] in JOB_TERMINAL for job in jobs):
                 row["phase"] = "queued" if any(job["state"] == "queued" for job in jobs) else "waiting"
                 row["managed_job"] = jobs[0]["id"]
@@ -601,51 +663,17 @@ class CoordinatorService:
         return self._reply(row)
 
     def _place_or_prepare(self, store, user, row, roles, environment) -> dict[str, Any]:
+        if row.get("preparation_jobs"):
+            # A restarted/failed preparation retains durable job references.
+            # Re-materializing here could replace sources under a live compiler.
+            # Keep this execution observable/stoppable without replaying work.
+            raise PreparationUncertain("retained preparation jobs require stop/quiet cleanup before a new execution")
         catalog = self.pool.catalog()
-        existing = self.pool.session_bindings(user, row["remote_session"]["id"])
-        reused_ids = []
-        reused_bindings = []
-        for role in roles:
-            found = None
-            found_binding = None
-            for binding in existing:
-                item = next((entry for entry in catalog if entry["runtime_id"] == binding["runtime_id"]), None)
-                if item is None or binding["runtime_id"] in reused_ids:
-                    continue
-                if not runtime_matches(item, environment, role):
-                    continue
-                cwd = binding["endpoint"]["cwd"]
-                if (self.pool.runtime_busy(binding["runtime_id"])
-                        or self._lock_for("root", cwd).locked()
-                        or self._other_execution_using_runtime(store, row, binding["runtime_id"])):
-                    return {"status": "waiting",
-                            "reason": "task root is in use; waiting before rematerializing changed code"}
-                found = binding["runtime_id"]
-                found_binding = binding
-                break
-            if not found:
-                reused_ids = []
-                reused_bindings = []
-                break
-            reused_ids.append(found)
-            reused_bindings.append(found_binding)
-        if reused_ids:
-            return {"runtime_ids": reused_ids, "bindings": reused_bindings, "reason": None}
-
-        busy = {item["runtime_id"] for item in catalog if self.pool.runtime_busy(item["runtime_id"])}
+        # Catalog entries supply compatible environments and artifact donors,
+        # never an arbitrary writable cwd to repurpose for the current sources.
+        # Preparation resolves the execution's own root and reusable artifacts.
         topology = (row.get("spec") or {}).get("topology") or {}
         need_distinct = distinct_hosts_required(roles, topology)
-        selected = select_runtimes(catalog, user=user, roles=roles, environment=environment,
-                                   busy_runtime_ids=busy, topology=topology)
-        if selected["runtime_ids"]:
-            catalog_map = {item["runtime_id"]: item for item in catalog}
-            for index, role in enumerate(roles):
-                item = catalog_map.get(selected["runtime_ids"][index])
-                if item is None or not runtime_matches(item, environment, role):
-                    return {"status": "cache_miss",
-                            "reason": "prepared environment does not match requested constraints",
-                            "provisioning_started": False}
-            return selected
 
         if need_distinct:
             known = {host_key(item) for item in catalog if item.get("user") == user and host_key(item)}
@@ -654,24 +682,56 @@ class CoordinatorService:
                 if ip:
                     known.add(ip)
             if len(known) < len(roles):
-                return {"status": "cache_miss", "reason": selected["reason"]
-                        or "not enough distinct hosts with a matching prepared environment for this topology",
+                return {"status": "cache_miss", "reason":
+                        "not enough distinct hosts with a matching prepared environment for this topology",
                         "provisioning_started": False}
-        ids = []
+        placements = []
         used_hosts: set[str] = set()
         for role in roles:
             donor = self._donor_for_role(user, environment, role, used_hosts, need_distinct)
             if donor is None:
                 donor = self._ensure_user_container(user, environment, role, used_hosts, need_distinct)
             if donor is None:
-                return {"status": "cache_miss", "reason": selected["reason"], "provisioning_started": False}
+                return {"status": "cache_miss", "reason": "no allowed host provides the requested environment",
+                        "provisioning_started": False}
             host = host_key(donor)
             if need_distinct and host:
                 used_hosts.add(host)
+            placements.append((role, donor))
+
+        def prepare(placement):
+            role, donor = placement
+            # CPU preparation never holds NPU leases. Across concurrent task
+            # groups, one host prepares at a time; independent hosts proceed.
+            host = host_key(donor)
+            lock = self._lock_for("prepare-host", host)
+            while not lock.acquire(timeout=0.1):
+                if self._adopt_cancel(store, row):
+                    return None
             try:
-                prepared = self._prepare_role(store, user, row, role, environment, donor)
-            except TaskRootBusy as exc:
-                return {"status": "waiting", "reason": str(exc)}
+                if self._adopt_cancel(store, row):
+                    return None
+                try:
+                    return self._prepare_role(store, user, row, role, environment, donor)
+                except PreparationCancelled:
+                    return None
+            finally:
+                lock.release()
+
+        try:
+            if len(placements) == 1:
+                prepared_roles = [prepare(placements[0])]
+            else:
+                with ThreadPoolExecutor(max_workers=min(4, len(placements)),
+                                        thread_name_prefix="vaws-prepare") as workers:
+                    prepared_roles = list(workers.map(prepare, placements))
+        except TaskRootBusy as exc:
+            return {"status": "waiting", "reason": str(exc)}
+        ids = []
+        snapshots = {}
+        for (role, _donor), prepared in zip(placements, prepared_roles):
+            if prepared is None:
+                return {"status": "waiting", "reason": "execution cancellation requested during preparation"}
             catalog = {item["runtime_id"]: item for item in self.pool.catalog()}
             item = catalog.get(prepared["id"])
             if item is None or not runtime_matches(item, environment, role):
@@ -679,16 +739,13 @@ class CoordinatorService:
                         "reason": "prepared environment does not match requested constraints",
                         "provisioning_started": True}
             ids.append(prepared["id"])
-        return {"runtime_ids": ids, "reason": None, "provisioning_started": True}
-
-    def _other_execution_using_runtime(self, store, row, runtime_id) -> bool:
-        for other in store.executions(row["session_id"]):
-            if other["id"] == row["id"] or other.get("phase") in DONE:
-                continue
-            for role in other.get("roles") or []:
-                if role.get("runtime_id") == runtime_id:
-                    return True
-        return False
+            # Completed preparation already published and checked this exact
+            # input. A second materialization would remove generated version
+            # metadata/native copies and repeat successful preparation work.
+            if (prepared.get("attestation", {}).get("preparation") or {}).get("source_id") == row["spec"]["source_snapshot"]["id"]:
+                snapshots[prepared["id"]] = {record["relpath"]: record["commit"]
+                                             for record in row["spec"]["source_snapshot"]["records"]}
+        return {"runtime_ids": ids, "snapshots": snapshots, "reason": None, "provisioning_started": True}
 
     def _donor_for_role(self, user, environment, role, used_hosts, require_distinct=False):
         catalog = self.pool.catalog()
@@ -789,29 +846,61 @@ class CoordinatorService:
             path = Path(event["log_ref"])
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(exist_ok=True)
-        previous = row.get("progress") or {}
-        same_step = (previous.get("step"), previous.get("role")) == (event.get("step"), role)
-        row["progress"] = {**(previous if same_step else {}), **event, "role": role,
-                           "started_at": previous["started_at"] if same_step else now,
-                           "updated_at": now}
-        store.save_execution(row)
+        with self._lock_for("progress", row["id"]):
+            previous = (row.get("role_progress") or {}).get(role, {}) if role else row.get("progress") or {}
+            same_step = (previous.get("step"), previous.get("role")) == (event.get("step"), role)
+            progress = {**(previous if same_step else {}), **event, "role": role,
+                        "started_at": previous["started_at"] if same_step else now,
+                        "updated_at": now}
+            row["progress"] = progress
+            if role:
+                row.setdefault("role_progress", {})[role] = progress
+            store.save_execution(row)
 
     def _prepare_role(self, store, user, row, role, environment, donor):
         from vaws_coordinator.provision import prepare_task_environment
         return prepare_task_environment(
-            self.pool, user=user, session_id=row["session_id"], role_name=role["name"],
+            self.pool, user=user, session_id=row["id"], role_name=role["name"],
             environment=environment, donor=donor, sources=row.get("sources") or {},
+            source_snapshot=row["spec"]["source_snapshot"],
             on_progress=lambda event: self._save_progress(store, row, role["name"], event),
             log_dir=self.state_dir / "runs" / row["id"] / role["name"],
+            on_preparation_job=lambda job: self._save_preparation_job(store, row, role["name"], job),
+            cancel_requested=lambda: self._adopt_cancel(store, row),
         )
 
-    def sync_binding(self, binding, sources, execution_id):
+    def _save_preparation_job(self, store, row, role, job):
+        with self._lock_for("progress", row["id"]):
+            row.setdefault("preparation_jobs", {}).setdefault(role, {})[job["job_id"]] = dict(job)
+            progress = (row.get("role_progress") or {}).get(role)
+            if progress and progress.get("step") == job.get("step"):
+                progress["process"] = {key: job.get(key) for key in ("job_id", "state", "quiet", "observed_at")}
+                current = row.get("progress") or {}
+                if current.get("role") == role and current.get("step") == job.get("step"):
+                    current["process"] = progress["process"]
+            store.save_execution(row)
+
+    def _refresh_preparation_jobs(self, store, row):
+        for role, records in (row.get("preparation_jobs") or {}).items():
+            for record in records.values():
+                if record.get("quiet"):
+                    continue
+                try:
+                    observed = preparation_control(record["endpoint"], record["job_id"], "status")
+                except Exception as exc:
+                    observed = {"state": "uncertain", "quiet": False, "error": str(exc)[:500]}
+                record.update({key: value for key, value in observed.items() if key != "processes"})
+                record["observed_at"] = time.time()
+                self._save_preparation_job(store, row, role, record)
+
+    def sync_binding(self, binding, source_snapshot, execution_id):
         directory = self.state_dir / "runs" / execution_id / binding["runtime_id"]
         directory.mkdir(parents=True, exist_ok=True)
         endpoint = binding["endpoint"]
         args = materialize_command(workspace_id=binding["intent"]["session"],
                                    runtime_id=binding["runtime_id"], endpoint=endpoint,
-                                   sources={name: sources[name] for name in ("vllm", "vllm-ascend")})
+                                   sources=source_paths(source_snapshot), source_snapshot=source_snapshot,
+                                   workspace_root=directory)
         environment = {key: value for key, value in os.environ.items() if key not in BUILD_INPUT_ENV_KEYS}
         environment.update(binding.get("build_env", {}))
         environment.update(binding["environment"])
@@ -835,12 +924,13 @@ class CoordinatorService:
     def _refresh_jobs(self, store, user, row):
         if not row.get("roles"):
             return row
-        for role in row["roles"]:
+        def observe_role(role):
             if not role.get("managed_job"):
-                continue
+                return
             job = self.pool.managed_control(user, role["managed_job"], "status")
             role["observation"] = job
             role["status_observed_at"] = time.time()
+        _map_roles(observe_role, row["roles"])
         if row["roles"]:
             if any(role.get("managed_job") for role in row["roles"]):
                 row["jobs_observed_at"] = time.time()
@@ -857,13 +947,32 @@ class CoordinatorService:
         if force:
             row["force"] = True
         self._stop_jobs(user, row, force)
+        preparation_quiet = self._stop_preparation_jobs(store, row, force)
         row = self._refresh_jobs(store, user, row)
         job_states = [role.get("observation", {}).get("state")
                       for role in row.get("roles") or [] if role.get("managed_job")]
-        if not job_states:
+        if not preparation_quiet:
+            row["phase"] = "uncertain"
+            row["error"] = "preparation stop has not verified quiet; retained jobs remain owned"
+            store.save_execution(row)
+        elif not job_states:
             row["phase"] = "cancelled"
             store.save_execution(row)
         return self._reply(row)
+
+    def _stop_preparation_jobs(self, store, row, force):
+        jobs = [(role, job) for role, records in (row.get("preparation_jobs") or {}).items()
+                for job in records.values()]
+        def stop_job(item):
+            role, job = item
+            if job.get("quiet"):
+                return True
+            return stop_preparation_process(job,
+                lambda value: self._save_preparation_job(store, row, role, value), force=force)
+        if len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as workers:
+                return all(list(workers.map(stop_job, jobs)))
+        return all(stop_job(item) for item in jobs)
 
     def _stop_and_wait(self, store, sessions_dir, user, row, timeout=None):
         if timeout is None:
@@ -876,12 +985,13 @@ class CoordinatorService:
         return reply
 
     def _stop_jobs(self, user, row, force):
-        for role in row.get("roles") or []:
+        def stop_role(role):
             if role.get("managed_job"):
                 try:
                     role["observation"] = self.pool.managed_control(user, role["managed_job"], "stop", force)
                 except Exception:
-                    continue
+                    pass
+        _map_roles(stop_role, row.get("roles") or [])
 
     def _record_assignment(self, row, jobs):
         assignment = row.get("assignment") or {"roles": []}
@@ -909,6 +1019,9 @@ class CoordinatorService:
         if (isinstance(exc, RemoteCommandError) and exc.returncode != 255
                 and row.get("phase") == "preparing" and not row.get("roles")):
             permanent = True
+        if any(not job.get("quiet") for records in (row.get("preparation_jobs") or {}).values()
+               for job in records.values()):
+            permanent = False
         path = self.state_dir / "runs" / row["id"] / "error.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as stream:
@@ -970,6 +1083,12 @@ class CoordinatorService:
         payload = {"execution_id": row["id"], "state": state, "service": (row.get("spec") or {}).get("service"),
                    "assignment": row.get("assignment"), "observed_at": time.time(),
                    "progress": row.get("progress"), "observation_freshness": self._observation_freshness(row)}
+        if row.get("role_progress"):
+            payload["role_progress"] = row["role_progress"]
+        snapshot = (row.get("spec") or {}).get("source_snapshot")
+        if snapshot:
+            payload["source_snapshot_id"] = snapshot["id"]
+            payload["sources"] = snapshot["sources"]
         if row.get("cancel_requested"):
             payload["cancel_requested"] = True
         if row.get("error"):
@@ -981,7 +1100,8 @@ class CoordinatorService:
         from vaws_coordinator.ready_runtime import TERMINAL
         payload["resources_released"] = state in DONE and all(
             not item.get("managed_job") or (item.get("observation") or {}).get("lease_state") in TERMINAL
-            for item in roles)
+            for item in roles) and all(job.get("quiet") for records in (row.get("preparation_jobs") or {}).values()
+                                      for job in records.values())
         role_views = [self._role_view(row, item) for item in roles]
         if role:
             role_views = [item for item in role_views if item.get("name") == role]
@@ -1019,6 +1139,20 @@ class CoordinatorService:
                 extra = by_name.get(view.get("name"))
                 if extra:
                     view.update(extra)
+        if not selected and row.get("role_progress"):
+            preparation_logs = []
+            for name, progress in row["role_progress"].items():
+                if role and name != role:
+                    continue
+                path = progress.get("log_ref")
+                if path and Path(path).is_file():
+                    with Path(path).open("rb") as stream:
+                        stream.seek(max(0, Path(path).stat().st_size - 32768))
+                        preparation_logs.append({"name": name, "step": progress.get("step"),
+                                                 "tail": stream.read().decode("utf-8", errors="replace")})
+            payload["preparation_logs"] = preparation_logs
+            if len(preparation_logs) == 1:
+                payload["tail"] = preparation_logs[0]["tail"]
         return payload
 
     def _target(self, row, binding, job) -> dict[str, Any]:
@@ -1287,7 +1421,7 @@ class CoordinatorService:
 
 class CoordinatorClient:
     def __init__(self, state_dir: Path, *, timeout=120):
-        self.state_dir = Path(state_dir)
+        self.state_dir = Path(client_path(state_dir)).expanduser().resolve()
         self.timeout = timeout
 
     def call(self, op: str, **payload) -> Any:
@@ -1351,8 +1485,13 @@ class CoordinatorClient:
         return self.call("finish", sessions_dir=str(sessions_dir), user=user,
                          session_id=session_id, force=force)
 
+    def runtime_register(self, runtime_id, spec):
+        return self.call("runtime_register", runtime_id=runtime_id, spec=spec)
+
 
 def ensure_daemon(state_dir: Path) -> CoordinatorClient:
+    state_dir = Path(client_path(state_dir)).expanduser().resolve()
+    require_native_owner(state_dir)
     client = CoordinatorClient(state_dir)
     try:
         client.runtime = (client.call("ping") or {}).get("runtime")
@@ -1379,6 +1518,7 @@ def ensure_daemon(state_dir: Path) -> CoordinatorClient:
 
 
 def _ensure_daemon_locked(state_dir: Path, client: CoordinatorClient) -> CoordinatorClient:
+    require_native_owner(state_dir)
     try:
         client.runtime = (client.call("ping") or {}).get("runtime")
         return client
@@ -1415,7 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", default="", help="Coordinator state directory")
     parser.add_argument("--action", choices=("serve", "status", "restart-if-idle"), default="serve")
     args = parser.parse_args(argv)
-    state = Path(args.state_dir).expanduser() if args.state_dir else coordinator_state_dir()
+    state = Path(client_path(args.state_dir)).expanduser().resolve() if args.state_dir else coordinator_state_dir()
     if args.action == "status":
         print(json.dumps(CoordinatorClient(state).call("ping")))
         return 0

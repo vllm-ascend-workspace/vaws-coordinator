@@ -11,11 +11,35 @@ from typing import Any
 
 SUPPORTED_RECIPES = {"rc", "main", "stable", "local-latest"}
 RESERVED_ENV = {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON", "VAWS_EXECUTION_OBSERVATION"}
+ENVIRONMENT_KEYS = {"recipe", "image", "python_abi", "cann", "soc", "machine_type"}
+RESOURCE_KEYS = {"devices", "npu_count", "service_port"}
+TOPOLOGY_KEYS = {"host", "roles", "distinct_hosts"}
+ROLE_KEYS = {"name", "command", "preflight", "devices", "npu_count", "service_port", "host", "env"}
+
+
+def checked_mapping(value, label, supported):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    unknown = set(value) - supported
+    if unknown:
+        raise ValueError(f"unsupported {label} fields: {', '.join(sorted(map(str, unknown)))}; supported: {', '.join(sorted(supported))}")
+    return dict(value)
+
+
+def normalize_environment(environment):
+    environment = checked_mapping(environment, "environment", ENVIRONMENT_KEYS)
+    if any(not isinstance(value, str) or not value.strip() for value in environment.values()):
+        raise ValueError("environment constraints must be nonempty strings")
+    if environment.get("recipe") and environment.get("image") and environment["recipe"] != environment["image"]:
+        raise ValueError("environment.recipe and environment.image specify conflicting constraints; supply one")
+    return environment
 
 
 def validate_user_env(env: dict[str, Any] | None) -> dict[str, str]:
     """Literal user env only. Managed device/port/interpreter/job tokens stay reserved."""
-    if not env:
+    if env is None:
         return {}
     if not isinstance(env, dict):
         raise ValueError("env must be a mapping of literal string values")
@@ -32,48 +56,72 @@ def validate_user_env(env: dict[str, Any] | None) -> dict[str, str]:
 
 
 def normalize_resources(resources: dict[str, Any] | None) -> dict[str, Any]:
-    resources = dict(resources or {})
-    if "devices" in resources and "npu_count" in resources:
-        raise ValueError("supply devices or npu_count, not both")
+    resources = checked_mapping(resources, "resources", RESOURCE_KEYS)
     if "devices" not in resources and "npu_count" not in resources:
-        resources["npu_count"] = 1
+        resources["npu_count"] = 0
     if "devices" in resources:
         devices = resources["devices"]
         if not isinstance(devices, list) or any(type(d) is not int or d < 0 for d in devices):
             raise ValueError("resources.devices must be distinct nonnegative integers")
         if len(set(devices)) != len(devices):
             raise ValueError("resources.devices must be distinct nonnegative integers")
-    if "npu_count" in resources and int(resources["npu_count"]) < 1:
-        raise ValueError("npu_count must be >= 1")
+    if "npu_count" in resources and (type(resources["npu_count"]) is not int or resources["npu_count"] < 0):
+        raise ValueError("npu_count must be a nonnegative integer")
+    if "devices" in resources and "npu_count" in resources:
+        if resources["npu_count"] != len(resources["devices"]):
+            raise ValueError("npu_count must equal the number of devices when both are supplied")
+        resources.pop("npu_count")
+    if "service_port" in resources and (type(resources["service_port"]) is not int or not 0 <= resources["service_port"] < 65536):
+        raise ValueError("service_port must be an integer from 0 to 65535")
     return resources
 
 
 def role_plan(topology: dict[str, Any] | None, resources: dict[str, Any], command: str) -> list[dict[str, Any]]:
-    if not topology or not topology.get("roles"):
+    topology = checked_mapping(topology, "topology", TOPOLOGY_KEYS)
+    if "distinct_hosts" in topology and type(topology["distinct_hosts"]) is not bool:
+        raise ValueError("topology.distinct_hosts must be a boolean")
+    if "host" in topology and (not isinstance(topology["host"], str) or not topology["host"].strip()):
+        raise ValueError("topology.host must be a nonempty hostname or IP address")
+    if "host" in topology and "roles" in topology:
+        raise ValueError("use topology.host for one default role, or topology.roles with host in each role; do not combine them")
+    if "roles" not in topology:
         item = {"name": "default", "command": command}
+        if "host" in topology:
+            item["host"] = topology["host"]
         item.update({k: resources[k] for k in ("devices", "npu_count", "service_port") if k in resources})
         return [item]
+    if not isinstance(topology["roles"], list) or not topology["roles"]:
+        raise ValueError("topology.roles must be a nonempty array of role objects")
     roles = []
     for role in topology["roles"]:
-        if not isinstance(role, dict) or not str(role.get("name") or "").strip():
+        role = checked_mapping(role, "topology.roles[]", ROLE_KEYS)
+        if not isinstance(role.get("name"), str) or not role["name"].strip():
             raise ValueError("topology.roles entries need a name")
-        name = str(role["name"])
-        item = {"name": name, "command": role.get("command") or command}
+        name = role["name"]
+        if any(previous["name"] == name for previous in roles):
+            raise ValueError("topology.roles names must be distinct")
+        if "command" in role and (not isinstance(role["command"], str) or not role["command"].strip()):
+            raise ValueError("role command must be a nonempty shell command")
+        item = {"name": name, "command": role.get("command", command)}
         if role.get("preflight") is not None:
             if not isinstance(role["preflight"], str) or not role["preflight"].strip():
                 raise ValueError("role preflight must be a nonempty shell command")
             item["preflight"] = role["preflight"]
-        if role.get("devices"):
-            item["devices"] = list(role["devices"])
+        if "devices" in role:
+            item.update(normalize_resources({key: role[key] for key in ("devices", "npu_count") if key in role}))
+        elif "npu_count" in role or "devices" not in resources:
+            item.update(normalize_resources({"npu_count": role.get("npu_count", resources.get("npu_count", 0))}))
         else:
-            item["npu_count"] = int(role.get("npu_count") or resources.get("npu_count") or 1)
+            item.update(normalize_resources({"devices": resources["devices"]}))
         if role.get("service_port") is not None:
-            item["service_port"] = role["service_port"]
+            item["service_port"] = normalize_resources({"service_port": role["service_port"]})["service_port"]
         elif resources.get("service_port") is not None and len(roles) == 0:
             item["service_port"] = resources["service_port"]
-        if role.get("host"):
+        if "host" in role:
+            if not isinstance(role["host"], str) or not role["host"].strip():
+                raise ValueError("role host must be a nonempty hostname or IP address")
             item["host"] = role["host"]
-        if role.get("env"):
+        if "env" in role:
             item["env"] = validate_user_env(role["env"])
         roles.append(item)
     return roles

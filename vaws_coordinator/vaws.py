@@ -47,6 +47,11 @@ def main():
         child.add_argument("--json", default="{}", help="Additional structured tool arguments")
         if name == "run":
             child.add_argument("--command", required=True)
+            sources = child.add_mutually_exclusive_group()
+            sources.add_argument("--source", action="append", metavar="NAME=PATH",
+                                 help="Capture an actual worktree for this submission; repeat for multiple repositories")
+            sources.add_argument("--no-sources", action="store_true", default=None,
+                                 help="Run without source dependencies, ignoring task defaults")
             child.add_argument("--service", default=None)
             child.add_argument("--restart", action="store_true")
             child.add_argument("--timeout-seconds", type=int)
@@ -78,6 +83,21 @@ def main():
     # Unset argparse defaults (None) must not silently override --json keys:
     # `--json '{"action":"stop"}'` degraded to a status query otherwise.
     merged = {**extra, **{key: value for key, value in args.items() if value is not None}}
+    if operation == "run":
+        selected = merged.pop("source", None)
+        no_sources = merged.pop("no_sources", None)
+        if selected:
+            captured = {}
+            for item in selected:
+                name, separator, path = item.partition("=")
+                if not separator or not name or not path or name in captured:
+                    print(json.dumps(error_payload("vaws.run", outcome="needs_input", status="invalid_sources",
+                                                   error="--source needs unique NAME=PATH entries"), ensure_ascii=False))
+                    return 1
+                captured[name] = path
+            merged["sources"] = captured
+        elif no_sources:
+            merged["sources"] = {}
     result = vaws_call("vaws." + operation, merged)
     print(json.dumps(result["result"], ensure_ascii=False))
     return 0 if result["result"]["outcome"] == "success" else 1

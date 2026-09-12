@@ -18,13 +18,37 @@ import uuid
 from pathlib import Path
 
 from vaws_coordinator.state_paths import agent_sessions_root
+from vaws_coordinator.client_paths import client_path
 
 CLIENTS = {"claude", "grok", "kimi", "codex", "cursor"}
 
 
+def git_common_directory(path: str | Path) -> Path:
+    """Resolve repository identity with Git, including linked-worktree subdirs."""
+    directory = Path(client_path(path)).expanduser().resolve(strict=True)
+    result = subprocess.run(
+        ["git", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+    )
+    return Path(client_path(result.stdout.strip())).resolve(strict=True)
+
+
+def source_defaults(session: dict, attachment: dict) -> dict:
+    """Select proven explicit task defaults or this native attachment's sources."""
+    if session.get("source_mode") == "explicit":
+        return {"origin": "explicit", "sources": session.get("sources", {})}
+    if session.get("sources"):
+        # Previous releases mixed automatic and explicit mappings. Neither a
+        # matching path nor a one-entry map establishes which one was intended.
+        return {"origin": "unknown", "sources": {},
+                "reason": "Saved source defaults have no provenance; set sources explicitly before submitting, "
+                          "or pass sources on this run. No legacy mapping was assumed to follow the native cwd."}
+    return {"origin": attachment.get("source_mode", "none"), "sources": attachment.get("sources", {})}
+
+
 def worktree_reference(path: str) -> dict:
     """Inspect an actual repository; never materialize a second source copy."""
-    source = Path(path).expanduser().resolve(strict=True)
+    source = Path(client_path(path)).expanduser().resolve(strict=True)
     result = subprocess.run(
         ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
@@ -39,7 +63,7 @@ def worktree_reference(path: str) -> dict:
 
 class AgentSessions:
     def __init__(self, state_dir: Path | None = None):
-        self.state_dir = (state_dir or agent_sessions_root()).expanduser().resolve()
+        self.state_dir = Path(client_path(state_dir or agent_sessions_root())).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db_path = self.state_dir / "sessions.sqlite3"
         with self.transaction() as db:
@@ -76,6 +100,7 @@ class AgentSessions:
             session = self.get(db, "session", attachment["session_id"])
         return {"schema_version": "vaws.agent-context.v1", "state_dir": str(self.state_dir),
                 "session": session, "attachment": attachment,
+                "source_defaults": source_defaults(session, attachment),
                 "context_file": str(self.state_dir / "contexts" / (attachment_id + ".json"))}
 
     def _publish(self, attachment_id):
@@ -107,6 +132,7 @@ class AgentSessions:
         # parent's native session id for child conversations.
         identity = [client, native_session_id, agent_id]
         key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        actual_cwd = str(Path(client_path(cwd)).expanduser().resolve())
         with self.transaction() as db:
             existing = [row for row in self.rows(db, "attachment") if row["id"] == key]
             if not existing:
@@ -116,13 +142,14 @@ class AgentSessions:
                     if session["state"] != "open":
                         raise ValueError("task is finished; explicitly reopen it before attaching")
                 else:
-                    self.put(db, "session", {"id": session_id, "state": "open", "created_at": now, "sources": {}})
+                    self.put(db, "session", {"id": session_id, "state": "open", "created_at": now,
+                                             "sources": {}, "source_mode": "automatic"})
                 self.put(db, "attachment", {
                     "id": key, "session_id": session_id, "client": client,
                     "native_session_id": native_session_id, "agent_id": agent_id or None,
                     "parent_id": parent["attachment"]["id"] if parent_context else None,
                     "association": "child" if parent_context else "explicit" if association else "new-task",
-                    "cwd": str(Path(cwd).expanduser().resolve()), "state": "attached", "created_at": now,
+                    "cwd": actual_cwd, "state": "attached", "created_at": now,
                 })
             else:
                 old = existing[0]
@@ -139,7 +166,12 @@ class AgentSessions:
                 elif session["state"] == "finished":
                     session["state"] = "open"
                     self.put(db, "session", session)
-                old.update(state="attached", resumed_at=now)
+                if old.get("cwd") != actual_cwd:
+                    # A native handoff can move this attachment. Never retain
+                    # the previous mutable automatic source after that move.
+                    old.pop("sources", None)
+                    old.pop("source_mode", None)
+                old.update(state="attached", resumed_at=now, cwd=actual_cwd)
                 self.put(db, "attachment", old)
         return self._publish(key)
 
@@ -163,14 +195,26 @@ class AgentSessions:
             session = self.get(db, "session", context["session"]["id"])
             if session["state"] != "open":
                 raise ValueError("resume the task before binding sources")
-            if any(row["session_id"] == session["id"] and row["phase"] not in
-                   {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
-                   for row in self.rows(db, "execution")):
-                if any(session["sources"].get(name, {}).get("path") != ref["path"] for name, ref in references.items()):
-                    raise ValueError("finish pending executions before changing source worktree references")
-            session["sources"].update(references)
+            # Defaults apply only to future submissions. Replace the mapping
+            # so {} can deliberately clear it and removed repos do not linger.
+            session["sources"] = references
+            session["source_mode"] = "explicit"
             self.put(db, "session", session)
         return self.context(context["attachment"]["id"])
+
+    def bind_native_sources(self, context: dict) -> dict:
+        """Bind only this attachment's actual cwd, without changing task defaults."""
+        attachment = self.context(context["attachment"]["id"])["attachment"]
+        reference = worktree_reference(attachment["cwd"])
+        common = Path(reference["git_common_dir"])
+        name = common.parent.name if common.name == ".git" else common.stem
+        with self.transaction() as db:
+            current = self.get(db, "attachment", attachment["id"])
+            if current["cwd"] != attachment["cwd"]:
+                raise ValueError("native working directory changed while binding its source")
+            current.update(sources={name: reference}, source_mode="native-cwd")
+            self.put(db, "attachment", current)
+        return self.context(attachment["id"])
 
     def detach(self, context: dict) -> dict:
         with self.transaction() as db:
@@ -191,6 +235,51 @@ class AgentSessions:
     def all_executions(self) -> list[dict]:
         with self.transaction() as db:
             return self.rows(db, "execution")
+
+    def close_if_unmanaged(self, session_id: str, *, user: str, force=False) -> dict | None:
+        """Close a task locally only when it has never admitted remote work.
+
+        The same write transaction guards admission's open-state check, so a
+        concurrent submit either becomes managed first or sees a closed task.
+        """
+        with self.transaction() as db:
+            session = self.get(db, "session", session_id)
+            rows = [row for row in self.rows(db, "execution") if row["session_id"] == session_id]
+            remote_facts = ("remote_session", "roles", "managed_job", "binding", "preparation_jobs")
+            if any(row.get("admitted") or any(row.get(key) for key in remote_facts) for row in rows):
+                return None
+            if session["state"] != "finished":
+                session["state"] = "finished"
+                session["finish"] = {"user": user, "force": bool(force), "at": time.time()}
+                self.put(db, "session", session)
+            observations = []
+            for row in rows:
+                row.update(phase="cancelled", cancel_requested=True)
+                self.put(db, "execution", row)
+                observations.append({"execution_id": row["id"], "state": "cancelled", "resources_released": True})
+            return {"state": "finished", "executions": observations, "worktrees_preserved": True}
+
+    def admit_execution(self, session_id: str, request_id: str, spec: dict, *, user: str) -> dict:
+        """Publish accepted execution facts atomically with the open-task check."""
+        key = hashlib.sha256(json.dumps([session_id, request_id]).encode()).hexdigest()
+        with self.transaction() as db:
+            if self.get(db, "session", session_id)["state"] != "open":
+                raise ValueError("task admission is closed; resume the task before starting another execution")
+            existing = [row for row in self.rows(db, "execution") if row["id"] == key]
+            if existing:
+                row = existing[0]
+                if row["spec"] != spec:
+                    raise ValueError("execution request id reused with different arguments")
+                if row.get("admitted"):
+                    if row.get("user") != user:
+                        raise PermissionError("execution belongs to another principal")
+                    return row
+            else:
+                row = {"id": key, "session_id": session_id, "request_id": request_id,
+                       "spec": spec, "created_at": time.time()}
+            row.update(phase="queued", admitted=True, user=user)
+            self.put(db, "execution", row)
+            return row
 
     def execution(self, context: dict, request_id: str, spec: dict) -> dict:
         key = hashlib.sha256(json.dumps([context["session"]["id"], request_id]).encode()).hexdigest()
@@ -245,7 +334,7 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
                 pass
         return store.attach("codex", native, str(Path.cwd()),
                             parent_context=parent, association=association)
-    path = Path(filename).expanduser().resolve(strict=True)
+    path = Path(client_path(filename)).expanduser().resolve(strict=True)
     reference = json.loads(path.read_text())
     if reference.get("schema_version") != "vaws.agent-context.v1":
         raise ValueError("not a VAWS agent context")

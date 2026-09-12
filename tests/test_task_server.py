@@ -170,13 +170,30 @@ class DispatchTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(result["structuredContent"]["data"]["session"]["sources"]["repo"]["path"], str(repo.resolve()))
 
-    def test_vaws_run_without_bound_sources_is_blocked_and_never_a_remote_success(self):
-        result = self.call("vaws_run", command="true")
-        self.assertTrue(result["isError"])
+    def test_vaws_run_without_bound_sources_admits_an_empty_fixed_input(self):
+        owner = mock.Mock()
+        owner.admit.return_value = {"execution_id": "e" * 64, "state": "queued"}
+        owner.runtime = None
+        with mock.patch("vaws_coordinator.service.ensure_daemon", return_value=owner):
+            result = self.call("vaws_run", command="true")
+        self.assertFalse(result["isError"])
         self.assertEqual(result["structuredContent"]["tool"], "vaws.run")
-        self.assertEqual((result["structuredContent"]["outcome"], result["structuredContent"]["status"]), ("blocked", "unavailable"))
-        self.assertIn("vllm", result["structuredContent"]["summary"])
-        self.assertTrue(any("No remote success is implied" in warning for warning in result["structuredContent"]["warnings"]))
+        self.assertEqual((result["structuredContent"]["outcome"], result["structuredContent"]["status"]), ("success", "queued"))
+        spec = owner.admit.call_args.args[3]
+        self.assertEqual(spec["source_snapshot"]["records"], [])
+        self.assertEqual(spec["resources"], {"npu_count": 0})
+
+    def test_accepted_execution_progress_is_not_an_mcp_error(self):
+        from vaws_coordinator.task_client import TaskClient
+
+        for state, outcome in (("queued", "success"), ("preparing", "success"), ("waiting", "success"),
+                               ("running", "success"), ("cancelled", "cancelled"),
+                               ("uncertain", "blocked"), ("inconclusive", "failed"), ("timeout", "timeout")):
+            with self.subTest(state=state), mock.patch.object(TaskClient, "observe", return_value={"execution_id": "e" * 64, "state": state}):
+                result = self.call("vaws_execution", execution_id="e" * 64)
+                self.assertEqual(result["isError"], outcome not in {"success", "cancelled"})
+                self.assertEqual(result["structuredContent"]["outcome"], outcome)
+                self.assertEqual(result["structuredContent"]["data"]["state"], state)
 
     def test_vaws_execution_rejects_an_id_it_does_not_own_before_any_network(self):
         result = self.call("vaws_execution", execution_id="not-an-id", action="status")

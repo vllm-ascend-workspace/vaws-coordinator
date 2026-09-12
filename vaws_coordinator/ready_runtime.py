@@ -19,8 +19,7 @@ from typing import Any
 
 from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMINAL, ManagedExecution
 from vaws_coordinator.runtime_profile import digest
-from vaws_coordinator.code_identity import identity_workspace, manifest_code
-from vaws_coordinator.run_manifest import new_manifest, utc_now, write_manifest
+from vaws_coordinator.run_manifest import utc_now
 
 TERMINAL = {"released", "cancelled", "expired"}
 
@@ -122,7 +121,7 @@ class RuntimePool(ManagedExecution):
     def session_open(self, owner: str, session_id: str, sources: dict[str, str]):
         safe_id(owner)
         safe_id(session_id)
-        if not sources or any(not isinstance(path, str) or not Path(path).is_absolute() for path in sources.values()):
+        if not isinstance(sources, dict) or any(not isinstance(path, str) or not Path(path).is_absolute() for path in sources.values()):
             raise ValueError("record the actual absolute local business worktree paths")
         key = digest([owner, session_id])
         # A new business worktree reference is an intent to prepare that code.
@@ -154,6 +153,21 @@ class RuntimePool(ManagedExecution):
     def register(self, runtime_id: str, spec: dict[str, Any]):
         """Adopt a prepared work root in the caller's fixed user container."""
         safe_id(runtime_id)
+        reuse_only = spec.get('reuse_only', False)
+        if type(reuse_only) is not bool:
+            raise ValueError('reuse_only must be a boolean')
+        fixed_sources = None
+        if reuse_only:
+            from vaws_coordinator.execution_sources import validate_source_snapshot
+            fixed_sources = validate_source_snapshot(spec.get('source_snapshot'))
+            if not {'vllm', 'vllm-ascend'}.issubset(fixed_sources['sources']) or not fixed_sources['records']:
+                raise ValueError('native artifact donor registration requires complete fixed source inputs')
+            source_records = {row['relpath']: row for row in fixed_sources['records']}
+            for name, source in fixed_sources['sources'].items():
+                record = source_records.get(name)
+                if not record or any(source.get(key) != record.get(key) or not re.fullmatch(r'[0-9a-f]{40,64}', str(record.get(key, '')))
+                                     for key in ('commit', 'tree')):
+                    raise ValueError('native artifact donor registration requires complete matching source records')
         user = safe_id(spec["user"])
         container_name = user_container_name(user)
         if spec.get("container_name") not in {None, "", container_name}:
@@ -164,7 +178,9 @@ class RuntimePool(ManagedExecution):
                 "endpoint": endpoint(spec["endpoint"], container=True),
                 "host_endpoint": endpoint(spec["host_endpoint"]),
                 "container_name": container_name,
-                "service_ports": spec.get("service_ports", [])}
+                "service_ports": spec.get("service_ports", []),
+                'reuse_only': reuse_only,
+                **({'source_snapshot': fixed_sources} if reuse_only else {})}
         ports = spec["service_ports"]
         if not isinstance(ports, list) or any(type(port) is not int or not 0 < port < 65536 for port in ports) or len(set(ports)) != len(ports):
             raise ValueError("service_ports must contain distinct TCP ports")
@@ -177,8 +193,9 @@ class RuntimePool(ManagedExecution):
             # against fresh state before committing. Sibling roots in the same
             # user container are allowed; overlapping mutable roots are not.
             observed = self.backend.inspect(spec, idle=True)
-            self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
-                                      "container_name": container_name, "port": spec["endpoint"]["port"]})
+            if not reuse_only:
+                self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
+                                          "container_name": container_name, "port": spec["endpoint"]["port"]})
             row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed, "draining": False}
             with self.lock, self.transaction() as db:
                 self._check_registration(db, runtime_id, spec, container_id=observed.get("container_id"))
@@ -229,6 +246,7 @@ class RuntimePool(ManagedExecution):
                             raise ValueError("this checkout request id belongs to a returned binding; use a new request id")
                         return binding
                 candidates = [row["id"] for row in self.rows(db, "runtime") if row["state"] == "ready"
+                              and not row.get('reuse_only')
                               and row.get("user") == owner
                               and row["attestation"]["profile_key"] == profile_key
                               and (not runtime_id or row["id"] == runtime_id)]
@@ -264,6 +282,7 @@ class RuntimePool(ManagedExecution):
                            "environment": {"VAWS_ENVIRONMENT_FINGERPRINT": profile_key},
                            "build_env": observed["profile"].get("build_env", {}),
                            "launch_env": observed["profile"]["launch_env"],
+                           "source_names": sorted(self.owned_source_names(owner, session)),
                            "launch_preamble": observed.get("launch_preamble", "")}
                     with self.lock, self.transaction() as db:
                         # Re-validate after the lock-free probe: a concurrent
@@ -340,16 +359,18 @@ class RuntimePool(ManagedExecution):
             safe_id(request_id)
         except ValueError as exc:
             raise ExecutionRequestError(str(exc)) from exc
-        if bool(devices) == bool(npu_count) or any(type(d) is not int or d < 0 for d in devices) or len(set(devices)) != len(devices) or npu_count < 0:
-            raise ExecutionRequestError("supply distinct physical devices OR a positive npu_count")
+        if (not isinstance(devices, list) or type(npu_count) is not int or npu_count < 0
+                or (devices and npu_count) or any(type(d) is not int or d < 0 for d in devices)
+                or len(set(devices)) != len(devices)):
+            raise ExecutionRequestError("supply distinct physical devices or a nonnegative npu_count")
         if not 1 <= queue_seconds <= 86400:
             raise ExecutionRequestError("queue_seconds must be between 1 and 86400")
         if service_port is not None and (type(service_port) is not int or service_port < 0):
             raise ExecutionRequestError("service_port must be 0 or a positive declared runtime service port")
-        if not {"vllm", "vllm-ascend"}.issubset(snapshots) or any(not re.fullmatch(r"[0-9a-f]{40,64}", commit) for commit in snapshots.values()):
-            raise ExecutionRequestError("pin the complete parity snapshot map before requesting cards")
+        if not isinstance(snapshots, dict) or any(not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit) for commit in snapshots.values()):
+            raise ExecutionRequestError("snapshots must map source paths to fixed Git commits")
         for name in snapshots:
-            if name != "." and (PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts):
+            if not isinstance(name, str) or not name or "\\" in name or (name != "." and (PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts)):
                 raise ExecutionRequestError("unsafe snapshot path")
         key = digest([owner, binding_id, request_id])
         intent = {"snapshots": snapshots, "build_key": expected_build_key, "devices": devices,
@@ -384,46 +405,47 @@ class RuntimePool(ManagedExecution):
                     raise ExecutionRequestError("binding already has an unresolved execution")
                 self.put(db, "run", run)  # durable intent BEFORE the first host request
                 self.event(db, owner, "run-queued", run=key)
-            self.export_manifest(run, binding)
+            self.export_execution_record(run, binding)
             return self.control(owner, key, "poll")
 
-    def export_manifest(self, run, binding, job=None):
-        session_key = (binding.get("intent") or {}).get("session")
-        if not session_key:
-            raise ValueError("binding has no session; cannot resolve code identity")
+    def owned_source_names(self, owner, session):
         with self.transaction() as db:
-            session = self.get(db, "session", session_key)
+            return tuple(self.owned(db, "session", session, owner)["sources"])
+
+    def export_execution_record(self, run, binding, job=None):
+        """Persist observed execution facts without reading mutable local worktrees.
+
+        Business Run Manifests remain an explicit report format. A CPU command
+        has no fabricated Git identity and a shell exit is not model validation.
+        """
+        with self.transaction() as db:
             if job is None:
                 job = next((row for row in self.rows(db, "job") if row["id"] == run["id"]), None)
-        # Session sources are the business trees (vllm, vllm-ascend); their
-        # commits already live on workspace_snapshot. code is the containing
-        # workspace — see identity_workspace.
-        code = manifest_code(identity_workspace(session["sources"]))
-        manifest = new_manifest(run_type="debug", run_id="pool-" + run["id"], created_at=run["created_at"],
-                                code=code,
-                                workspace_snapshot=run["intent"]["snapshots"],
-                                environment={"profile_key": binding["profile_key"], "build_key": binding["build_key"],
-                                             "endpoint": binding["endpoint"]},
-                                topology={"physical_devices": run.get("task", {}).get("granted_devices", [])})
-        # A released allocation says nothing about model correctness/readiness.
-        manifest["status"] = ("inconclusive" if run["state"] in TERMINAL and run.get("task", {}).get("started_at")
-                              else "cancelled" if run["state"] in TERMINAL else "running" if run.get("task", {}).get("started_at") else "planned")
-        manifest["updated_at"] = utc_now()
-        manifest["environment"]["coordination"] = {"state": run["state"], "task_id": run["task_id"], "epoch": run["epoch"]}
+        record = {
+            "schema_version": "vaws.managed-run.v2",
+            "run_id": run["id"],
+            "created_at": run["created_at"],
+            "updated_at": utc_now(),
+            "snapshots": dict(run["intent"]["snapshots"]),
+            "environment": {"profile_key": binding["profile_key"], "build_key": binding["build_key"],
+                            "endpoint": binding["endpoint"]},
+            "resources": {"state": run["state"], "task_id": run["task_id"], "epoch": run["epoch"],
+                          "released": run["state"] in TERMINAL,
+                          "devices": run.get("task", {}).get("granted_devices", []),
+                          "service_port": run.get("service_port")},
+            "process": None,
+        }
         if job:
-            manifest["environment"]["managed_execution"] = {
-                "job_id": job["job_id"], "state": job["state"], "runtime_id": binding["runtime_id"],
-                "remote_dir": job.get("remote", {}).get("remote_dir"),
-                "result": job.get("remote", {}).get("result"),
-            }
-            # Shell exit 0 alone does not establish a model-level pass.
-            if job["state"] in {"failed", "timeout"}:
-                manifest["status"] = "failed"
-            elif job["state"] == "cancelled":
-                manifest["status"] = "cancelled"
-            elif job["state"] in {"succeeded", "inconclusive"}:
-                manifest["status"] = "inconclusive"
-        write_manifest(self.state_dir / "runs" / (run["id"] + ".json"), manifest)
+            record["process"] = {"job_id": job["job_id"], "state": job["state"],
+                                 "runtime_id": binding["runtime_id"],
+                                 "command": (job.get("spec") or {}).get("command"),
+                                 "remote_dir": job.get("remote", {}).get("remote_dir"),
+                                 "result": job.get("remote", {}).get("result")}
+        path = self.state_dir / "runs" / (run["id"] + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix("." + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
 
     def control(self, owner: str, run_id: str, action: str, pid: int = 0, *, _managed=False,
                 process_guard=None, completion_confirmed=False):
@@ -535,7 +557,7 @@ class RuntimePool(ManagedExecution):
                 self.put(db, "run", run)
                 if (previous["state"], previous.get("error")) != (run["state"], run.get("error")):
                     self.event(db, owner, "run-state", run=run_id, state=run["state"], error=run.get("error"))
-            self.export_manifest(run, binding)
+            self.export_execution_record(run, binding)
             return run
 
     def reconcile(self, owner: str, run_id: str, reason: str, *, evidence: str = "", force_release: bool = False):
@@ -595,7 +617,7 @@ class RuntimePool(ManagedExecution):
                 event = self.event(db, owner, "run-reconciled", run=run_id,
                                    reason=reason.strip()[:500], previous=previous,
                                    evidence=evidence[:500], force_release=force_release)
-        self.export_manifest(run, binding, job=jobs[0] if jobs else None)
+        self.export_execution_record(run, binding, job=jobs[0] if jobs else None)
         return {"run": run, "jobs": jobs, "event": event,
                 "next": "return the runtime for quarantine and re-verification before any reuse"}
 
@@ -633,6 +655,7 @@ class RuntimePool(ManagedExecution):
                 rows.append({
                     "runtime_id": row["id"], "state": row["state"],
                     "draining": row.get("draining", False),
+                    'reuse_only': row.get('reuse_only', False),
                     "user": row.get("user"), "python": row.get("python"),
                     "recipe": row.get("recipe") or profile.get("recipe"),
                     "python_abi": profile.get("python_abi"),

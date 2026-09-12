@@ -1,0 +1,191 @@
+"""Long preparation owns a durable process, including stop after daemon loss."""
+import copy
+import json
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, Mock
+
+import pytest
+
+from vaws_coordinator.agent_session import AgentSessions
+from vaws_coordinator.parity_support import PROGRESS_SENTINEL, RemoteCommandError, SshEndpoint, ssh_exec_stream
+from vaws_coordinator.preparation_process import (
+    PreparationCancelled, PreparationProcess, PreparationUncertain, stop_preparation_process,
+)
+from vaws_coordinator.service import CoordinatorService
+
+
+ENDPOINT = {"host": "example.invalid", "port": 22, "user": "user", "root": "/tmp/task", "cwd": "/tmp/task"}
+
+
+def test_receipt_saved_before_go_and_progress_survives_split_chunks(monkeypatch, tmp_path):
+    saved, actions = [], []
+    chunks = iter([
+        {"state": "running", "quiet": False, "stdout": "out\n", "stderr": PROGRESS_SENTINEL + '{"step": "bui',
+         "stdout_offset": 4, "stderr_offset": 30},
+        {"state": "succeeded", "quiet": True, "stderr": 'ld"}\nwarn', "stderr_offset": 40,
+         "result": {"exit_code": 0}},
+    ])
+    def control(endpoint, job_id, action, **kwargs):
+        assert saved[0]["job_id"] == job_id
+        actions.append(action)
+        if action == "prepare":
+            assert saved[-1]["state"] == "pending"
+            return {"state": "prepared", "quiet": False, "receipt": {"pid": 123, "boot_id": "test"}}
+        if action == "go":
+            assert saved[-1]["receipt"]["pid"] == 123
+            return {"state": "running", "quiet": False}
+        return next(chunks)
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    process = PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False)
+    events = []
+    result = ssh_exec_stream(SshEndpoint("example.invalid", 22, "user"), "build", stream_progress=False,
+                             on_progress=events.append, log_path=tmp_path / "build.log", process=process)
+    assert result.stdout == "out\n" and result.stderr == "warn"
+    assert events == [{"step": "build"}]
+    assert saved[-1]["quiet"] is True and "stdout" not in saved[-1]
+    assert actions == ["prepare", "go", "exchange", "exchange"]
+
+
+def test_lost_go_reply_retains_job_and_never_replays_launch(monkeypatch):
+    saved, actions = [], []
+    def control(endpoint, job_id, action, **kwargs):
+        actions.append(action)
+        if action == "prepare":
+            return {"state": "prepared", "quiet": False, "receipt": {"pid": 456}}
+        raise OSError("lost go reply")
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    with pytest.raises(PreparationUncertain, match="was not replayed"):
+        PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False).run("build", on_output=lambda *a: None)
+    assert actions == ["prepare", "go"]
+    assert saved[-1]["job_id"] == saved[0]["job_id"]
+    assert saved[-1]["receipt"]["pid"] == 456 and saved[-1]["quiet"] is False
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_cancel_stops_owned_job_and_requires_quiet(monkeypatch, unknown):
+    saved, actions, cancelled = [], [], [False]
+    def control(endpoint, job_id, action, **kwargs):
+        actions.append(action)
+        if action == "prepare":
+            return {"state": "prepared", "quiet": False, "receipt": {"pid": 1}}
+        if action == "go":
+            cancelled[0] = True
+            return {"state": "running", "quiet": False}
+        if action == "stop":
+            return {"state": "uncertain" if unknown else "cancelled", "quiet": not unknown,
+                    "unknown": ["lost supervisor"] if unknown else []}
+        return {"state": "cancelled", "quiet": True, "stdout": "last output\n", "stdout_offset": 12}
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    output = []
+    with pytest.raises(PreparationUncertain if unknown else PreparationCancelled):
+        PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: cancelled[0]).run("build", on_output=lambda *a: output.append(a))
+    assert actions.count("stop") == 1
+    assert saved[-1]["quiet"] is not unknown
+    assert output == ([] if unknown else [("stdout", "last output\n")])
+
+
+def test_stop_transport_failure_is_unknown(monkeypatch):
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", Mock(side_effect=OSError("offline")))
+    record = {"endpoint": ENDPOINT, "job_id": "prepare-retained", "quiet": False}
+    assert stop_preparation_process(record, lambda _: None) is False
+    assert record["state"] == "uncertain" and record["quiet"] is False
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+def test_restarted_service_stops_persisted_preparation_before_marking_cancelled(tmp_path, monkeypatch, quiet):
+    store = AgentSessions(tmp_path / "sessions")
+    context = store.attach("codex", "task", str(tmp_path))
+    row = store.execution(context, "build", {"command": "build"})
+    row.update(user="user", phase="preparing", preparation_jobs={"worker": {"prepare-retained": {
+        "endpoint": ENDPOINT, "job_id": "prepare-retained", "step": "install", "quiet": False,
+        "receipt": {"pid": 123, "boot_id": "verified"}}}})
+    store.save_execution(row)
+    # No original thread, local process handle or runtime binding remains.
+    service = CoordinatorService(tmp_path / "coordinator", pool=MagicMock())
+    observed = {"state": "cancelled" if quiet else "uncertain", "quiet": quiet,
+                "unknown": [] if quiet else ["ownership uncertain"]}
+    control = Mock(return_value=observed)
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    reply = service.advance(str(tmp_path / "sessions"), "user", row["id"], action="stop")
+    assert reply["state"] == ("cancelled" if quiet else "uncertain")
+    assert reply["resources_released"] is quiet
+    control.assert_called_once_with(ENDPOINT, "prepare-retained", "stop", force=False)
+    with store.transaction() as db:
+        latest = store.get(db, "execution", row["id"])
+    assert latest["preparation_jobs"]["worker"]["prepare-retained"]["quiet"] is quiet
+
+
+def test_retained_preparation_never_replaces_sources(tmp_path):
+    service = CoordinatorService(tmp_path / "coordinator", pool=MagicMock())
+    with pytest.raises(PreparationUncertain, match="retained preparation"):
+        service._place_or_prepare(Mock(), "user", {"preparation_jobs": {"worker": {}}}, [], {})
+    service.pool.catalog.assert_not_called()
+
+
+def test_one_failed_build_cannot_make_other_unquiet_preparation_terminal(tmp_path):
+    service = CoordinatorService(tmp_path / "coordinator", pool=MagicMock())
+    row = {"id": "execution", "phase": "preparing", "preparation_jobs": {
+        "rank0": {"one": {"quiet": True}}, "rank1": {"two": {"quiet": False}},
+    }}
+    reply = service._record_execution_error(Mock(), row, RemoteCommandError(1, "compiler failed"))
+    assert reply["state"] == "uncertain" and reply["resources_released"] is False
+
+
+def test_cancel_while_waiting_for_other_executions_host_lock(tmp_path, monkeypatch):
+    store = AgentSessions(tmp_path / "sessions")
+    context = store.attach("codex", "waiting-task", str(tmp_path))
+    row = store.execution(context, "queued-build", {"command": "build"})
+    row.update(user="user", phase="preparing")
+    store.save_execution(row)
+    service = CoordinatorService(tmp_path / "coordinator", pool=MagicMock())
+    monkeypatch.setattr(service, "_donor_for_role", lambda *a: {"host": "host-a"})
+    prepared = Mock()
+    monkeypatch.setattr(service, "_prepare_role", prepared)
+    host_lock = service._lock_for("prepare-host", "host-a")
+    host_lock.acquire()
+    result = []
+    waiter = threading.Thread(target=lambda: result.append(service._place_or_prepare(
+        store, "user", row, [{"name": "worker"}], {})))
+    try:
+        waiter.start()
+        time.sleep(0.05)
+        with store.transaction() as db:
+            cancelled = store.get(db, "execution", row["id"])
+        cancelled["cancel_requested"] = True
+        store.save_execution(cancelled)
+        waiter.join(2)
+        assert not waiter.is_alive(), "queued cancellation must not wait for the other compilation"
+        assert host_lock.locked(), "the other execution must retain its preparation lock"
+        prepared.assert_not_called()
+        assert result[0]["status"] == "waiting" and row["cancel_requested"] is True
+    finally:
+        host_lock.release()
+        waiter.join(2)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="remote-dev supervisor requires Linux /proc")
+def test_actual_supervisor_stop_drains_child_and_preserves_output(tmp_path, monkeypatch):
+    from remote_dev.processes.client import worker_source
+    from remote_dev.processes.worker import control_job
+    endpoint = {**ENDPOINT, "root": str(tmp_path), "cwd": str(tmp_path)}
+    saved, output = [], []
+    def control(endpoint, job_id, action, **kwargs):
+        return control_job({"root": endpoint["root"], "job_id": job_id, "action": action, **kwargs}, worker_source())
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    def cancelled():
+        return (tmp_path / "ready").exists()
+    process = PreparationProcess(endpoint, "compiler", lambda row: saved.append(copy.deepcopy(row)), cancelled)
+    try:
+        with pytest.raises(PreparationCancelled):
+            process.run("sleep 300 &\nprintf 'compiler output\\n'; touch ready; wait", on_output=lambda *a: output.append(a))
+        assert ("stdout", "compiler output\n") in output
+        # Deserialize the package's facts as a restarted daemon would do.
+        retained = json.loads(json.dumps(saved[-1]))
+        final = control(endpoint, retained["job_id"], "status")
+        assert final["quiet"] is True and final["processes"] == []
+        assert final["result"]["descendants_drained"] is True
+    finally:
+        if saved:
+            stop_preparation_process(saved[-1], lambda _: None, force=True)

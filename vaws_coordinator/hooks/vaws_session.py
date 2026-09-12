@@ -11,7 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from vaws_coordinator.agent_session import CLIENTS, AgentSessions, load_context
+from vaws_coordinator.agent_session import CLIENTS, AgentSessions, git_common_directory, load_context
+from vaws_coordinator.client_paths import client_path
 
 
 # Cross-client payload discriminators, pinned by each client's documented hook
@@ -28,6 +29,49 @@ GROK_EVENT_FIELD = "hookEventName"
 CURSOR_VERSION_FIELD = "cursor_version"
 
 
+def in_project_scope(cwd: Path, project: Path) -> bool:
+    """Include actual worktrees of this repository, never a similarly named clone."""
+    cwd, project = cwd.resolve(), project.resolve()
+    if cwd == project:
+        return True
+    inside = project in cwd.parents
+    try:
+        common = git_common_directory(project)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # Keep local/non-Git project initialization usable in its own scope.
+        return inside
+    try:
+        current = cwd
+        for _ in range(8):
+            if git_common_directory(current).samefile(common):
+                return True
+            # Registered submodules belong to the workspace too. An unrelated
+            # nested clone has no superproject and must not inherit its hooks.
+            parent = subprocess.run(
+                ["git", "-C", str(current), "rev-parse", "--show-superproject-working-tree"],
+                capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+            ).stdout.strip()
+            if not parent:
+                return False
+            parent = Path(client_path(parent)).resolve()
+            if parent == current:
+                return False
+            current = parent
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return False
+
+
+def bind_native_defaults(store: AgentSessions, context: dict) -> dict:
+    try:
+        return store.bind_native_sources(context)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # An unborn/non-Git or inaccessible directory still has a local task.
+        # attach() clears old automatic sources when the native cwd changes.
+        print(f"VAWS: source reference not yet bound: {type(exc).__name__}", file=sys.stderr)
+        return context
+
+
 def handle(client: str, payload: dict, store: AgentSessions | None = None) -> dict:
     if client == "claude" and (GROK_EVENT_FIELD in payload or CURSOR_VERSION_FIELD in payload):
         return {}
@@ -38,13 +82,15 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     event = str(payload.get("hook_event_name") or payload.get("hookEventName") or "")
     normalized = re.sub(r"[^a-z]", "", event.lower())
     native = str(payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "")
-    cwd = payload.get("cwd") or payload.get("workspaceRoot") or (payload.get("workspace_roots") or [str(Path.cwd())])[0]
+    cwd = client_path(payload.get("cwd") or payload.get("workspaceRoot") or (payload.get("workspace_roots") or [str(Path.cwd())])[0])
     if not native:
         raise ValueError("hook has no native session identity; no task association was guessed")
 
     if normalized == "sessionstart":
         if payload.get("source") == "compact":
             context = store.native_context(client, native)
+            if context["attachment"]["cwd"] != str(Path(cwd).resolve()):
+                context = store.attach(client, native, str(cwd))
         else:
             parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
             association = os.environ.get("VAWS_ATTACH_CONTEXT", "")
@@ -52,11 +98,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
                 inherited = load_context(parent or association)
                 store = AgentSessions(Path(inherited["state_dir"]))
             context = store.attach(client, native, str(cwd), parent_context=parent, association=association)
-            try:
-                context = store.bind_sources(context, {Path(cwd).name: str(cwd)})
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                # A new, non-Git or unborn project still has a usable local task.
-                print(f"VAWS: source reference not yet bound: {type(exc).__name__}", file=sys.stderr)
+        context = bind_native_defaults(store, context)
     elif normalized in {"subagentstart", "subagentstop"}:
         parent_native = str(payload.get("parent_conversation_id") or payload.get("parentSessionId") or native)
         parent = store.native_context(client, parent_native)
@@ -67,11 +109,15 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         if normalized == "subagentstop":
             store.detach(context)
             return {}
+        context = bind_native_defaults(store, context)
     else:
         context = store.native_context(client, native, str(payload.get("agent_id") or ""))
         if normalized == "sessionend":
             store.detach(context)
             return {}
+        if normalized in {"userpromptsubmit", "beforesubmitprompt"} and context["attachment"]["cwd"] != str(Path(cwd).resolve()):
+            context = store.attach(client, native, str(cwd), agent_id=context["attachment"].get("agent_id") or "")
+            context = bind_native_defaults(store, context)
 
     hint = ("VAWS task context:\n" + context["context_file"] + "\n"
             "Pass this as context_file to vaws_session/vaws_run/vaws_execution/vaws_finish. "
@@ -104,7 +150,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     if client == "cursor" and normalized == "sessionstart":
         return {"env": {"VAWS_CONTEXT_FILE": context["context_file"]}, "additional_context": hint}
     if client == "claude" and normalized == "sessionstart" and os.environ.get("CLAUDE_ENV_FILE"):
-        with Path(os.environ["CLAUDE_ENV_FILE"]).open("a") as stream:
+        with Path(client_path(os.environ["CLAUDE_ENV_FILE"])).open("a") as stream:
             stream.write("\nexport VAWS_CONTEXT_FILE=" + shlex.quote(context["context_file"]) + "\n")
     if normalized in {"sessionstart", "subagentstart", "userpromptsubmit"}:
         canonical = {"sessionstart": "SessionStart", "subagentstart": "SubagentStart", "userpromptsubmit": "UserPromptSubmit"}[normalized]
@@ -115,15 +161,15 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", choices=sorted(CLIENTS), required=True)
-    parser.add_argument("--project", type=Path, help="Scope a global hook (notably Kimi) to this project")
+    parser.add_argument("--project", help="Scope a global hook (notably Kimi) to this project")
     args = parser.parse_args()
     try:
         payload = json.load(sys.stdin)
         if args.project:
-            cwd = Path(payload.get("cwd") or payload.get("workspaceRoot") or
-                       (payload.get("workspace_roots") or [str(Path.cwd())])[0]).resolve()
-            project = args.project.expanduser().resolve()
-            if cwd != project and project not in cwd.parents:
+            cwd = Path(client_path(payload.get("cwd") or payload.get("workspaceRoot") or
+                       (payload.get("workspace_roots") or [str(Path.cwd())])[0])).resolve()
+            project = Path(client_path(args.project)).expanduser().resolve()
+            if not in_project_scope(cwd, project):
                 # Kimi appends stdout to the user prompt; a literal {} would
                 # pollute every prompt outside this project. Stay silent.
                 print("")

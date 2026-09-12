@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 EXECUTION_KEYS = ("execution_id", "state", "service", "error", "error_ref", "reason", "progress",
+                  "source_snapshot_id", "sources", "role_progress",
                   "observed_at", "cancel_requested", "service_port", "provisioning_started",
                   "worktrees_preserved", "resources_released", "stdout", "stderr", "observation_freshness")
 ROLE_KEYS = ("name", "state", "runtime_id", "host", "root", "service_port", "error", "lease_state",
@@ -33,6 +34,8 @@ def compact_data(value: dict, *, target=False) -> dict:
         result = {"session": {key: session[key] for key in ("id", "state", "sources") if key in session},
                   "context_file": value.get("context_file"),
                   "attachments_count": len(value.get("attachments") or [])}
+        if "source_defaults" in value:
+            result["source_defaults"] = value["source_defaults"]
     else:
         result = execution_summary(value, target=target)
     if "executions" in value:
@@ -40,6 +43,29 @@ def compact_data(value: dict, *, target=False) -> dict:
         result["executions"] = [execution_summary(row) for row in rows[-5:]]
         result["executions_total"] = len(rows)
     return result
+
+
+def compact_runtime(runtime):
+    """Collapse repeated healthy package identities, retaining diagnostic facts."""
+    if not isinstance(runtime, dict) or not runtime or set(runtime) - {"client", "daemon"}:
+        return runtime
+    packages = {}
+    for records in runtime.values():
+        if not isinstance(records, list) or not records:
+            return runtime
+        for record in records:
+            if not isinstance(record, dict):
+                return runtime
+            loaded = record.get("loaded") or {}
+            if not isinstance(loaded, dict):
+                return runtime
+            package, version = loaded.get("package"), loaded.get("version")
+            if record.get("status") != "current" or not package or not version:
+                return runtime
+            if package in packages and packages[package] != version:
+                return runtime
+            packages[package] = version
+    return {"status": "current", "packages": packages}
 
 
 def present(result: dict, directory: Path, *, full=False, target=False) -> dict:
@@ -66,6 +92,8 @@ def present(result: dict, directory: Path, *, full=False, target=False) -> dict:
         return value
     compact = {**result, "data": {**bound({k: v for k, v in data.items() if k != "target"}),
                                   **({"target": data["target"]} if "target" in data else {})}}
+    if not target and "runtime" in compact:
+        compact["runtime"] = compact_runtime(compact["runtime"])
     if len(json.dumps(compact, ensure_ascii=False).encode()) > 16000:
         compact["data"] = {key: data[key] for key in ("execution_id", "state", "service", "error_ref") if key in data}
         compact["summary"] = str(result["summary"])[:1000]
