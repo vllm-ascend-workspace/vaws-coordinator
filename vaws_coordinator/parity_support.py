@@ -491,14 +491,15 @@ def _materialize_fixed(request):
                 print(f'shared source candidate unavailable: {exc}', file=sys.stderr, flush=True)
         if tree.returncode:
             carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
-            if carrier.returncode and shared and Path(shared).is_dir():
+            if carrier.returncode and shared:
                 try:
                     # A new owner can negotiate a small edit against one
                     # immutable shared snapshot. This never selects its input:
                     # the requested commit is still missing and must arrive.
-                    hint = git(shared, 'for-each-ref', '--count=1', '--sort=-creatordate',
-                               '--format=%(objectname) %(refname)', 'refs/vaws/snapshots/')
-                    parts = hint.stdout.strip().split()
+                    hint = (git(shared, 'for-each-ref', '--count=1', '--sort=-creatordate',
+                                '--format=%(objectname) %(refname)', 'refs/vaws/snapshots/')
+                            if Path(shared).is_dir() else None)
+                    parts = hint.stdout.strip().split() if hint else []
                     if len(parts) == 2 and parts[1] == 'refs/vaws/snapshots/' + parts[0]:
                         base = {'commit': parts[0], 'tree': git(shared, 'rev-parse', parts[0] + '^{tree}').stdout.strip()}
                         if copy_fixed_objects(shared, mirror, base):
