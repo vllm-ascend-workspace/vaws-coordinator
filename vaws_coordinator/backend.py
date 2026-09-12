@@ -366,7 +366,9 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         log = progress("verify-profile")
         self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
                                   process=owned_process("verify-profile"), log_path=log)
-        return self.inspect(spec)
+        # The caller immediately registers this root, which performs the full
+        # container/profile/source attestation. No caller consumes a second
+        # copy of that probe here.
 
     def _write_ready_profile(self, spec, environment, *, native_recipe=True, source_versions=None,
                              process=None, log_path=None):

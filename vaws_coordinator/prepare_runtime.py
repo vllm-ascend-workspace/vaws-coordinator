@@ -151,7 +151,8 @@ marker = root / ".vaws-runtime/ready-profile.json"
 temp = marker.with_suffix(".tmp")
 temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 os.replace(temp, marker)
-print(json.dumps(manifest))
+print(json.dumps({'manifest': str(marker), 'profile_key': manifest['profile_key'],
+                  'build_key': manifest['build_key']}))
 '''
 
 

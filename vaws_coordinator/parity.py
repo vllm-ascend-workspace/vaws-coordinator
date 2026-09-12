@@ -809,11 +809,23 @@ def marker_path_for(runtime_root: str, marker_dirname: str) -> str:
     return str(PurePosixPath(runtime_root) / marker_dirname / 'runtime-install.json')
 
 
-def ensure_remote_bare_repos(container: SshEndpoint, mirror_paths: list[str], dry_run: bool) -> None:
+def snapshot_mirror_refs(workspace_id: str) -> tuple[str, str, str]:
+    return (f'refs/heads/{PARITY_BRANCH_NAME}', f'refs/parity/{workspace_id}/current',
+            f'refs/parity/{workspace_id}/transport-carrier')
+
+
+def ensure_remote_bare_repos(
+    container: SshEndpoint, mirror_paths: list[str], dry_run: bool, *, refs: tuple[str, ...] = (),
+) -> dict[str, dict[str, str]]:
+    """Prepare mirrors and observe their live refs in the same remote request.
+
+    Callers hold the parity lock through the subsequent transfer/materialize.
+    Missing refs or objects remain misses; no local receipt predicts success.
+    """
     if dry_run or not mirror_paths:
-        return
+        return {}
     lines = ['set -eo pipefail']
-    for mirror_path in mirror_paths:
+    for index, mirror_path in enumerate(mirror_paths):
         lines.extend(
             [
                 f'mkdir -p {quoted(str(PurePosixPath(mirror_path).parent))}',
@@ -821,7 +833,20 @@ def ensure_remote_bare_repos(container: SshEndpoint, mirror_paths: list[str], dr
                 f'if [ ! -d {quoted(mirror_path)} ]; then git init --bare {quoted(mirror_path)} >/dev/null; fi',
             ]
         )
-    ssh_exec(container, '\n'.join(lines))
+        for ref in refs:
+            lines.append(
+                f'if oid=$(git --git-dir={quoted(mirror_path)} rev-parse --verify --quiet {quoted(ref + "^{commit}")}) '
+                f'&& git --git-dir={quoted(mirror_path)} cat-file -e "$oid^{{tree}}" 2>/dev/null; then '
+                f'printf "%s\\t%s\\t%s\\n" {index} {quoted(ref)} "$oid"; fi'
+            )
+    result = ssh_exec(container, '\n'.join(lines))
+    observed = {path: {} for path in mirror_paths}
+    for line in result.stdout.splitlines():
+        fields = line.split('\t')
+        if (len(fields) == 3 and fields[0].isdigit() and int(fields[0]) < len(mirror_paths)
+                and fields[1] in refs and re.fullmatch(r'[0-9a-f]{40,64}', fields[2])):
+            observed[mirror_paths[int(fields[0])]][fields[1]] = fields[2]
+    return observed
 
 
 def cleanup_failed_mirror_hydration(container: SshEndpoint, mirror_path: str) -> None:
@@ -864,13 +889,14 @@ def push_snapshot_via_git(
     mirror_path: str,
     record: SnapshotRecord,
     workspace_id: str,
+    remote_refs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     target_ref = f'refs/parity/{workspace_id}/current'
     remote_carrier_ref = f'refs/parity/{workspace_id}/transport-carrier'
     remote_url = git_remote_url(container, mirror_path)
     git_env = git_ssh_environment(container)
-    remote_carrier_commit = remote_ref_commit(
+    remote_carrier_commit = remote_refs.get(remote_carrier_ref) if remote_refs is not None else remote_ref_commit(
         repo,
         remote_url=remote_url,
         remote_ref=remote_carrier_ref,
@@ -884,6 +910,13 @@ def push_snapshot_via_git(
         record=record,
         remote_carrier_commit=remote_carrier_commit,
     )
+    expected_refs = {target_ref: record.commit, f'refs/heads/{PARITY_BRANCH_NAME}': record.commit,
+                     remote_carrier_ref: carrier_commit}
+    if remote_refs is not None and all(remote_refs.get(ref) == commit for ref, commit in expected_refs.items()):
+        return {'repo': record.relpath, 'transport': 'git',
+                'elapsed_seconds': round(time.monotonic() - started, 6),
+                'carrier_commit': carrier_commit, 'skipped': True,
+                'detail': 'live remote refs and commit objects already match the fixed snapshot'}
     result = git(
         repo,
         [
@@ -964,6 +997,7 @@ def push_snapshot_to_mirror(
     workspace_id: str,
     dry_run: bool,
     transport: str = 'auto',
+    remote_refs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if transport not in TRANSFER_MODES:
         raise ValueError(f'unsupported parity transport: {transport}')
@@ -979,6 +1013,7 @@ def push_snapshot_to_mirror(
                 mirror_path=mirror_path,
                 record=record,
                 workspace_id=workspace_id,
+                remote_refs=remote_refs,
             )
         except Exception as exc:
             if transport == 'git':
@@ -2120,7 +2155,10 @@ def run_sync(args: argparse.Namespace) -> int:
                     current_phase = 'push-mirrors'
                     emit_progress(current_phase, repo_count=len(records), apply_mode=args.apply_mode)
                     all_mirror_paths = [mirror_path_for(container_cache_root, workspace_id, r) for r in records]
-                    ensure_remote_bare_repos(container, all_mirror_paths, args.dry_run)
+                    mirror_refs = ensure_remote_bare_repos(
+                        container, all_mirror_paths, args.dry_run,
+                        refs=snapshot_mirror_refs(workspace_id) if args.transport in {'auto', 'git'} else (),
+                    )
                     transfer_reports: list[dict[str, Any]] = []
                     for record in records:
                         emit_progress('push-mirror', relpath=record.relpath, transport=args.transport)
@@ -2133,6 +2171,7 @@ def run_sync(args: argparse.Namespace) -> int:
                             workspace_id=workspace_id,
                             dry_run=args.dry_run,
                             transport=args.transport,
+                            remote_refs=mirror_refs.get(mirror_path_for(container_cache_root, workspace_id, record)),
                         )
                         transfer_reports.append(transfer)
                         emit_progress('push-mirror-complete', **transfer)
@@ -2336,7 +2375,10 @@ def run_sync(args: argparse.Namespace) -> int:
                 current_phase = 'push-mirrors'
                 emit_progress(current_phase, repo_count=len(records))
                 all_mirror_paths = [mirror_path_for(container_cache_root, workspace_id, r) for r in records]
-                ensure_remote_bare_repos(container, all_mirror_paths, args.dry_run)
+                mirror_refs = ensure_remote_bare_repos(
+                    container, all_mirror_paths, args.dry_run,
+                    refs=snapshot_mirror_refs(workspace_id) if args.transport in {'auto', 'git'} else (),
+                )
                 transfer_reports: list[dict[str, Any]] = []
                 for record in records:
                     emit_progress('push-mirror', relpath=record.relpath, transport=args.transport)
@@ -2349,6 +2391,7 @@ def run_sync(args: argparse.Namespace) -> int:
                         workspace_id=workspace_id,
                         dry_run=args.dry_run,
                         transport=args.transport,
+                        remote_refs=mirror_refs.get(mirror_path_for(container_cache_root, workspace_id, record)),
                     )
                     transfer_reports.append(transfer)
                     emit_progress('push-mirror-complete', **transfer)
