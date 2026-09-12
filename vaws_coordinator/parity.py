@@ -207,7 +207,7 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                 # below Linux's per-argument limit; overflow uses Git below.
                 if len(command().encode('utf-8')) <= 96 * 1024:
                     if on_progress:
-                        on_progress({'phase': 'push-mirror-complete', 'relpath': record.relpath,
+                        on_progress({'phase': 'inline-pack-ready', 'relpath': record.relpath,
                                      'transport': 'owned-rpc-pack', 'bytes': pack['bytes']})
                     continue
                 del request['inline_packs'][str(row['index'])]
