@@ -55,7 +55,7 @@ def task_runtime_id(session_id: str, host: str, role_name: str) -> str:
 
 def create_venv_script(root: str, python: str, donor_python: str | None = None) -> str:
     """Create a task-owned venv. Image packages may be reused; donor venv is not."""
-    from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE
+    from vaws_coordinator.parity import PYTHON_METADATA_PREAMBLE
     from vaws_coordinator.parity_support import quoted
 
     donor = quoted(donor_python or "")
@@ -63,7 +63,7 @@ def create_venv_script(root: str, python: str, donor_python: str | None = None) 
         [
             "set -euo pipefail",
             f"mkdir -p {quoted(root)}",
-            *DEFAULT_ENV_PREAMBLE,
+            *PYTHON_METADATA_PREAMBLE,
             'IMAGE_PYTHON="$PYTHON"',
             'if [ -z "$IMAGE_PYTHON" ]; then echo "image python3 not found" >&2; exit 1; fi',
             f"DONOR={donor}",
@@ -74,9 +74,20 @@ def create_venv_script(root: str, python: str, donor_python: str | None = None) 
             '  echo "cannot create a task interpreter from the donor python" >&2',
             "  exit 1",
             "fi",
-            f'"$IMAGE_PYTHON" -m venv --system-site-packages {quoted(str(PurePosixPath(root) / ".venv"))}',
+            f'"$IMAGE_PYTHON" -m venv --without-pip --system-site-packages {quoted(str(PurePosixPath(root) / ".venv"))}',
             f"test -x {quoted(python)}",
             f'test {quoted(python)} != "$DONOR"',
+            # Image pip is importable through system-site-packages; its
+            # installation scheme is still this new venv. Seed only if absent.
+            f'if ! {quoted(python)} -c "import pip" >/dev/null 2>&1; then',
+            f'  "$IMAGE_PYTHON" -m venv --system-site-packages {quoted(str(PurePosixPath(root) / ".venv"))}',
+            'fi',
+            f'{quoted(python)} - {quoted(str(PurePosixPath(root) / ".venv"))} <<\'VAWS_VENV\'',
+            'import pathlib, sys, sysconfig',
+            'expected = pathlib.Path(sys.argv[1]).resolve()',
+            'if pathlib.Path(sys.prefix).resolve() != expected or not pathlib.Path(sysconfig.get_paths()["purelib"]).resolve().is_relative_to(expected):',
+            '    raise ValueError("pip installation scheme escaped the owned interpreter")',
+            'VAWS_VENV',
         ]
     )
 

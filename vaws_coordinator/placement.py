@@ -17,6 +17,18 @@ TOPOLOGY_KEYS = {"host", "roles", "distinct_hosts"}
 ROLE_KEYS = {"name", "command", "preflight", "devices", "npu_count", "service_port", "allow_external_busy", "host", "env"}
 
 
+def provisionable_recipe(recipe: str) -> bool:
+    """Use the provision owner's existing fixed-image syntax for new roots too."""
+    if recipe in SUPPORTED_RECIPES:
+        return True
+    from vaws_coordinator.provision.host_ops import MachineManagementError, require_explicit_image_ref
+    try:
+        require_explicit_image_ref(recipe)
+    except MachineManagementError:
+        return False
+    return True
+
+
 def checked_mapping(value, label, supported):
     if value is None:
         return {}
@@ -219,7 +231,7 @@ def select_runtimes(
 def _gap(roles, ready, environment, topology=None) -> str:
     environment = environment or {}
     recipe = environment.get("recipe") or environment.get("image")
-    if recipe and recipe not in SUPPORTED_RECIPES and not any(runtime_matches(row, environment) for row in ready):
+    if recipe and not provisionable_recipe(recipe) and not any(runtime_matches(row, environment) for row in ready):
         return f"unsupported environment recipe {recipe!r}; no matching prepared root"
     if distinct_hosts_required(roles, topology):
         hosts = {host_key(row) for row in ready if runtime_matches(row, environment)}

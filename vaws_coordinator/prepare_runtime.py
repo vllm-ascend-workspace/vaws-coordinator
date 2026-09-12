@@ -16,7 +16,7 @@ from pathlib import Path
 
 from vaws_coordinator.build_inputs import runtime_build_inputs
 from vaws_coordinator.git_sources import discover_repo_tree, iter_postorder
-from vaws_coordinator.runtime_profile import capture, file_digest, profile_key, publish, restore, verify
+from vaws_coordinator.runtime_profile import capture, capture_launch_environment, file_digest, native_vendor_launch_environment, profile_key, publish, restore, verify
 
 
 CANN_VERSION_CANDIDATES = (
@@ -116,33 +116,26 @@ if args.get('source_versions'):
     profile['source_versions'] = args['source_versions']
 
 files = installed_native_files(root)
+previous_launch_env = profile['launch_env']
+profile['launch_env'] = native_vendor_launch_environment(root, files, profile['launch_env'])
+upgraded_loader = profile['launch_env'] != previous_launch_env
 
 evidence_dir = root / ".vaws-runtime/profile-evidence"
 evidence_dir.mkdir(parents=True, exist_ok=True)
 inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))
-if reuse.get('kind') == 'native' and reuse.get('compatibility_evidence'):
+if reuse.get('kind') == 'native' and reuse.get('compatibility_evidence') and not upgraded_loader:
     compatibility = json.loads(checked_file(root, reuse['compatibility_evidence']).read_text())
     smoke = {'kind': 'native-compatibility-reuse', 'python_import_executed': False,
              'profile_key': profile_key(profile), 'build_inputs': inputs,
              'compatibility': compatibility, 'source_mapping': native_source_mapping(root)}
 else:
-    result = subprocess.run(
-    [sys.executable, "-c", """import json, pathlib, sys, importlib.metadata
-import torch_npu, vllm, vllm_ascend, acl
-import vllm_ascend.vllm_ascend_C as extension
-root = pathlib.Path(sys.argv[1]).resolve()
-paths = {'vllm': pathlib.Path(vllm.__file__).resolve(), 'vllm_ascend': pathlib.Path(vllm_ascend.__file__).resolve(), 'extension': pathlib.Path(extension.__file__).resolve()}
-if not all(path.is_relative_to(root) for path in paths.values()):
-    raise ValueError('imports escaped the execution source view: ' + str(paths))
-print(json.dumps({'python': sys.executable, 'imports': {k: str(v) for k,v in paths.items()}, 'vllm': importlib.metadata.version('vllm'), 'vllm_ascend': importlib.metadata.version('vllm-ascend')}))
-""", str(root)],
-    capture_output=True, text=True, encoding="utf-8", timeout=30,
-    )
-    smoke = {"passed": result.returncode == 0, "profile_key": profile_key(profile),
-             "stdout": result.stdout[-4000:], "stderr": result.stderr[-8000:]}
+    smoke = native_import_smoke(root, profile, inputs)
+    if upgraded_loader and reuse.get('compatibility_evidence'):
+        smoke['reason'] = 'native-loader-environment-upgrade'
     if not smoke['passed']:
         (evidence_dir / 'smoke.json').write_text(json.dumps(smoke, indent=2) + '\n')
         raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
+smoke['source_mapping'] = native_source_mapping(root)
 (evidence_dir / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
 (evidence_dir / "cann.json").write_text(json.dumps(profile["system_files"]["cann"], sort_keys=True) + "\n")
 (evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
@@ -153,13 +146,18 @@ if reuse:
     evidence['reuse'] = '.vaws-runtime/reuse.json'
 manifest = capture(root, profile, inputs, files, evidence)
 manifest['preparation'] = verified_preparation(args.get('preparation', {}), profile)
+manifest['execution_view'] = {'source_id': args.get('source_id'), 'python': sys.executable}
 verify(root, manifest)
 marker = root / ".vaws-runtime/ready-profile.json"
 temp = marker.with_suffix(".tmp")
 temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 os.replace(temp, marker)
-print(json.dumps({'manifest': str(marker), 'profile_key': manifest['profile_key'],
-                  'build_key': manifest['build_key']}))
+# Preserve the complete verified bytes while avoiding repetitive path/JSON
+# overhead in stdout collection. Publication and its proof have one reply.
+import base64, zlib
+encoded_manifest = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
+print(json.dumps({'manifest_zlib_base64': base64.b64encode(zlib.compress(encoded_manifest)).decode('ascii'),
+                  'manifest_bytes': len(encoded_manifest), 'manifest_digest': digest(manifest)}))
 '''
 
 
@@ -203,18 +201,20 @@ def require_clean_sources(root: Path):
 
 
 def attest(root: Path, spec: dict):
-    profile = spec["profile"]
-    key = profile_key(profile)
+    profile = dict(spec["profile"])
     require_clean_sources(root)
-    inputs = runtime_build_inputs(root, profile, key)
     evidence_dir = root / ".vaws-runtime/profile-evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     # Preserve the prepared image environment when overlaying launch settings.
     environment = os.environ.copy()
     for name, value in profile["launch_env"].items():
-        if name in {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH"} and not value:
+        if name in {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_CUSTOM_OPP_PATH"} and not value:
             continue
-        environment[name] = value + (":" + environment[name] if name in {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH"} and environment.get(name) else "")
+        environment[name] = value + (":" + environment[name] if name in {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_CUSTOM_OPP_PATH"} and environment.get(name) else "")
+    environment = native_vendor_launch_environment(root, spec['files'], environment)
+    profile['launch_env'] = capture_launch_environment(environment)
+    key = profile_key(profile)
+    inputs = runtime_build_inputs(root, profile, key)
     try:
         smoke = subprocess.run([sys.executable, "-c", "import torch_npu, vllm, vllm_ascend, acl; import vllm_ascend.vllm_ascend_C"], env=environment,
                                capture_output=True, text=True, encoding="utf-8", timeout=60)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from remote_dev.result import make_result
 
 from vaws_coordinator.agent_session import CLIENTS, AgentSessions, load_context
 from vaws_coordinator.ops import vaws_call
+from vaws_coordinator.task_client import TaskClient
 
 
 def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
@@ -31,7 +33,11 @@ def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
 def main():
     from vaws_coordinator._stdio import configure_stdio
     configure_stdio()
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=inspect.cleandoc(TaskClient.__doc__),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = parser.add_subparsers(dest="operation", required=True)
     attach = sub.add_parser("attach", help="Adapter entry: native root/resume, child, or explicit task association")
     attach.add_argument("--client", choices=sorted(CLIENTS), required=True)

@@ -15,6 +15,41 @@ import pytest
 from vaws_coordinator import preparation_cache as cache, runtime_profile as profile
 
 
+@pytest.mark.skipif(sys.platform != 'linux', reason='Linux recipient venv and shell contract')
+def test_image_pip_installs_only_in_new_owned_venv(tmp_path, monkeypatch):
+    import importlib.util
+    import shlex
+    import zipfile
+    from vaws_coordinator import parity
+    from vaws_coordinator.provision.task_environment import create_venv_script
+    root = tmp_path / 'execution'
+    interpreter = root / '.venv/bin/python'
+    monkeypatch.setattr(parity, 'PYTHON_METADATA_PREAMBLE', ['PYTHON=' + shlex.quote(sys.executable)])
+    script = create_venv_script(str(root), str(interpreter))
+    environment = dict(os.environ)
+    pip = importlib.util.find_spec('pip')
+    if pip and pip.origin:
+        # Expose the image's existing pip while keeping sys.prefix/purelib in
+        # the new venv, exactly as system-site-packages does on the recipient.
+        environment['PYTHONPATH'] = str(Path(pip.origin).parent.parent)
+    subprocess.run(['bash', '-c', script], env=environment, capture_output=True, text=True, check=True, timeout=30)
+    wheel = tmp_path / 'vaws_dependency_fixture-1.0-py3-none-any.whl'
+    dist = 'vaws_dependency_fixture-1.0.dist-info/'
+    with zipfile.ZipFile(wheel, 'w') as archive:
+        archive.writestr('vaws_dependency_fixture.py', 'value = "owned"\n')
+        archive.writestr(dist + 'METADATA', 'Metadata-Version: 2.1\nName: vaws-dependency-fixture\nVersion: 1.0\n')
+        archive.writestr(dist + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+        archive.writestr(dist + 'RECORD', '')
+    subprocess.run([str(interpreter), '-m', 'pip', 'install', '--no-index', '--no-deps', str(wheel)],
+                   env=environment, capture_output=True, text=True, check=True, timeout=30)
+    probe = subprocess.run([str(interpreter), '-c',
+        'import json,sys,sysconfig,vaws_dependency_fixture as p;print(json.dumps([sys.prefix,sysconfig.get_paths()["purelib"],p.__file__]))'],
+        env=environment, capture_output=True, text=True, check=True)
+    prefix, purelib, installed = map(Path, json.loads(probe.stdout))
+    assert prefix == root / '.venv'
+    assert purelib.is_relative_to(prefix) and installed.is_relative_to(purelib)
+
+
 @pytest.mark.skipif(sys.platform != 'linux', reason='Linux extension loading contract')
 def test_python_source_view_loads_copied_extension_and_own_scm_metadata(tmp_path, monkeypatch):
     import _ctypes_test

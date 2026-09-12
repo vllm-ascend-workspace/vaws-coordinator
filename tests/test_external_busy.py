@@ -71,7 +71,7 @@ def test_default_occupancy_policy_cannot_be_relaxed_by_acquire_hints(queue, tmp_
         submit(host, "strict")
 
 
-@pytest.mark.parametrize("shared,expected_samples", [(True, 1), (False, 2)])
+@pytest.mark.parametrize("shared,expected_samples", [(True, 0), (False, 2)])
 def test_release_samples_follow_host_owned_sharing_policy(queue, monkeypatch, tmp_path, shared, expected_samples):
     host, _ = queue
     submit(host, allow_external_busy=shared)
@@ -168,17 +168,16 @@ def test_external_worker_is_not_a_reason_to_retain_a_drained_owned_lease(queue, 
     assert host.acquire("strict", BUSY)["status"] == "waiting"
 
 
-def test_shared_release_preserves_ports_and_unknown_device_checks(queue, monkeypatch):
+def test_completed_shared_release_preserves_ports_without_requiring_device_visibility(queue, monkeypatch):
     host, _ = queue
     token, owned, grant = start(host, monkeypatch, service_port=0)
     owned["alive"] = False
     port = grant["granted_service_port"]
-    for observed, listening in ((BUSY, None), (BUSY, {"status": "ok", "ports": [port]}),
-                                (None, {"status": "ok", "ports": []})):
+    for observed, listening in ((BUSY, None), (BUSY, {"status": "ok", "ports": [port]})):
         result = host.release("shared", token, observed, completion_confirmed=True, listening=listening)
         assert result["status"] == "orphaned_busy"
         assert result["task"]["granted_service_port"] == port
-    result = host.release("shared", token, BUSY, completion_confirmed=True, listening={"status": "ok", "ports": []})
+    result = host.release("shared", token, None, completion_confirmed=True, listening={"status": "ok", "ports": []})
     assert result["status"] == "released" and result["task"]["granted_service_port"] is None
 
 

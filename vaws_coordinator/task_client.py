@@ -28,6 +28,51 @@ def coordinator_user(explicit: str | None = None, *, identity_file=None) -> str:
 
 
 class TaskClient:
+    """Run and observe managed work from an existing native task context.
+
+    Prefer the existing vaws_run / vaws_execution MCP tools when available.
+    For Python callers, this is the same task API:
+
+        from vaws_coordinator.task_client import TaskClient
+
+        client = TaskClient("/local/task-context.json")
+        run = client.run(
+            '"$VAWS_PYTHON" -c "import torch_npu; print(1)"',
+            sources={"vllm": "/local/vllm", "vllm-ascend": "/local/vllm-ascend"},
+            resources={"devices": [0]},
+            topology={"host": "npu-host"},
+        )
+        execution_id = run["execution_id"]
+        status = client.wait(execution_id, until="released", timeout_seconds=30)
+        print(status["state"], status["resources_released"])
+        log = client.observe(execution_id, action="tail")
+        print(log.get("tail", ""))
+
+    Use the native attachment's supplied context_file path. TaskClient() can
+    instead resolve VAWS_CONTEXT_FILE or the actual native task context; no
+    session or attach call is needed before run. Explicit task association
+    requires authorization; a directory alone does not identify another task.
+
+    The command runs in the remote execution root. VAWS_PYTHON is its prepared
+    interpreter; source names become subdirectories there and are on PYTHONPATH.
+    sources maps names to local Git worktrees and captures current edits at run.
+    Omit sources to use task defaults; sources={} has no source dependencies.
+    Resources default to no NPU. Use npu_count for any available devices, or
+    devices plus topology.host for specific physical devices on a chosen host.
+    Only for explicitly intended sharing, add allow_external_busy=True with
+    exactly one devices entry; other managed leases still conflict.
+
+    run returns an execution_id after admission, before business completion.
+    wait(until="released") confirms termination and resource release, including
+    failed executions: success also requires state == "succeeded". A bounded
+    wait may return wait_timed_out=True; inspect it and wait on the same id again
+    as needed. This observation timeout does not stop or resubmit the execution.
+    observe(action="tail") returns logs (tail and separate stdout/stderr).
+    observe(action="status", refresh=False) reads cached progress;
+    observe(action="stop") stops that execution. finish() closes the whole task
+    and stops its owned executions; it is not needed after each completed run.
+    """
+
     def __init__(self, context_file="", *, pool=None, user=None, service=None, allow_native_context=True,
                  identity_file=None):
         self.context = load_context(context_file, allow_native_context=allow_native_context)
@@ -104,6 +149,15 @@ class TaskClient:
             timeout_seconds=1800, service=None, restart=False, preflight=None):
         """Admit fixed inputs and resources for one supervised execution.
 
+        ``command`` is remote shell code; use ``"$VAWS_PYTHON"`` for the prepared
+        interpreter. ``sources`` maps source names to local Git worktrees;
+        their fixed snapshots become remote subdirectories on Python's path.
+        Omit sources for task defaults, or pass ``{}`` for no source inputs.
+        ``resources`` defaults to no NPU; ``topology={"host": "npu-host"}``
+        selects a host. The returned ``execution_id`` identifies admitted work,
+        not a completed command. Read logs with ``observe(action="tail")`` and
+        confirm completion with ``wait(until="released")`` on that id.
+
         ``resources={"devices": [id], "allow_external_busy": True}`` explicitly
         shares one physical NPU with external processes. Other managed leases
         remain exclusive; stopping this execution only stops its own family.
@@ -170,6 +224,14 @@ class TaskClient:
         return selected[0]["id"] if selected else None
 
     def observe(self, execution_id=None, action="status", force=False, role=None, refresh=True, *, service=None):
+        """Read status/logs/target or stop one owned execution.
+
+        Pass the run reply's execution_id, or a task-scoped service name.
+        ``action="tail"`` returns ``tail`` and separate ``stdout``/``stderr``
+        (per role for multiple roles). Status is fresh by default; use
+        ``refresh=False`` for cached progress. Stop requests termination;
+        ``wait(until="released")`` confirms resource release afterward.
+        """
         if action not in {"status", "tail", "stop", "target"}:
             raise ValueError("unsupported execution action")
         execution_id = self.resolve_execution(execution_id, service=service)
@@ -200,7 +262,11 @@ class TaskClient:
         """Wait on one owned execution; return the last facts on bounded timeout.
 
         A terminal failure ends a running wait. Release waits end only when
-        the coordinator confirms both termination and resource release.
+        the coordinator confirms both termination and resource release;
+        check ``state == "succeeded"`` separately for business success.
+        A timeout returns the last facts plus ``wait_timed_out=True``; inspect
+        them and wait on the same id again as needed. This observation timeout
+        does not cancel or resubmit the work.
         """
         if until not in {"running", "released"}:
             raise ValueError("until must be running or released")

@@ -7,9 +7,12 @@ the single device-allocation authority. Generic process control is
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import shlex
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,13 +21,33 @@ from remote_dev.core.shell_ops import remote_bash
 
 from vaws_coordinator.host_queue import HostQueue
 from vaws_coordinator.machine_directory import MachineDirectory
-from vaws_coordinator.runtime_profile import digest, launch_preamble, native_compatibility_key
+from vaws_coordinator.runtime_profile import build_key, digest, launch_preamble, native_compatibility_key, profile_key
 
 
 @dataclass(frozen=True)
 class PreparedNativeView:
-    """Internal completed-publication handoff, never a registration argument."""
+    """Internal completed native proof, never a registration argument."""
     attestation: dict
+
+
+def _captured_manifest(output: str) -> dict:
+    """Decode a bounded complete capture receipt, never a preview or a subset."""
+    limit = 16 * 1024 * 1024
+    reply = json.loads(output)
+    size = reply.get('manifest_bytes')
+    encoded = reply.get('manifest_zlib_base64')
+    if (type(size) is not int or not 0 < size <= limit or not isinstance(encoded, str)
+            or len(encoded) > limit * 2):
+        raise ValueError('invalid captured manifest size or encoding')
+    compressed = base64.b64decode(encoded, validate=True)
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(compressed, size + 1)
+    if len(raw) != size or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+        raise ValueError('captured manifest is truncated or exceeds its declared size')
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or digest(manifest) != reply.get('manifest_digest'):
+        raise ValueError('captured manifest digest differs')
+    return manifest
 
 
 def _package_file(relative: str) -> Path:
@@ -68,6 +91,15 @@ class RemoteBackend:
     def submit_and_acquire(self, runtime, request):
         """Use the already persisted epoch for one host admission exchange."""
         return self.host(runtime, {**request, "action": "submit-acquire"})
+
+    def submit_and_preflight(self, runtime, request):
+        """The caller just verified this new run's fixed runtime inputs."""
+        return self.host(runtime, {**request, "action": "submit-acquire-preflight"})
+
+    def startup_context(self, runtime, task_id):
+        """Read this new task's epoch and container identity in one host call."""
+        return self.host(runtime, {"action": "startup-context", "task_id": task_id,
+                                   "container_name": runtime["container_name"]})
 
     def preflight(self, binding, command, env):
         from vaws_coordinator.managed_execution import ExecutionRequestError, task_preamble
@@ -177,7 +209,7 @@ print(json.dumps({'pid':matches[0]}))
         return {**manifest, "container_id": info["Id"],
                 "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
 
-    def verify_preflight(self, runtime, *, snapshots=None):
+    def verify_preflight(self, runtime, *, snapshots=None, _container_info=None):
         """Check the registered launch view with a compact remote reply.
 
         Owned native publications reuse their completed output proof and check
@@ -199,7 +231,10 @@ print(json.dumps({'pid':matches[0]}))
         expected_digest = digest(manifest)
 
         def check_container():
-            info = self._inspect_container(runtime)
+            info = self._inspect_container(runtime) if _container_info is None else _container_info
+            if _container_info is not None and (not info["State"]["Running"]
+                    or info["State"].get("Paused") or info["State"].get("Restarting")):
+                raise RuntimeError("prepared container is not running normally")
             if info["Id"] != expected.get("container_id"):
                 raise ValueError("runtime container changed before launch")
 
@@ -359,6 +394,20 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             raise ValueError("task-owned interpreter must not be the donor interpreter")
         if source_snapshot is None:
             raise ValueError('preparation requires fixed execution source inputs')
+        versions = {record['relpath']: {'version': record.get('scm_version'), 'source_head': record.get('source_head')}
+                    for record in source_snapshot.get('records', []) if record['relpath'] in ('vllm', 'vllm-ascend')}
+        publication = None
+        if native_recipe:
+            if any(not row['version'] for row in versions.values()):
+                raise ValueError('native preparation requires captured source SCM versions')
+            if reuse and reuse['kind'] == 'native':
+                try:
+                    native_compatibility_key(reuse['runtime']['attestation'])
+                except (KeyError, ValueError):
+                    pass
+                else:
+                    from vaws_coordinator.native_publication import NativeViewPublication
+                    publication = NativeViewPublication(spec, reuse['runtime'], versions)
         container = SshEndpoint(host=endpoint["host"], port=int(endpoint["port"]), user=endpoint["user"])
         def owned_process(step):
             if on_preparation_job is None:
@@ -381,6 +430,8 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
 
         if log_dir is not None:
             Path(log_dir).mkdir(parents=True, exist_ok=True)
+        # The owned worker resolves root/cwd before running any script. Keep
+        # this short RPC even when materialization and publication share a job.
         scripts = [("prepare-root", prepare_isolated_root_script(root))]
         if (native_recipe and (not reuse or reuse['kind'] != 'native')) or (not native_recipe and not donor_python):
             scripts.append(("create-venv", create_venv_script(root, python, donor_python)))
@@ -416,37 +467,33 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                                 process=owned_process(step))
             check_cancel()
         identity = spec.get("container_name") or ("vaws-" + spec["user"])
+        check_cancel()
         log = progress("materialize")
         if sources:
-            materialize_fixed_sources(
+            materialized = materialize_fixed_sources(
                 workspace_id=identity, endpoint=endpoint, source_snapshot=source_snapshot,
+                host_endpoint=spec['host_endpoint'],
                 log_path=log, process=owned_process("materialize"),
                 on_progress=lambda event: progress("materialize", event),
+                **({'native_publication': publication} if publication is not None else {}),
             )
         check_cancel()
-        versions = {record['relpath']: {'version': record.get('scm_version'), 'source_head': record.get('source_head')}
-                    for record in source_snapshot.get('records', []) if record['relpath'] in ('vllm', 'vllm-ascend')}
         if native_recipe:
-            if any(not row['version'] for row in versions.values()):
-                raise ValueError('native preparation requires captured source SCM versions')
-            if reuse and reuse['kind'] == 'native':
-                previous = reuse['runtime']
-                try:
-                    native_compatibility_key(previous['attestation'])
-                except (KeyError, ValueError):
-                    # An old environment without complete compatibility facts
-                    # still needs one ordinary preparation/attestation pass.
-                    pass
+            if publication is not None:
+                if 'native_view' in materialized:
+                    prepared = publication.accept(materialized['native_view'])
                 else:
+                    # A composite program exceeding the existing command byte
+                    # budget retains the original two-operation path.
                     log = progress('publish-native-view')
-                    prepared = self._prepare_native_view(spec, previous, versions,
+                    prepared = self._prepare_native_view(spec, reuse['runtime'], versions,
                         process=owned_process('publish-native-view'), log_path=log)
-                    check_cancel()
-                    return PreparedNativeView(prepared)
+                check_cancel()
+                return PreparedNativeView(prepared)
             preparation_data = {'versions': versions, 'build_env': source_snapshot.get('build_env', {})}
             write = 'mkdir -p ' + shlex.quote(root + '/.vaws-runtime') + '\nprintf %s ' + shlex.quote(json.dumps(preparation_data)) + ' > ' + shlex.quote(root + '/.vaws-runtime/build-source.json')
             self.bash(endpoint, write)
-        if reuse:
+        def reuse_previous():
             from vaws_coordinator.preparation_cache import REMOTE_REUSE_SUFFIX
             previous = reuse['runtime']
             request = {'kind': reuse['kind'], 'root': root, 'source_root': previous['endpoint']['root'],
@@ -483,6 +530,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                 compiled_native = True
 
         cached_native = False
+        incremental_native = False
 
         def rebuild(reason):
             nonlocal cached_native
@@ -491,62 +539,123 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             if discarded.get('status') != 'discarded':
                 raise RuntimeError('cannot discard incomplete cached outputs: ' + discarded.get('reason', 'unknown'))
             cached_native = False
+            install('check-build-compat')
+            install('install-vllm')
             install('install-vllm-ascend')
             install('verify-imports')
             install('verify-deps')
 
+        def accept_cache(cache):
+            nonlocal cached_native, compiled_native, incremental_native
+            progress('shared-native-cache', cache)
+            cached_native = cache.get('status') in {'hit', 'incremental'}
+            if not cached_native:
+                return False
+            if not cache.get('dependencies', {}).get('satisfied'):
+                if reuse and reuse['kind'] == 'dependencies':
+                    reuse_previous()
+                else:
+                    install('install-vllm-ascend-requirements')
+                install('verify-deps')
+                validated = self._shared_native(spec, 'revalidate', versions,
+                    process=owned_process('shared-native-revalidate-after-dependencies'))
+                if validated.get('status') != 'validated':
+                    # Imports or broad requirement ranges cannot establish the
+                    # original bundle's ABI after a dependency overlay changed.
+                    rebuild(validated.get('reason', 'cached native environment changed during dependency repair'))
+                    return True
+            if cache['status'] == 'incremental':
+                install('install-vllm-ascend-incremental')
+                compiled_native = True
+                incremental_native = True
+            return True
+
+        if native_recipe and steps:
+            # The recipient venv already sees the image packages. Restore and
+            # check their real dependency metadata before any pip/copy work.
+            cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
+            remaining_donors = None
+            while cache.get('status') == 'miss':
+                exported = self._export_shared_native(spec, **({'donors': remaining_donors}
+                                                              if remaining_donors is not None else {}))
+                remaining_donors = exported.get('remaining_donors', [])
+                progress('shared-native-export', {key: value for key, value in exported.items()
+                                                   if key != 'remaining_donors'})
+                check_cancel()
+                if exported.get('status') != 'stored':
+                    break
+                cache = self._shared_native(spec, 'restore', versions,
+                    candidate={key: exported[key] for key in ('bundle', 'native_key')},
+                    process=owned_process('shared-native-restore-after-export'))
+                if not remaining_donors:
+                    break
+            if accept_cache(cache):
+                # Profile capture below performs this execution's real import
+                # once. No editable install or repeated native smoke is needed.
+                steps = ('write-marker',)
+            elif reuse:
+                reuse_previous()
+        elif reuse:
+            reuse_previous()
+
         for step in steps:
-            if step == 'install-vllm-ascend':
-                cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
-                progress('shared-native-cache', cache)
-                cached_native = cache.get('status') == 'hit'
-                if cached_native:
+            if step == 'install-vllm-ascend' and reuse and reuse['kind'] == 'dependencies':
+                # Copying a same-container dependency overlay may have repaired
+                # an ABI mismatch from the early image-only lookup.
+                cache = self._shared_native(spec, 'restore', versions,
+                    process=owned_process('shared-native-restore-after-dependencies'))
+                if accept_cache(cache):
                     continue
-            try:
-                install(step)
-            except (PreparationCancelled, PreparationUncertain):
-                raise
-            except Exception as exc:
-                if not cached_native or step not in {'verify-imports', 'verify-deps'}:
-                    raise
-                rebuild(exc)
+            if cached_native and step in {'verify-imports', 'verify-deps'}:
+                continue
+            install(step)
         check_cancel()
         log = progress("verify-profile")
         try:
-            self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
-                                      process=owned_process("verify-profile"), log_path=log)
+            captured = self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
+                                                process=owned_process("verify-profile"), log_path=log)
         except (PreparationCancelled, PreparationUncertain):
             raise
         except Exception as exc:
-            if not cached_native:
+            if incremental_native or not cached_native:
                 raise
             rebuild(exc)
-            self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
-                                      process=owned_process("verify-profile"), log_path=log)
+            captured = self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
+                                                process=owned_process("verify-profile"), log_path=log)
+        check_cancel()
         if compiled_native:
             progress('shared-native-cache', self._shared_native(spec, 'store', versions, process=owned_process('shared-native-store')))
-        # Registration performs the full container/profile/source attestation.
+        check_cancel()
+        if native_recipe and captured is not None:
+            return PreparedNativeView(captured)
+        # Legacy adapters and command roots retain their registration probe.
 
-    def _shared_native(self, spec, action, versions, *, process=None):
+    def _shared_native(self, spec, action, versions, *, process=None, candidate=None):
         """One bounded automatic cache lookup/copy; no other user's runtime."""
-        from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE, task_python_exports
+        from vaws_coordinator.parity import PYTHON_METADATA_PREAMBLE, task_python_exports
         from vaws_coordinator.preparation_cache import REMOTE_SHARED_SUFFIX
         from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
         try:
             root, python = spec['endpoint']['root'], spec['python']
-            request = {'root': root, 'action': action, 'preparation': spec.get('preparation', {}), 'versions': versions}
+            request = {'root': root, 'action': action, 'preparation': spec.get('preparation', {}),
+                       'versions': versions, 'machine_type': spec.get('machine_type')}
+            if candidate is not None:
+                request['candidate'] = candidate
             if action == 'restore':
                 host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
                 name = shlex.quote(spec['container_name'])
                 request['image_digest'] = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
             module = _package_file('runtime_profile.py').read_text()
+            build_source = _package_file('build_inputs.py').read_text()
+            incremental = _package_file('native_incremental.py').read_text()
             cache = _package_file('preparation_cache.py').read_text()
             preamble = '\n'.join(['set -euo pipefail', 'export VAWS_RUNTIME_ROOT=' + shlex.quote(root),
-                                   *DEFAULT_ENV_PREAMBLE, *task_python_exports(python),
+                                   *PYTHON_METADATA_PREAMBLE, *task_python_exports(python),
                                    'export PYTHONPATH=' + shlex.quote(':'.join([root + '/.vaws-runtime/metadata',
                                                                             root + '/vllm', root + '/vllm-ascend']))])
             command = (preamble + '\n' + shlex.quote(python) + ' - ' + shlex.quote(json.dumps(request))
-                       + " <<'VAWS_SHARED_NATIVE'\n" + module + '\nexec(' + repr(cache) + ', globals())\n'
+                       + " <<'VAWS_SHARED_NATIVE'\n" + module + '\nexec(' + repr(build_source) + ', globals())\n'
+                       + 'exec(' + repr(incremental) + ', globals())\nexec(' + repr(cache) + ', globals())\n'
                        + REMOTE_SHARED_SUFFIX + '\nVAWS_SHARED_NATIVE\n')
             if process is None:
                 return json.loads(self.bash(spec['endpoint'], command))
@@ -559,6 +668,32 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             raise
         except Exception as exc:
             return {'status': 'miss', 'reason': str(exc)[:500]}
+
+    def _export_shared_native(self, spec, *, donors=None):
+        """An existing verified donor is exported only when the cache missed."""
+        from remote_dev.core.ssh_transport import run_remote_python
+        from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
+        host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
+        name = shlex.quote(spec['container_name'])
+        image = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
+        source = '\n'.join(_package_file(name).read_text(encoding='utf-8')
+                           for name in ('runtime_profile.py',))
+        # Separate compile units preserve module-level future imports.
+        for name in ('build_inputs.py', 'native_incremental.py', 'preparation_cache.py'):
+            source += '\nexec(' + repr(_package_file(name).read_text(encoding='utf-8')) + ', globals())\n'
+        source += "\nimport signal\nsignal.alarm(45)\nargs=json.loads(sys.argv[1])\nprint(json.dumps(store_shared_native(Path(args['root']),Path(SHARED_NATIVE_CACHE))))\n"
+        module = _package_file('shared_native_discovery.py').read_text(encoding='utf-8')
+        script = module + '\nimport sys\nprint(json.dumps(export_verified_donor(json.load(sys.stdin))))\n'
+        request = {'preparation': spec.get('preparation', {}), 'image_digest': image,
+                   'machine_type': spec.get('machine_type'), 'export_source': source}
+        if donors is not None:
+            request['donors'] = donors
+        reply = run_remote_python(resolve_endpoint(host), script, request, timeout_ms=120000)
+        if reply.get('status') == 'cancelled':
+            raise PreparationCancelled('shared native export cancelled')
+        if reply.get('status') == 'uncertain' or reply.get('remote_outcome') == 'unknown':
+            raise PreparationUncertain('shared native export outcome is uncertain')
+        return reply
 
     def _prepare_native_view(self, spec, previous, versions, *, process=None, log_path=None):
         from vaws_coordinator.preparation_cache import REMOTE_NATIVE_VIEW_SUFFIX
@@ -606,16 +741,19 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         root = spec["endpoint"]["root"]
         host = {**spec["host_endpoint"], "root": "/", "cwd": "/"}
         name = shlex.quote(spec["container_name"])
-        digest = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
-        if not digest:
+        fields = shlex.quote('{"Id":{{json .Id}},"Image":{{json .Image}},"State":{{json .State}}}')
+        info = json.loads(self.bash(host, f"docker inspect --format {fields} {name}"))
+        if not info.get('Id') or not info.get('Image'):
             raise ValueError("cannot attest image digest")
+        if not info['State']['Running'] or info['State'].get('Paused') or info['State'].get('Restarting'):
+            raise ValueError('capture container is not running normally')
         recipe = (environment or {}).get("recipe") or (environment or {}).get("image") or spec.get("recipe")
         module = _package_file("runtime_profile.py").read_text()
         build_source = _package_file("build_inputs.py").read_text()
         request = json.dumps({
             "root": root,
             "recipe": recipe,
-            "image_digest": digest,
+            "image_digest": info['Image'],
             "machine_type": (environment or {}).get("machine_type") or spec.get("machine_type"),
             "cann_files": list(CANN_VERSION_CANDIDATES),
             "driver_files": list(DRIVER_VERSION_CANDIDATES),
@@ -644,9 +782,29 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         command = (preamble + "\n" + shlex.quote(python) + " - " + shlex.quote(request)
                    + " <<'VAWS_CAPTURE_PROBE'\n" + module + runner + "\nVAWS_CAPTURE_PROBE\n")
         if process is None:
-            self.bash(spec["endpoint"], command)
+            output = self.bash(spec["endpoint"], command)
         else:
             from vaws_coordinator.parity_support import SshEndpoint, ssh_exec_stream
             endpoint = spec["endpoint"]
-            ssh_exec_stream(SshEndpoint(endpoint["host"], int(endpoint["port"]), endpoint["user"]),
-                            command, stream_progress=False, process=process, log_path=log_path)
+            completed = ssh_exec_stream(SshEndpoint(endpoint["host"], int(endpoint["port"]), endpoint["user"]),
+                                        command, stream_progress=False, process=process, log_path=log_path)
+            output = completed.stdout
+        if native_recipe:
+            manifest = _captured_manifest(output)
+            source_id = spec.get('source_snapshot', {}).get('id')
+            files, evidence = manifest.get('files', {}), manifest.get('evidence', {})
+            if (manifest.get('schema_version') != 1 or not files
+                    or not {'library', 'metadata'}.issubset({row.get('role') for row in files.values()})
+                    or not {'cann', 'driver', 'smoke'}.issubset(evidence)
+                    or any(not re.fullmatch('[0-9a-f]{64}', str(row.get('sha256', '')))
+                           for row in [*files.values(), *evidence.values()])
+                    or manifest.get('profile_key') != profile_key(manifest['profile'])
+                    or manifest.get('build_key') != build_key(manifest['profile'], manifest['build_inputs'])):
+                raise ValueError('capture did not return a complete native proof')
+            if (not source_id or manifest.get('execution_view', {}).get('source_id') != source_id
+                    or manifest.get('execution_view', {}).get('python') != python
+                    or manifest.get('runtime_root') != root
+                    or manifest.get('profile', {}).get('image_digest') != info['Image']):
+                raise ValueError('capture did not return this fixed execution view')
+            return {**manifest, 'container_id': info['Id'],
+                    'launch_preamble': launch_preamble(manifest['profile'], python=python)}

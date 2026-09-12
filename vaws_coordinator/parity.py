@@ -7,15 +7,18 @@ script by filesystem path.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -116,7 +119,10 @@ def materialize_command(
 
 def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snapshot: dict,
                               log_path=None, process=None, on_progress=None,
-                              container_cache_root: str | None = None) -> dict:
+                              container_cache_root: str | None = None,
+                              host_endpoint: dict | None = None,
+                              shared_cache_root: str | None = None,
+                              native_publication=None) -> dict:
     """Materialize admitted inputs directly, without the public sync lifecycle.
 
     One completed remote operation pins available objects, checks out the exact
@@ -128,6 +134,7 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
     import inspect
     from vaws_coordinator.execution_sources import validate_source_snapshot
     from vaws_coordinator.parity_support import _materialize_fixed
+    from vaws_coordinator.shared_source_objects import SHARED_SOURCE_CACHE, copy_fixed_objects
 
     validate_source_snapshot(source_snapshot)
     workspace_id = normalize_workspace_id(workspace_id)
@@ -162,11 +169,24 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                'records': [{'relpath': row.relpath, 'commit': row.commit, 'tree': row.tree,
                             'submodules': row.submodules,
                             'mirror': mirror_path_for(cache, workspace_id, row)} for row in records]}
-    script = ('python3 - <<\'VAWS_FIXED_SOURCES\'\n' + inspect.getsource(_materialize_fixed)
-              + '\nimport json\nprint(json.dumps(_materialize_fixed(' + repr(request)
-              + '), separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
+    if host_endpoint is not None or shared_cache_root is not None:
+        shared = validate_absolute_posix_path(shared_cache_root or SHARED_SOURCE_CACHE,
+                                             label='shared source cache')
+        with ThreadPoolExecutor(max_workers=min(4, len(records))) as pool:
+            for row, record, bases in zip(request['records'], records, pool.map(_local_snapshot_bases, records)):
+                row['repo_id'] = record.repo_id
+                row['shared_mirror'] = str(PurePosixPath(shared) / (record.repo_id + '.git'))
+                row['local_bases'] = bases
+    def command():
+        program = (inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(_materialize_fixed)
+                   + '\nimport json\nresult = _materialize_fixed(' + repr(request) + ')\n')
+        if native_publication is not None:
+            return native_publication.wrap_program(program)
+        return ("python3 - <<'VAWS_FIXED_SOURCES'\n" + program
+                + '\nprint(json.dumps(result, separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
 
     def run():
+        script = command()
         result = ssh_exec_stream(container, script, stream_progress=False,
                                  log_path=log_path, process=process)
         try:
@@ -177,15 +197,44 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
             raise ParityUnavailable('fixed source materialization returned an invalid receipt')
         return payload
 
-    result = run()
-    if result.get('status') == 'missing':
+    def missing_rows(result):
         missing = result.get('missing')
         if (not isinstance(missing, list) or not missing
                 or any(not isinstance(row, dict) or type(row.get('index')) is not int
                        or not 0 <= row['index'] < len(records) for row in missing)
                 or len({row['index'] for row in missing}) != len(missing)):
             raise ParityUnavailable('fixed source materialization returned invalid missing objects')
+        return missing
+
+    if native_publication is not None and len(command().encode('utf-8')) > 96 * 1024:
+        # Large native metadata uses the existing separate publication job.
+        # Every later inline pack is budgeted against this entire program.
+        native_publication = None
+    result = run()
+    if result.get('status') == 'missing' and host_endpoint is not None:
+        missing = missing_rows(result)
+        if process is not None and process.cancel_requested():
+            from vaws_coordinator.preparation_process import PreparationCancelled
+            raise PreparationCancelled('fixed object discovery cancelled before launch')
+        cold = [request['records'][row['index']] for row in missing if not row.get('carrier')]
+        # An existing private carrier already enables cheap delta transfer.
+        # A new Python edit must not rediscover every container on the host.
+        if cold:
+            exported = _export_existing_source_objects(host_endpoint, cold, cache)
+            if log_path and (exported.get('diagnostics') or exported.get('reason')):
+                with Path(log_path).open('a', encoding='utf-8') as stream:
+                    stream.write('shared source discovery: ' + json.dumps(exported, sort_keys=True) + '\n')
+            if on_progress:
+                on_progress({'phase': 'shared-source-objects', **exported})
+            if exported['status'] == 'copied':
+                # A new persisted job, not a replay of the completed miss.
+                result = run()
+    if result.get('status') == 'missing':
+        missing = missing_rows(result)
         for row in missing:
+            if process is not None and process.cancel_requested():
+                from vaws_coordinator.preparation_process import PreparationCancelled
+                raise PreparationCancelled('fixed object upload cancelled before launch')
             record = records[row['index']]
             mirror = request['records'][row['index']]['mirror']
             repo = Path(record.source_path)
@@ -193,6 +242,20 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                 workspace_id=workspace_id, record=record, remote_carrier_commit=row.get('carrier'))
             if on_progress:
                 on_progress({'phase': 'push-mirror', 'relpath': record.relpath})
+            pack = _fixed_inline_pack(repo, record.commit, carrier, row.get('carrier'))
+            if pack is not None:
+                # The next persisted preparation job receives and materializes
+                # the exact objects over its existing authenticated transport.
+                request.setdefault('inline_packs', {})[str(row['index'])] = pack
+                # The owned worker invokes bash -c. Bound the whole argument,
+                # including base64, all repositories and the remote program,
+                # below Linux's per-argument limit; overflow uses Git below.
+                if len(command().encode('utf-8')) <= 96 * 1024:
+                    if on_progress:
+                        on_progress({'phase': 'inline-pack-ready', 'relpath': record.relpath,
+                                     'transport': 'owned-rpc-pack', 'bytes': pack['bytes']})
+                    continue
+                del request['inline_packs'][str(row['index'])]
             # Exact OIDs are the source, including the carrier. A concurrent
             # capture can move local refs without changing this execution.
             # Git owns its receive process/atomic refs; never kill or delete a
@@ -213,6 +276,103 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
     return result
 
 
+def _export_existing_source_objects(host_endpoint, records, legacy_cache):
+    import inspect
+    from remote_dev.core.endpoint import resolve_endpoint
+    from remote_dev.core.ssh_transport import run_remote_python
+    from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
+    from vaws_coordinator.shared_source_objects import (
+        copy_fixed_objects, export_container_objects, export_existing_objects,
+    )
+    source = inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(export_container_objects)
+    source += '\nimport json,sys\nprint(json.dumps(export_container_objects(json.load(sys.stdin))))\n'
+    script = inspect.getsource(export_existing_objects)
+    script += '\nimport json,sys\nprint(json.dumps(export_existing_objects(json.load(sys.stdin))))\n'
+    result = run_remote_python(resolve_endpoint({**host_endpoint, 'root': '/', 'cwd': '/'}), script,
+        {'records': records, 'legacy_cache': legacy_cache, 'export_source': source}, timeout_ms=360000)
+    if result.get('status') == 'cancelled':
+        raise PreparationCancelled('fixed object export cancelled; it was not replayed')
+    if (result.get('status') == 'failed' and result.get('exit_code') is not None
+            and result.get('remote_outcome') != 'unknown'):
+        raise ParityUnavailable('fixed object export failed: ' + str(result.get('stderr_tail') or result))
+    if result.get('status') not in {'copied', 'miss'} or result.get('remote_outcome') == 'unknown':
+        raise PreparationUncertain('fixed object export did not complete; it was not replayed: ' + str(result))
+    return result
+
+
+def _fixed_inline_pack(repo, commit, carrier, previous, *, limit=65536):
+    """Bound small edits by a freshly observed carrier; cold/large input uses Git."""
+    if not previous or not re.fullmatch(r'[0-9a-f]{40,64}', previous):
+        return None
+    if git(repo, ['cat-file', '-e', previous + '^{commit}'], check=False).returncode:
+        return None
+    # A temporary file bounds memory even when a nominal edit contains a large
+    # new blob. No network or shared refs are mutated while constructing it.
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            ['git', '-C', str(repo), 'pack-objects', '--stdout', '--revs', '--delta-base-offset', '--compression=1'],
+            input=(commit + '\n' + carrier + '\n^' + previous + '\n').encode('ascii'),
+            stdout=output, stderr=subprocess.PIPE, timeout=DEFAULT_GIT_TRANSPORT_TIMEOUT_SECONDS,
+        )
+        if result.returncode:
+            raise RuntimeError('fixed source pack failed: ' + result.stderr.decode('utf-8', errors='replace'))
+        if output.tell() > limit:
+            return None
+        output.seek(0)
+        data = output.read()
+    return {'previous': previous, 'carrier': carrier, 'bytes': len(data),
+            'sha256': hashlib.sha256(data).hexdigest(), 'data': base64.b64encode(data).decode('ascii')}
+
+
+def _local_snapshot_bases(record, *, limit=64):
+    """Bounded local membership hints, never source selection or authority.
+
+    Retained input/transport refs include parentless snapshots that an ordinary
+    ancestor walk misses. Missing local history simply leaves the Git fallback.
+    """
+    try:
+        refs = git(Path(record.source_path), ['for-each-ref', '--count=256', '--sort=-refname',
+            '--format=%(objectname) %(refname)', 'refs/vaws/inputs', 'refs/parity-transport', 'refs/parity'],
+            check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if refs.returncode:
+        return []
+    result = []
+    for line in refs.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) == 2 and parts[1].endswith('/' + record.repo_id)
+                and re.fullmatch(r'[0-9a-f]{40,64}', parts[0])
+                and parts[0] != record.commit and parts[0] not in result):
+            result.append(parts[0])
+            if len(result) == limit:
+                break
+    return result
+
+
+PYTHON_METADATA_PREAMBLE = (
+    'export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
+    'PYTHON_CANDIDATE="$(ls -1d /usr/local/python*/bin/python3 2>/dev/null | sort -V | tail -n 1 || true)"',
+    'if [ -n "$PYTHON_CANDIDATE" ]; then export PYTHON="$PYTHON_CANDIDATE"; elif command -v python3 >/dev/null 2>&1; then export PYTHON="$(command -v python3)"; elif command -v python >/dev/null 2>&1; then export PYTHON="$(command -v python)"; else echo "python not found" >&2; exit 127; fi',
+    # Metadata, hashing and venv creation need libpython, not CANN/ATB setup.
+    # In paired images ATB set_env itself imports torch and costs seconds.
+    'VAWS_IMAGE_PYTHON_ROOT="$(dirname "$(dirname "$(readlink -f "$PYTHON")")")"',
+    'if [ -d "$VAWS_IMAGE_PYTHON_ROOT/lib" ]; then export LD_LIBRARY_PATH="$VAWS_IMAGE_PYTHON_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi',
+    'export PATH="$(dirname "$PYTHON"):$PATH"',
+)
+
+
+ATB_CXX_ABI_PROBE = '''import importlib.metadata, json, sys, sysconfig
+try:
+    row = json.load(open(sys.argv[1])).get('atb_abi', {})
+    if (row.get('cxx_abi') in ('0', '1') and row.get('torch') == importlib.metadata.version('torch')
+            and row.get('python_abi') == sysconfig.get_config_var('SOABI')):
+        print(row['cxx_abi'])
+except (OSError, ValueError, TypeError, AttributeError, importlib.metadata.PackageNotFoundError):
+    pass
+'''
+
+
 DEFAULT_ENV_PREAMBLE = (
     'export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
     'export VAWS_RUNTIME_ROOT="${VAWS_RUNTIME_ROOT:-/vllm-workspace}"',
@@ -228,7 +388,16 @@ DEFAULT_ENV_PREAMBLE = (
     '  file="$1"',
     '  if [ -f "$file" ]; then',
     '    set +u',
-    '    source "$file" >/dev/null 2>&1 || true',
+    '    local -a _vaws_source_args=()',
+    '    if [ "$file" = /usr/local/Ascend/nnal/atb/set_env.sh ] && [ -f "$VAWS_RUNTIME_ROOT/.vaws-runtime/reuse.json" ]; then',
+    '      local _vaws_atb_abi',
+    '      _vaws_atb_abi="$(python3 - "$VAWS_RUNTIME_ROOT/.vaws-runtime/reuse.json" <<\'VAWS_ATB_CXX_ABI\'',
+    ATB_CXX_ABI_PROBE,
+    'VAWS_ATB_CXX_ABI',
+    '      )" || _vaws_atb_abi=""',
+    '      case "$_vaws_atb_abi" in 0|1) _vaws_source_args=("--cxx_abi=$_vaws_atb_abi");; esac',
+    '    fi',
+    '    source "$file" "${_vaws_source_args[@]}" >/dev/null 2>&1 || true',
     '    set -u',
     '  fi',
     '}',
@@ -842,6 +1011,14 @@ def build_transport_carrier(
     ref = transport_carrier_ref(container, mirror_path, workspace_id, record)
     previous_result = git(repo, ['rev-parse', '--verify', ref], check=False)
     previous = previous_result.stdout.strip() if previous_result.returncode == 0 else None
+    # A fresh recipient can already own a verified shared snapshot even when
+    # this local endpoint has no carrier ref. Connect the transport history to
+    # that observed base: disconnected tree snapshots otherwise make Git send
+    # every object despite excluding the base in pack-objects --revs.
+    if (remote_carrier_commit and previous != remote_carrier_commit
+            and re.fullmatch(r'[0-9a-f]{40,64}', remote_carrier_commit)
+            and git(repo, ['cat-file', '-e', remote_carrier_commit + '^{commit}'], check=False).returncode == 0):
+        previous = remote_carrier_commit
     if not previous or previous != remote_carrier_commit:
         carrier = record.commit
     elif git_tree_for_commit(repo, previous) == record.tree:
@@ -1360,8 +1537,9 @@ def runtime_install_step_script(
     lines = ['set -euo pipefail', f'cd {quoted(runtime_root)}']
     lines.extend(remote_runtime_env_exports())
     lines.append(f'export VAWS_RUNTIME_ROOT={quoted(runtime_root)}')
-    lines.extend(DEFAULT_ENV_PREAMBLE)
-    if python:
+    if step != 'write-marker':
+        lines.extend(DEFAULT_ENV_PREAMBLE)
+    if python and step != 'write-marker':
         lines.extend(task_python_exports(python))
     if step in {'verify-imports', 'verify-deps'}:
         # Shared native reuse copies outputs instead of installing an editable
@@ -1371,7 +1549,7 @@ def runtime_install_step_script(
             '  export PYTHONPATH="$VAWS_RUNTIME_ROOT/.vaws-runtime/metadata:$VAWS_RUNTIME_ROOT/vllm:$VAWS_RUNTIME_ROOT/vllm-ascend${PYTHONPATH:+:$PYTHONPATH}"',
             'fi',
         ])
-    if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-requirements', 'check-build-compat'}:
+    if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-incremental', 'install-vllm-ascend-requirements', 'check-build-compat'}:
         source_name = 'vllm' if step == 'install-vllm' else 'vllm-ascend'
         # Only package-created fixed input data enters the build shell. Never
         # derive versions from the synthetic commit's truncated history.
@@ -1589,6 +1767,16 @@ def runtime_install_step_script(
                 'fi',
             ]
         )
+    elif step == 'install-vllm-ascend-incremental':
+        from vaws_coordinator import native_incremental
+        script = Path(native_incremental.__file__).read_text(encoding='utf-8')
+        lines.extend([
+            '"$PYTHON" - "$VAWS_RUNTIME_ROOT" <<\'VAWS_NATIVE_INCREMENTAL\'',
+            script,
+            'import sys',
+            'build_incremental_kernel(Path(sys.argv[1]))',
+            'VAWS_NATIVE_INCREMENTAL',
+        ])
     elif step == 'install-vllm-ascend':
         lines.extend(
             [

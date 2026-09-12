@@ -8,6 +8,50 @@ containers through `vaws-remote-dev`. Code identity is git. The API owns runtime
 preparation, lifecycle transitions and resource release; callers provide the
 business command and constraints.
 
+## Quick start
+
+Use the existing `vaws_run` / `vaws_execution` MCP tools when available.
+Python callers can use the same task API below. The complete short example
+and its semantics are also available in one local command:
+`python -m vaws_coordinator.vaws --help` (or `help(TaskClient)` in Python).
+
+```python
+from vaws_coordinator.task_client import TaskClient
+
+client = TaskClient("/local/task-context.json")
+run = client.run(
+    '"$VAWS_PYTHON" -c "import torch_npu; print(1)"',
+    sources={"vllm": "/local/vllm", "vllm-ascend": "/local/vllm-ascend"},
+    resources={"devices": [0]},
+    topology={"host": "npu-host"},
+)
+execution_id = run["execution_id"]
+status = client.wait(execution_id, until="released", timeout_seconds=30)
+print(status["state"], status["resources_released"])
+log = client.observe(execution_id, action="tail")
+print(log.get("tail", ""))
+```
+
+Replace the paths and host with your task's inputs. Use the native attachment's
+supplied `context_file`, or `TaskClient()` to resolve `VAWS_CONTEXT_FILE` / the
+actual native task context. No separate session or attach call is needed.
+`sources` captures edits from local Git worktrees; their names become remote
+subdirectories on `PYTHONPATH`. The command runs in that execution root and
+`VAWS_PYTHON` selects its prepared interpreter. Omitted sources use task defaults;
+`sources={}` runs without source dependencies. Resources default to no NPU;
+use `npu_count` for available devices or `devices` with `topology.host` for
+specific physical devices. Explicit sharing of one physical NPU adds
+`allow_external_busy=True` to resources; other managed leases still conflict.
+
+`run` returns after admission. A released result confirms termination and
+resource release; business success also requires `state == "succeeded"`.
+If a bounded wait returns `wait_timed_out=True`, inspect its facts and wait on
+the same id again as needed; that timeout does not stop or resubmit the work.
+Tail replies include `tail` and separate `stdout` / `stderr`. For progress use
+`observe(execution_id, refresh=False)`; to stop it use `action="stop"` and wait
+for release. `finish()` closes the entire task and stops its owned executions;
+completed runs release their resources without a per-run finish call.
+
 ## Agent references and recorded launch facts
 
 `TaskClient()` uses an explicit context or `VAWS_CONTEXT_FILE` first. Local
@@ -24,7 +68,9 @@ transaction boundary: if close wins, submission is rejected; if admission wins,
 finish delegates to the coordinator for owned-execution cleanup.
 
 A configured existing user container can prepare a task without selecting an
-image recipe again. Creating a container still requires an explicit recipe.
+image recipe again. Creating a container requires an explicit recipe or a
+concrete image tag/digest, supplied in the same run's `environment.image`.
+No separate provisioning call is required for a first run at a fixed version.
 Preparation checks source/image build compatibility before installing vLLM.
 A completed failing preparation command ends that execution with its diagnostic
 log; an unavailable SSH transport remains uncertain. Correct the configuration
@@ -215,6 +261,14 @@ native-view publication: outputs are copied and checked against the existing
 hashes, source/SCM mappings are updated, and the original import proof is carried
 forward. Its completed receipt goes directly into an atomic managed binding.
 There is no second profile capture, full registration probe, or SSH reservation.
+Fresh native builds and shared/incremental restores also hand their completed
+capture directly to managed registration. The capture still runs the required
+import, hashes the full bundle, verifies its environment and atomically writes
+the marker; its compressed reply retains every file identity. The handoff checks
+the exact execution root, interpreter, source identity and observed image and
+container, and waits for any owned cache store and cancellation check. Launch
+still verifies current container, environment, source mapping and pinned Git
+inputs before admission.
 Before launch, coordinator checks the container, environment version facts,
 current source mappings and fixed Git inputs; it does not rehash all native
 outputs in its private execution view. Initial builds, changed native or
@@ -279,7 +333,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@2de5cc32c5f3dd517e698cadfb1f9ed23589b1aa"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@4da7bbdd6b1a5d809d53522c9ee0b0b1d7d2e83c"
 uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
@@ -328,6 +382,15 @@ Incomplete or conflicting evidence stays an error.
 Managed source materialization consumes the admitted Git snapshot directly in
 one remote operation. Existing immutable mirror objects are reused; a completed
 missing-object response uploads only those objects before a new owned job.
+Small edits use a bounded Git pack in that next owned job over the existing
+RPC connection. The complete command, including all encoded packs, is capped
+below the remote worker's argument limit; cold or larger transfers retain Git
+SSH. Pack contents, prerequisite commit and resulting tree are verified before
+atomically publishing snapshot refs or materializing the execution view.
+Container provisioning checks SSH and Python package metadata without allocating
+an NPU. Native import validation belongs to runtime preparation; device execution
+belongs to a resource-backed run. The explicit standalone smoke command retains
+its device test.
 Each execution retains independent working files, a stable per-root lock, and
 final HEAD and dirty-state checks across parent repositories and submodules.
 Uncertain jobs are observed, never replayed. Runtime compatibility, native
@@ -338,9 +401,18 @@ Short root preparation reuses that endpoint's Python RPC connection; owned
 preparation jobs wait for exit within their bounded polling interval instead
 of returning early merely because output arrived. First admission persists
 the observed host epoch before submitting and acquiring in one host exchange.
-Container identity and compact source/environment verification run concurrently
-within the same preflight; both must finish successfully before host preflight.
-They are not cached across queue waits.
+New managed runs read their exact task and container facts together, verify the
+compact source/environment view, then reuse a newly issued grant's occupancy
+sample for host preflight. Queue recovery verifies again; facts are not cached
+across queue waits. Explicit shared-device admission queries the current physical
+device mapping; external occupancy stays unknown. Strict leases, unsupported
+device queries and conflicting expired reservations retain full occupancy
+probes. Prepared activation uses the exact container, boot, PID, start-time and
+process marker proof without a second scan of every host process.
+Startup and release operations record monotonic durations
+in the existing run events, without command contents or heartbeat log entries.
+Completed managed shared leases retain the host process-guard and port checks;
+they need no whole-device visibility scan to release their own ownership.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;

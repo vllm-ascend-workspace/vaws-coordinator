@@ -80,6 +80,8 @@ def donor(tmp_path, monkeypatch):
                  'build_key', 'verified_preparation', 'verify_native_compatibility', 'checked_file',
                  'file_digest', 'digest', 'build_toolchain_from_logs'):
         monkeypatch.setattr(cache, name, getattr(profile, name), raising=False)
+    for name in ('native_vendor_paths', 'native_vendor_launch_environment', 'native_import_smoke', 'native_compatibility_key'):
+        monkeypatch.setattr(cache, name, getattr(profile, name), raising=False)
     monkeypatch.setattr(cache, 'BUILD_INPUT_ENV_KEYS', BUILD_INPUT_ENV_KEYS, raising=False)
     monkeypatch.setattr(cache, 'verify', lambda *a, **k: pytest.fail('native outputs must not be re-attested'), raising=False)
     args = {'root': str(view), 'source_root': str(source), 'source_id': 'accepted-source',
@@ -143,6 +145,56 @@ def test_successive_hot_views_move_only_the_current_loader_paths_and_keep_flat_o
     assert smoke['compatibility']['origin']['build_key'] == old['build_key']
     assert smoke['python_import_executed'] is False and 'passed' not in smoke
     profile.verify_execution_view(later, current)
+
+
+@pytest.mark.parametrize('passed', [False, True])
+def test_missing_vendor_loader_path_requires_one_owned_import_then_reuses_new_proof(donor, monkeypatch, passed):
+    source, view, old, args, original = donor
+    library = 'vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib/libopapi.so'
+    path = source / library
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'verified donor library')
+    old['files'][library] = {'role': 'library', 'sha256': profile.file_digest(path)}
+    args['donor_manifest_digest'] = profile.digest(old)
+    original_bytes = {name: (source / name).read_bytes() for name in old['files']}
+    calls = []
+    def smoke(root, settings, inputs):
+        calls.append(root)
+        assert root == view
+        assert settings['launch_env']['LD_LIBRARY_PATH'].split(':')[0] == str((view / library).parent)
+        assert not any(part.startswith(str(source) + '/') for part in settings['launch_env']['LD_LIBRARY_PATH'].split(':'))
+        return {'passed': passed, 'python_import_executed': True, 'profile_key': profile.profile_key(settings),
+                'build_inputs': inputs, 'stdout': 'new owned import', 'stderr': '', 'elapsed_seconds': .01}
+    monkeypatch.setattr(cache, 'native_import_smoke', smoke)
+    if not passed:
+        with pytest.raises(ValueError, match='loader upgrade import smoke failed'):
+            cache.prepare_native_view(view, source, old, args)
+        assert not (view / '.vaws-runtime/ready-profile.json').exists()
+    else:
+        first = cache.prepare_native_view(view, source, old, args)
+        current = {**first['manifest'], 'files': old['files']}
+        proof = profile.native_compatibility_receipt(view, current)
+        assert proof['origin']['smoke']['stdout'] == 'new owned import'
+        # The new profile needs no more path additions. Its certificate is
+        # applicable to the next owned view without an upgrade/import.
+        assert profile.native_vendor_launch_environment(view, current['files'], current['profile']['launch_env']) == current['profile']['launch_env']
+        assert proof['key'] == profile.native_compatibility_key(current)
+        later = view.parent / 'next-execution'
+        for name, package in (('vllm', 'vllm'), ('vllm-ascend', 'vllm_ascend')):
+            target = later / name / package
+            target.mkdir(parents=True)
+            (target / '__init__.py').write_text("raise RuntimeError('normal hot view imported again')\n")
+        following = {**args, 'root': str(later), 'source_root': str(view), 'source_id': 'next-inputs',
+                     'donor_manifest_digest': profile.digest(current), 'build_inputs': current['build_inputs'],
+                     'versions': {name: {'version': '2.2', 'source_head': 'next-head'} for name in args['versions']}}
+        second = cache.prepare_native_view(later, view, current, following)
+        next_profile = {**second['manifest'], 'files': current['files']}
+        assert profile.native_compatibility_receipt(later, next_profile) == proof
+    evidence = json.loads((view / '.vaws-runtime/profile-evidence/smoke.json').read_text())
+    assert evidence['reason'] == 'native-loader-environment-upgrade'
+    assert evidence['elapsed_seconds'] == .01 and evidence['passed'] is passed
+    assert calls == [view]
+    assert {name: (source / name).read_bytes() for name in old['files']} == original_bytes
 
 
 @pytest.mark.parametrize('change', ['native', 'build-env', 'manifest', 'artifact', 'evidence'])
@@ -225,23 +277,33 @@ def test_actual_backend_script_publishes_once_and_launch_checks_only_mutable_fac
         backend.verify_preflight(runtime)
 
 
-def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch):
+@pytest.mark.parametrize('mode', ['combined', 'oversized', 'uncertain', 'cancelled-before'])
+def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch, mode):
     from vaws_coordinator import backend as adapters, parity, parity_support
     backend = adapters.RemoteBackend()
     seen = []
     published = {'completed': 'native-view'}
+    from types import SimpleNamespace
+    publication = SimpleNamespace(accept=lambda reply: published if reply == {'published': True} else pytest.fail('wrong native proof'))
+    monkeypatch.setattr('vaws_coordinator.native_publication.NativeViewPublication', lambda *args: publication)
     snapshot = {'id': 'accepted', 'records': [
         {'relpath': name, 'scm_version': '2.1', 'source_head': 'accepted-head'}
         for name in ('vllm', 'vllm-ascend')]}
     spec = {'user': 'alice', 'python': '/donor/bin/python',
             'endpoint': {'host': 'local.invalid', 'port': 46001, 'user': 'root', 'root': '/execution'},
+            'host_endpoint': {'host': 'local.invalid', 'port': 22, 'user': 'root'},
             'source_snapshot': snapshot}
     def materialize(**kwargs):
         from vaws_coordinator.preparation_process import PreparationProcess
         assert kwargs['source_snapshot'] is snapshot
         assert kwargs['endpoint'] is spec['endpoint']
         assert isinstance(kwargs['process'], PreparationProcess)
+        assert kwargs['native_publication'] is publication
         seen.append('materialize')
+        if mode == 'uncertain':
+            from vaws_coordinator.preparation_process import PreparationUncertain
+            raise PreparationUncertain('lost composite operation')
+        return {'native_view': {'published': True}} if mode == 'combined' else {}
     monkeypatch.setattr(parity, 'materialize_fixed_sources', materialize)
     from remote_dev.core.ssh_transport import RemoteCompleted
     monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script',
@@ -252,12 +314,27 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
     monkeypatch.setattr(backend, '_write_ready_profile', lambda *a, **k: pytest.fail('hot preparation must not recapture'))
     monkeypatch.setattr(backend, '_shared_native', lambda *a, **k: pytest.fail('hot donor needs no shared cache lookup'))
     progress = []
-    result = backend.prepare_task_root(spec, sources={'vllm': '/local/vllm', 'vllm-ascend': '/local/ascend'},
-        environment={}, source_snapshot=snapshot, reuse={'kind': 'native', 'runtime': {'attestation': {}}},
-        on_progress=lambda event: progress.append(event['step']), on_preparation_job=lambda *a, **k: None)
+    def prepare():
+        return backend.prepare_task_root(spec, sources={'vllm': '/local/vllm', 'vllm-ascend': '/local/ascend'},
+            environment={}, source_snapshot=snapshot, reuse={'kind': 'native', 'runtime': {'attestation': {}}},
+            on_progress=lambda event: progress.append(event['step']), on_preparation_job=lambda *a, **k: None,
+            cancel_requested=lambda: mode == 'cancelled-before')
+    if mode == 'cancelled-before':
+        from vaws_coordinator.preparation_process import PreparationCancelled
+        with pytest.raises(PreparationCancelled):
+            prepare()
+        assert seen == [] and progress == []
+        return
+    if mode == 'uncertain':
+        from vaws_coordinator.preparation_process import PreparationUncertain
+        with pytest.raises(PreparationUncertain):
+            prepare()
+        assert seen == ['prepare-root', 'materialize']
+        return
+    result = prepare()
     assert isinstance(result, adapters.PreparedNativeView) and result.attestation is published
-    assert seen == ['prepare-root', 'materialize', 'publish']
-    assert progress == ['prepare-root', 'materialize', 'publish-native-view']
+    assert seen == (['prepare-root', 'materialize'] if mode == 'combined' else ['prepare-root', 'materialize', 'publish'])
+    assert progress == (['prepare-root', 'materialize'] if mode == 'combined' else ['prepare-root', 'materialize', 'publish-native-view'])
 
 
 @pytest.mark.parametrize('uncertain', [False, True])
