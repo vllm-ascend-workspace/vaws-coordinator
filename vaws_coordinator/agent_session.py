@@ -345,6 +345,19 @@ class AgentSessions:
 def load_context(context_file: str = "", *, allow_native_context: bool = True) -> dict:
     filename = context_file or os.environ.get("VAWS_CONTEXT_FILE", "")
     if not filename:
+        callers = [(client, os.environ.get(key, "").strip()) for client, key in
+                   (("codex", "CODEX_THREAD_ID"), ("grok", "GROK_SESSION_ID"), ("kimi", "KIMI_SESSION_ID"))]
+        callers = [(client, native) for client, native in callers if native]
+        if len(callers) > 1:
+            raise ValueError("conflicting native client identities; pass context_file explicitly")
+        if callers and callers[0][0] != "codex" and allow_native_context:
+            client, native = callers[0]
+            agent = os.environ.get("KIMI_AGENT_ID", "").strip() if client == "kimi" else ""
+            if client == "kimi" and agent == "main":
+                agent = ""
+            # These clients attach before tools run. A later shell cd does not
+            # create a task or change its sources; an unknown child stays unknown.
+            return AgentSessions().native_context(client, native, agent)
         # Codex exposes a native thread id to local commands even when the
         # session hook cannot export VAWS_CONTEXT_FILE to their environment.
         # Resolve only that identity; cwd is attachment metadata, never a key.

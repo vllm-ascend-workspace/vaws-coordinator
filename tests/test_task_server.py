@@ -151,7 +151,7 @@ class DispatchTests(unittest.TestCase):
                            "params": {"name": name, "arguments": {"context_file": self.registry.context_file, **arguments}}})
         self.assertNotIn("error", response, response)
         result = response["result"]
-        self.assertEqual(result["content"][0]["text"], result["structuredContent"]["summary"])
+        self.assertEqual(json.loads(result["content"][0]["text"]), result["structuredContent"])
         return result
 
     def test_vaws_session_is_local_and_the_same_task_answers_twice(self):

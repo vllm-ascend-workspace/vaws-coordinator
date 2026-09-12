@@ -10,7 +10,7 @@ from test_execution_inputs import repo
 @pytest.fixture
 def native_env(tmp_path, monkeypatch):
     for name in ("VAWS_CONTEXT_FILE", "VAWS_PARENT_CONTEXT", "VAWS_ATTACH_CONTEXT",
-                 "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+                 "CODEX_THREAD_ID", "CODEX_SESSION_ID", "GROK_SESSION_ID", "KIMI_SESSION_ID", "KIMI_AGENT_ID"):
         monkeypatch.delenv(name, raising=False)
     state = tmp_path / "sessions"
     monkeypatch.setenv("VAWS_AGENT_SESSIONS_DIR", str(state))
@@ -55,6 +55,65 @@ def test_mcp_does_not_adopt_the_server_process_native_identity(native_env):
     reply = call_tool("vaws_session", {})
     assert reply["isError"]
     assert not native_env.exists()
+
+
+@pytest.mark.parametrize("client,key", [("grok", "GROK_SESSION_ID"), ("kimi", "KIMI_SESSION_ID")])
+def test_native_shell_uses_existing_attachment_after_cd(native_env, monkeypatch, tmp_path, client, key):
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv(key, "actual-native")
+    store = AgentSessions(native_env)
+    expected = store.attach(client, "actual-native", str(tmp_path / "original"))
+    monkeypatch.chdir(tmp_path)
+    assert load_context()["context_file"] == expected["context_file"]
+    assert load_context()["attachment"]["cwd"] == str(tmp_path / "original")
+    monkeypatch.setenv(key, "unknown-native")
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        load_context()
+    assert len(store.sessions()) == 1
+
+
+def test_kimi_native_child_does_not_fall_back_to_parent(native_env, monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv("KIMI_SESSION_ID", "native-kimi")
+    monkeypatch.setenv("KIMI_AGENT_ID", "child")
+    store = AgentSessions(native_env)
+    parent = store.attach("kimi", "native-kimi", str(tmp_path))
+    monkeypatch.setenv("KIMI_AGENT_ID", "main")
+    assert load_context()["context_file"] == parent["context_file"]
+    monkeypatch.setenv("KIMI_AGENT_ID", "child")
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        load_context()
+    child = store.attach("kimi", "native-kimi", str(tmp_path), parent_context=parent["context_file"], agent_id="child")
+    assert load_context()["context_file"] == child["context_file"]
+
+
+def test_kimi_mcp_call_metadata_is_per_call_and_visible_as_text(native_env, monkeypatch, tmp_path):
+    import json
+    from vaws_coordinator.task_server import call_tool
+    store = AgentSessions(native_env)
+    first = store.attach("kimi", "first", str(tmp_path))
+    second = store.attach("kimi", "second", str(tmp_path))
+    for native, expected in (("first", first), ("second", second), ("first", first)):
+        reply = call_tool("vaws_session", {"full": True}, {"kimi_code/session_id": native, "kimi_code/agent_id": "main"})
+        assert not reply["isError"]
+        assert reply["structuredContent"]["data"]["session"]["id"] == expected["session"]["id"]
+        assert json.loads(reply["content"][0]["text"]) == reply["structuredContent"]
+    with pytest.raises(ValueError, match="differs from this native Kimi caller"):
+        call_tool("vaws_session", {"context_file": first["context_file"]}, {"kimi_code/session_id": "second"})
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        call_tool("vaws_session", {}, {"kimi_code/session_id": "first", "kimi_code/agent_id": "unknown-child"})
+
+
+def test_kimi_nested_agent_hooks_keep_exact_parent(native_env, tmp_path):
+    from vaws_coordinator.hooks.vaws_session import handle
+    store = AgentSessions(native_env)
+    base = {"session_id": "native-kimi", "cwd": str(tmp_path)}
+    handle("kimi", {**base, "hook_event_name": "SessionStart", "agent_id": "main"}, store)
+    handle("kimi", {**base, "hook_event_name": "SubagentStart", "agent_id": "child", "parent_agent_id": "main"}, store)
+    handle("kimi", {**base, "hook_event_name": "SubagentStart", "agent_id": "grandchild", "parent_agent_id": "child"}, store)
+    child = store.native_context("kimi", "native-kimi", "child")
+    grandchild = store.native_context("kimi", "native-kimi", "grandchild")
+    assert grandchild["attachment"]["parent_id"] == child["attachment"]["id"]
 
 
 def test_native_status_preserves_a_finished_task(native_env):

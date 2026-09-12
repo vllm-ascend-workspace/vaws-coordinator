@@ -120,7 +120,8 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         context = bind_native_defaults(store, context)
     elif normalized in {"subagentstart", "subagentstop"}:
         parent_native = str(payload.get("parent_conversation_id") or payload.get("parentSessionId") or native)
-        parent = store.native_context(client, parent_native)
+        parent_agent = str(payload.get("parent_agent_id") or "") if client == "kimi" else ""
+        parent = store.native_context(client, parent_native, "" if parent_agent == "main" else parent_agent)
         child = str(payload.get("agent_id") or payload.get("subagent_id") or payload.get("subagentId") or "")
         if not child:
             raise ValueError("client omitted the child id; do not invent a native session from its display name")
@@ -131,6 +132,8 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         context = bind_native_defaults(store, context)
     else:
         agent_id = str(payload.get("agent_id") or "")
+        if client == "kimi" and agent_id == "main":
+            agent_id = ""
         try:
             context = store.native_context(client, native, agent_id)
         except ValueError:
