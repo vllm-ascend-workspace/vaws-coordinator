@@ -107,14 +107,35 @@ class AgentSessions:
         context = self.context(attachment_id)
         path = Path(context["context_file"])
         path.parent.mkdir(exist_ok=True, mode=0o700)
+        reference = {key: context[key] for key in ("schema_version", "state_dir")} | {"attachment_id": attachment_id}
+
+        def already_published():
+            try:
+                return json.loads(path.read_text(encoding="utf-8")) == reference
+            except (OSError, ValueError):
+                return False
+
+        # The file is an immutable reference; current state comes from SQLite.
+        # Reusing it also permits Windows readers to keep the file open.
+        if already_published():
+            return context
         temporary = path.with_suffix("." + uuid.uuid4().hex + ".tmp")
-        with temporary.open("x") as stream:
-            os.chmod(temporary, 0o600)
-            json.dump({key: context[key] for key in ("schema_version", "state_dir")}
-                      | {"attachment_id": attachment_id}, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                os.chmod(temporary, 0o600)
+                json.dump(reference, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.replace(temporary, path)
+            except PermissionError:
+                # Another process may have published the same reference since
+                # our check. Only that complete result makes a denied replace
+                # successful; unrelated access failures must still propagate.
+                if not already_published():
+                    raise
+        finally:
+            temporary.unlink(missing_ok=True)
         return context
 
     def attach(self, client: str, native_session_id: str, cwd: str, *, parent_context: str = "",
