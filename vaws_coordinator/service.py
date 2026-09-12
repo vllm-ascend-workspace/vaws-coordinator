@@ -822,7 +822,7 @@ class CoordinatorService(TaskMessages):
                 "port": int(host_info.get("port") or 22),
                 "user": host_info.get("user") or "root",
             }
-            if not ssh_port:
+            if not ssh_port or recipe:
                 if not recipe:
                     # An existing configured container needs no image choice.
                     # Creating a container still requires an explicit recipe.
@@ -843,6 +843,10 @@ class CoordinatorService(TaskMessages):
                 result = provision_user_container(
                     host=host_ip, image=recipe, user=user,
                     host_user=host_endpoint["user"], host_port=host_endpoint["port"],
+                    # A configured name/port does not prove the requested
+                    # image. The provision owner verifies existing containers
+                    # and rejects mismatches without replacing them.
+                    ssh_port=int(ssh_port) if ssh_port else None,
                     machine_type=machine_type or environment.get("machine_type"),
                     machines=getattr(self.backend, "machines", None),
                     reserve_port=reserve_port,
