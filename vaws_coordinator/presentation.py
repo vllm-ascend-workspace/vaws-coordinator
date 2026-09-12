@@ -7,7 +7,8 @@ from pathlib import Path
 EXECUTION_KEYS = ("execution_id", "state", "service", "error", "error_ref", "reason", "progress",
                   "source_snapshot_id", "sources", "role_progress",
                   "observed_at", "cancel_requested", "service_port", "provisioning_started",
-                  "worktrees_preserved", "resources_released", "stdout", "stderr", "observation_freshness")
+                  "worktrees_preserved", "resources_released", "stdout", "stderr", "observation_freshness",
+                  "runtime_update", "active_executions")
 ROLE_KEYS = ("name", "state", "runtime_id", "host", "root", "service_port", "error", "lease_state",
              "quiet", "descendants_drained", "stdout", "stderr", "status_observed_at")
 
@@ -53,6 +54,8 @@ def compact_runtime(runtime):
     if not isinstance(runtime, dict) or not runtime or set(runtime) - {"client", "daemon"}:
         return runtime
     packages = {}
+    identities = {}
+    python = None
     for records in runtime.values():
         if not isinstance(records, list) or not records:
             return runtime
@@ -63,12 +66,17 @@ def compact_runtime(runtime):
             if not isinstance(loaded, dict):
                 return runtime
             package, version = loaded.get("package"), loaded.get("version")
-            if record.get("status") != "current" or not package or not version:
+            if record.get("status") != "current" or not package or not version or not loaded.get("python"):
                 return runtime
-            if package in packages and packages[package] != version:
+            identity = (version, loaded.get("commit"), loaded.get("location"))
+            if package in identities and identities[package] != identity:
                 return runtime
-            packages[package] = version
-    return {"status": "current", "packages": packages}
+            if python is not None and python != loaded["python"]:
+                return runtime
+            identities[package] = identity
+            packages[package] = {"version": version, "commit": loaded.get("commit")}
+            python = loaded["python"]
+    return {"status": "current", "packages": packages, "python": python}
 
 
 def present(result: dict, directory: Path, *, full=False, target=False) -> dict:

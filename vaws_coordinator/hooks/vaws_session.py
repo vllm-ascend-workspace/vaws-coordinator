@@ -35,6 +35,19 @@ def task_tool(name: str) -> bool:
     return any(name == tool or name.endswith(("__" + tool, ":" + tool)) for tool in TASK_TOOLS)
 
 
+def context_tool(name: str, client: str = "") -> bool:
+    """Include companion calls only when the native name identifies their provider."""
+    if task_tool(name):
+        return True
+    # Cursor names the tool resolved by its MCP configuration without a
+    # provider prefix. The native dispatcher owns that name resolution.
+    if client == "cursor" and re.fullmatch(r"MCP:(?:knowledge_(?:query|explain|capture)|remote_[a-z_]+)", name):
+        return True
+    return bool(re.fullmatch(
+        r"(?:MCP:)?(?:mcp__)?(?:vaws[-_]knowledge__knowledge_(?:query|explain|capture)"
+        r"|remote[-_]dev__remote_[a-z_]+)", name))
+
+
 def attach_native(store: AgentSessions, client: str, native: str, cwd: str) -> tuple[AgentSessions, dict]:
     parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
     association = os.environ.get("VAWS_ATTACH_CONTEXT", "")
@@ -100,7 +113,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         # Cursor SessionStart is asynchronous. Only a VAWS MCP call needs its
         # local attachment recovered here; ordinary native tools stay untouched.
         arguments = payload.get("tool_input", {})
-        if (not task_tool(str(payload.get("tool_name") or ""))
+        if (not context_tool(str(payload.get("tool_name") or ""), client)
                 or not isinstance(arguments, dict) or arguments.get("context_file")):
             return {}
     native = str((payload.get("conversation_id") if client == "cursor" else "")
@@ -144,7 +157,11 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         if normalized == "sessionend":
             store.detach(context)
             return {}
-        if normalized in {"userpromptsubmit", "beforesubmitprompt"} and context["attachment"]["cwd"] != str(Path(cwd).resolve()):
+        refresh_cwd = normalized in {"userpromptsubmit", "beforesubmitprompt"} or (
+            client == "claude" and normalized == "pretooluse" and bool(payload.get("cwd")))
+        if refresh_cwd and context["attachment"]["cwd"] != str(Path(cwd).resolve()):
+            # EnterWorktree can move Claude during one prompt. Its next tool
+            # carries the new native cwd; do not wait for another user prompt.
             context = store.attach(client, native, str(cwd), agent_id=context["attachment"].get("agent_id") or "")
             context = bind_native_defaults(store, context)
 
@@ -155,9 +172,12 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         # redundant context instruction on every prompt. Official legacy Kimi
         # omits agent_id and still needs the text fallback below.
         return {}
+    defaults = context["source_defaults"]
+    paths = {name: source["path"] for name, source in defaults["sources"].items()}
     hint = ("VAWS task automatically attached to this native session. Context:\n" + context["context_file"] + "\n"
-            "No session-creation call is needed. Native hooks supply context_file to supported task tools; "
-            "otherwise use this context. Local editing needs no remote resources. "
+            f"Source defaults ({defaults['origin']}): {json.dumps(paths, ensure_ascii=False)}\n"
+            "Client startup owns workspace and component preparation. "
+            "Native hooks supply context_file to supported VAWS tools; otherwise use this context. "
             "For a child or authorized cross-tool handoff, pass this context explicitly.")
     if normalized == "pretooluse":
         name = str(payload.get("tool_name") or payload.get("toolName") or "")
@@ -175,7 +195,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
                 name = nested_name
                 nested_key = "tool_input" if "tool_input" in arguments else "toolInput"
                 nested_arguments = arguments.get(nested_key) or {}
-        if task_tool(name) and client in {"claude", "codex", "grok", "cursor"}:
+        if context_tool(name, client) and client in {"claude", "codex", "grok", "cursor"}:
             if not isinstance(nested_arguments, dict) or nested_arguments.get("context_file"):
                 return {}
             updated = {**nested_arguments, "context_file": context["context_file"]}
