@@ -182,19 +182,36 @@ print(json.dumps({'pid':matches[0]}))
             if self.inspect(runtime, snapshots=snapshots) != expected:
                 raise ValueError("runtime changed before launch")
             return True
-        info = self._inspect_container(runtime)
-        if info["Id"] != expected.get("container_id"):
-            raise ValueError("runtime container changed before launch")
         manifest = {key: value for key, value in expected.items()
                     if key not in {"container_id", "launch_preamble"}}
         if launch_preamble(manifest["profile"], python=runtime.get("python")) != expected.get("launch_preamble"):
             raise ValueError("runtime launch environment changed before launch")
         expected_digest = digest(manifest)
-        reply = self._inspect_manifest(runtime, snapshots=snapshots,
-                                       expected_digest=expected_digest,
-                                       prepared_view=runtime.get('prepared_native_view', False))
-        if reply != {"manifest_digest": expected_digest}:
-            raise ValueError("runtime verification returned no matching manifest digest")
+
+        def check_container():
+            info = self._inspect_container(runtime)
+            if info["Id"] != expected.get("container_id"):
+                raise ValueError("runtime container changed before launch")
+
+        def check_manifest():
+            reply = self._inspect_manifest(runtime, snapshots=snapshots,
+                                           expected_digest=expected_digest,
+                                           prepared_view=runtime.get('prepared_native_view', False))
+            if reply != {"manifest_digest": expected_digest}:
+                raise ValueError("runtime verification returned no matching manifest digest")
+
+        # These read-only observations have no data dependency. Keep both in
+        # this preflight (never across queue waits), and drain both operations
+        # before allowing host preflight or reporting any failure.
+        from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="vaws-preflight") as workers:
+            checks = [workers.submit(copy_context().run, check) for check in (check_container, check_manifest)]
+        errors = [check.exception() for check in checks if check.exception() is not None]
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("runtime preflight checks failed: " + "; ".join(map(str, errors)), errors)
         return True
 
     def _inspect_manifest(self, runtime, *, snapshots=None, expected_digest=None, prepared_view=False):

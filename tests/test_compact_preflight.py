@@ -145,12 +145,12 @@ def test_complete_profile_verification_precedes_digest_confirmation(prepared_vie
         backend.verify_preflight(runtime, snapshots=snapshots)
 
 
-def test_container_replacement_rejects_before_manifest_probe(prepared_view):
+def test_container_replacement_rejects_even_when_manifest_probe_succeeds(prepared_view):
     backend, runtime, snapshots, _marker, _manifest = prepared_view
     backend.container["Id"] = "replacement-container"
     with pytest.raises(ValueError, match="runtime container changed"):
         backend.verify_preflight(runtime, snapshots=snapshots)
-    assert backend.requests == []
+    assert len(backend.requests) == 1
 
 
 def test_derived_launch_preamble_must_equal_registered_value(prepared_view):
