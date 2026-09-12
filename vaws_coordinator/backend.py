@@ -18,7 +18,7 @@ from remote_dev.core.shell_ops import remote_bash
 
 from vaws_coordinator.host_queue import HostQueue
 from vaws_coordinator.machine_directory import MachineDirectory
-from vaws_coordinator.runtime_profile import launch_preamble
+from vaws_coordinator.runtime_profile import digest, launch_preamble
 
 
 def _package_file(relative: str) -> Path:
@@ -131,17 +131,21 @@ print(json.dumps({'pid':matches[0]}))
             raise RuntimeError(message)
         return Path(result["refs"]["stdout"]).read_text()
 
-    def inspect(self, runtime, *, idle=False, snapshots=None):
-        # idle remains an inspect of the selected prepared root and container
-        # identity. It must not require the whole user container to be empty:
-        # sibling roots may have authorized executions.
-        del idle
+    def _inspect_container(self, runtime):
         host = {**runtime["host_endpoint"], "root": "/", "cwd": "/"}
         name = shlex.quote(runtime["container_name"])
         fields = shlex.quote('{"Id":{{json .Id}},"State":{{json .State}}}')
         info = json.loads(self.bash(host, f"docker inspect --format {fields} {name}"))
         if not info["State"]["Running"] or info["State"].get("Paused") or info["State"].get("Restarting"):
             raise RuntimeError("prepared container is not running normally")
+        return info
+
+    def inspect(self, runtime, *, idle=False, snapshots=None):
+        # idle remains an inspect of the selected prepared root and container
+        # identity. It must not require the whole user container to be empty:
+        # sibling roots may have authorized executions.
+        del idle
+        info = self._inspect_container(runtime)
         if runtime.get('reuse_only'):
             observed = self.qualify_prepared_inputs(runtime, runtime['source_snapshot'], include_manifest=True)
             if not observed.get('qualified'):
@@ -149,10 +153,44 @@ print(json.dumps({'pid':matches[0]}))
             manifest = observed['manifest']
             return {**manifest, 'container_id': info['Id'],
                     'launch_preamble': launch_preamble(manifest['profile'], python=runtime['python'])}
+        manifest = self._inspect_manifest(runtime, snapshots=snapshots)
+        return {**manifest, "container_id": info["Id"],
+                "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
+
+    def verify_preflight(self, runtime, *, snapshots=None):
+        """Verify the complete registered view with a compact remote reply.
+
+        All remote checks are shared with inspect. Only its output differs:
+        a digest confirms equality of the entire manifest, while the live
+        container and the derived launch preamble are compared separately.
+        """
+        expected = runtime["attestation"]
+        if runtime.get('reuse_only'):
+            # Historical donor qualification has its own source-tree contract.
+            # Such roots are not managed bindings; retain its complete probe.
+            if self.inspect(runtime, snapshots=snapshots) != expected:
+                raise ValueError("runtime changed before launch")
+            return True
+        info = self._inspect_container(runtime)
+        if info["Id"] != expected.get("container_id"):
+            raise ValueError("runtime container changed before launch")
+        manifest = {key: value for key, value in expected.items()
+                    if key not in {"container_id", "launch_preamble"}}
+        if launch_preamble(manifest["profile"], python=runtime.get("python")) != expected.get("launch_preamble"):
+            raise ValueError("runtime launch environment changed before launch")
+        expected_digest = digest(manifest)
+        reply = self._inspect_manifest(runtime, snapshots=snapshots,
+                                       expected_digest=expected_digest)
+        if reply != {"manifest_digest": expected_digest}:
+            raise ValueError("runtime verification returned no matching manifest digest")
+        return True
+
+    def _inspect_manifest(self, runtime, *, snapshots=None, expected_digest=None):
         python = runtime.get("python") or "python3"
         module = _package_file("runtime_profile.py").read_text()
         request = json.dumps({"root": runtime["endpoint"].get("cwd") or runtime["endpoint"]["root"],
-                              "snapshots": snapshots or {}})
+                              "snapshots": snapshots or {},
+                              **({"expected_manifest_digest": expected_digest} if expected_digest is not None else {})})
         build_source = _package_file("build_inputs.py").read_text()
         runner = "\n_build_namespace = {}\nexec(" + repr(build_source) + ", _build_namespace)\n" + '''
 import subprocess
@@ -172,16 +210,20 @@ for name, expected in args["snapshots"].items():
     extras = [path for path in untracked.split("\\0") if path and path.split("/", 1)[0] not in private]
     if head != expected or dirty.strip() or extras:
         raise ValueError("runtime source differs from pinned snapshot: " + name)
-print(json.dumps(manifest))
+if 'expected_manifest_digest' in args:
+    actual_digest = digest(manifest)
+    if actual_digest != args['expected_manifest_digest']:
+        raise ValueError('runtime changed before launch')
+    print(json.dumps({'manifest_digest': actual_digest}))
+else:
+    print(json.dumps(manifest))
 '''
         view = runtime['endpoint'].get('cwd') or runtime['endpoint']['root']
         # Interpreter metadata must resolve the execution view's overlay too.
         prefix = 'export PYTHONPATH=' + shlex.quote(':'.join([view + '/.vaws-runtime/metadata', view + '/vllm', view + '/vllm-ascend'])) + '"${PYTHONPATH:+:$PYTHONPATH}"\n'
         command = (prefix + shlex.quote(python) + " - " + shlex.quote(request)
                    + " <<'VAWS_READY_PROBE'\n" + module + runner + "\nVAWS_READY_PROBE\n")
-        manifest = json.loads(self.bash(runtime["endpoint"], command))
-        return {**manifest, "container_id": info["Id"],
-                "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
+        return json.loads(self.bash(runtime["endpoint"], command))
 
     def qualify_prepared_inputs(self, runtime, source_snapshot, *, include_manifest=False):
         """Read-only qualification of a historical verified exact-source donor.

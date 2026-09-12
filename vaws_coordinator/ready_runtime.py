@@ -590,9 +590,14 @@ class RuntimePool(ManagedExecution):
                 else:
                     if action == "preflight":
                         try:
-                            observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
-                            if observed != runtime["attestation"]:
-                                raise ValueError("runtime changed before launch")
+                            compact_verify = getattr(self.backend, "verify_preflight", None) if _managed else None
+                            if callable(compact_verify):
+                                if compact_verify(runtime, snapshots=run["intent"]["snapshots"]) is not True:
+                                    raise ValueError("runtime verification did not confirm the registered view")
+                            else:
+                                observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
+                                if observed != runtime["attestation"]:
+                                    raise ValueError("runtime changed before launch")
                         except Exception as exc:
                             if _managed:
                                 # This read-only validation precedes host
