@@ -87,7 +87,7 @@ def provision_user_container(
         stream_progress=False,
     )
     probe_payload = host_ops.assert_remote_success(probe, require_payload=True)
-    chosen_port = int(ssh_port or probe_payload.get("suggested_port") or probe_payload.get("ssh_port")
+    chosen_port = int(ssh_port or probe_payload.get("free_port") or probe_payload.get("suggested_port") or probe_payload.get("ssh_port")
                       or probe_payload.get("container_ssh_port") or 0)
     if chosen_port <= 0:
         raise host_ops.MachineManagementError("host probe did not offer a container SSH port")
