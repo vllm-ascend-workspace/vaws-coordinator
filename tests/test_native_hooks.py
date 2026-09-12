@@ -2,11 +2,14 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from unittest.mock import Mock
+import io
+import json
 
 import pytest
 
 from vaws_coordinator.agent_session import AgentSessions
 from vaws_coordinator.hooks.vaws_session import handle
+from vaws_coordinator.hooks.vaws_session import main
 from test_execution_inputs import repo
 
 
@@ -121,3 +124,32 @@ def test_grok_message_dispatcher_keeps_its_nested_envelope(tmp_path):
                              "toolName": "use_tool", "toolInput": nested}, store)
     assert output == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {
         **nested, "tool_input": {**arguments, "context_file": context["context_file"]}}}}
+
+
+@pytest.mark.parametrize("agent", [None, "main", "agent-1"])
+def test_kimi_extension_prompt_updates_cwd_silently_while_legacy_keeps_context(tmp_path, monkeypatch, capsys, agent):
+    before, after = repo(tmp_path / "before"), repo(tmp_path / "after")
+    store = AgentSessions(tmp_path / "sessions")
+    handle("kimi", {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(before)}, store)
+    if agent == "agent-1":
+        handle("kimi", {"hook_event_name": "SubagentStart", "session_id": "native", "agent_id": agent,
+                        "parent_agent_id": "main", "cwd": str(before)}, store)
+    native_agent = agent if agent == "agent-1" else ""
+    original = store.native_context("kimi", "native", native_agent)
+    payload = {"hook_event_name": "UserPromptSubmit", "session_id": "native", "cwd": str(after)}
+    if agent:
+        payload["agent_id"] = agent
+    monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.AgentSessions", lambda: store)
+    monkeypatch.setattr("sys.argv", ["hook", "--client", "kimi"])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    capsys.readouterr()
+    assert main() == 0
+    text = capsys.readouterr().out.strip()
+    if agent:
+        assert text == ""
+    else:
+        assert original["context_file"] in text
+    current = store.native_context("kimi", "native", native_agent)
+    assert current["session"]["id"] == original["session"]["id"]
+    assert current["attachment"]["cwd"] == str(after)
+    assert {source["path"] for source in current["source_defaults"]["sources"].values()} == {str(after)}

@@ -149,6 +149,12 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             context = bind_native_defaults(store, context)
 
     context = store.bind_configured_user(context)
+    if client == "kimi" and normalized == "userpromptsubmit" and payload.get("agent_id"):
+        # The SessionSetup extension supplies this native agent id alongside
+        # MCP call metadata. Keep cwd/user binding above, without appending a
+        # redundant context instruction on every prompt. Official legacy Kimi
+        # omits agent_id and still needs the text fallback below.
+        return {}
     hint = ("VAWS task automatically attached to this native session. Context:\n" + context["context_file"] + "\n"
             "No session-creation call is needed. Native hooks supply context_file to supported task tools; "
             "otherwise use this context. Local editing needs no remote resources. "
