@@ -289,8 +289,8 @@ an unknown transport or ownership outcome remains uncertain. A restarted daemon
 can observe and stop these retained jobs without replaying preparation or
 replacing sources beneath a compiler. Queued preparation can cancel while
 another execution holds the host's preparation lock. Tail includes the current
-local preparation log. Source materialization retains its existing bounded
-upload/command deadlines and checks cancellation at its completion boundary.
+local preparation log. Fixed source materialization runs as an owned preparation
+job with bounded upload/command deadlines and cancellation support.
 Completed build-compatibility failures end preparation before editable installs
 and do not retry automatically. Completed source-sync failures retain their
 original cause; lost transport remains uncertain. Remote profile paths are
@@ -300,10 +300,14 @@ export SoC/compiler variables, attestation reads those build selections from
 the latest completed installer log and hashes that log as profile evidence.
 Incomplete or conflicting evidence stays an error.
 
-Managed source materialization checks current remote HEADs and tracked and
-untracked changes under the container lock. When every repository already
-matches the newly computed local snapshot, it skips mirror transport and reset.
-Runtime compatibility, native build checks and resource allocation still run.
+Managed source materialization consumes the admitted Git snapshot directly in
+one remote operation. Existing immutable mirror objects are reused; a completed
+missing-object response uploads only those objects before a new owned job.
+Each execution retains independent working files, a stable per-root lock, and
+final HEAD and dirty-state checks across parent repositories and submodules.
+Uncertain jobs are observed, never replayed. Runtime compatibility, native
+build checks and resource allocation still run. Host coordination uses the
+remote-dev Python RPC code cache, sending only the request after the first call.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;
