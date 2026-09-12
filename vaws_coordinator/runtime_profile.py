@@ -171,6 +171,59 @@ def installed_native_files(root: Path) -> dict[str, str]:
     return files
 
 
+def native_vendor_paths(files: dict) -> dict[str, list[str]]:
+    """Derive custom-op loader directories from the complete native file set."""
+    vendors, libraries = set(), set()
+    for relative in files:
+        path = PurePosixPath(relative)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError('unsafe native vendor artifact: ' + relative)
+        parts = path.parts
+        for index in range(len(parts) - 3):
+            if parts[index:index + 2] != ('_cann_ops_custom', 'vendors'):
+                continue
+            vendor = PurePosixPath(*parts[:index + 3])
+            vendors.add(vendor.as_posix())
+            if (parts[index + 3:index + 5] == ('op_api', 'lib') and
+                    (path.suffix == '.so' or '.so.' in path.name)):
+                libraries.add((vendor / 'op_api/lib').as_posix())
+    return {'ASCEND_CUSTOM_OPP_PATH': sorted(vendors), 'LD_LIBRARY_PATH': sorted(libraries)}
+
+
+def native_vendor_launch_environment(root: Path, files: dict, environment: dict[str, str]) -> dict[str, str]:
+    """Make owned custom-op APIs visible when the native process is created."""
+    result = dict(environment)
+    for key, paths in native_vendor_paths(files).items():
+        if paths:
+            owned = [(root.resolve() / path).as_posix() for path in paths]
+            result[key] = ':'.join(dict.fromkeys([*owned, *filter(None, result.get(key, '').split(':'))]))
+    return result
+
+
+def native_import_smoke(root: Path, profile: dict, inputs: dict) -> dict:
+    """Import in a new process so the loader sees the final owned environment."""
+    import subprocess
+    import sys
+    import time
+    started = time.monotonic()
+    command = '''import json, pathlib, sys, importlib.metadata
+import torch_npu, vllm, vllm_ascend, acl
+import vllm_ascend.vllm_ascend_C as extension
+root = pathlib.Path(sys.argv[1]).resolve()
+paths = {'vllm': pathlib.Path(vllm.__file__).resolve(), 'vllm_ascend': pathlib.Path(vllm_ascend.__file__).resolve(), 'extension': pathlib.Path(extension.__file__).resolve()}
+if not all(path.is_relative_to(root) for path in paths.values()):
+    raise ValueError('imports escaped the execution source view: ' + str(paths))
+print(json.dumps({'python': sys.executable, 'imports': {k: str(v) for k,v in paths.items()}, 'vllm': importlib.metadata.version('vllm'), 'vllm_ascend': importlib.metadata.version('vllm-ascend')}))
+'''
+    result = subprocess.run([sys.executable, '-c', command, str(root)],
+                            env={**os.environ, **profile['launch_env']},
+                            capture_output=True, text=True, encoding='utf-8', timeout=30)
+    return {'passed': result.returncode == 0, 'python_import_executed': True,
+            'profile_key': profile_key(profile), 'build_inputs': inputs,
+            'stdout': result.stdout[-4000:], 'stderr': result.stderr[-8000:],
+            'elapsed_seconds': time.monotonic() - started}
+
+
 def profile_key(profile: dict[str, Any]) -> str:
     if profile.get('kind') == 'command':
         if not all(isinstance(profile.get(key), str) and profile[key] for key in ('image_digest', 'python_abi')):
@@ -268,6 +321,7 @@ def native_compatibility_key(manifest: dict[str, Any]) -> str:
     root = manifest['runtime_root'].replace('\\', '/').rstrip('/')
     overlays = (root + '/.vaws-runtime/metadata', root + '/vllm', root + '/vllm-ascend')
     native_root = root + '/vllm-ascend/vllm_ascend'
+    vendors = [root + '/' + path for path in native_vendor_paths(manifest['files'])['ASCEND_CUSTOM_OPP_PATH']]
     loader_environment = {}
     for name, value in profile['launch_env'].items():
         if name == 'PATH':
@@ -286,6 +340,8 @@ def native_compatibility_key(manifest: dict[str, Any]) -> str:
             elif name != 'PYTHONPATH' and (part in {native_root, native_root + '/_cann_ops_custom'}
                                             or part.startswith(native_root + '/_cann_ops_custom/')):
                 part = '$EXECUTION_NATIVE_ROOT' + part[len(native_root):]
+            elif name != 'PYTHONPATH' and any(part == vendor or part.startswith(vendor + '/') for vendor in vendors):
+                part = '$EXECUTION_ROOT' + part[len(root):]
             if part and part not in parts:
                 parts.append(part)
         loader_environment[name] = ':'.join(parts)

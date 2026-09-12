@@ -378,6 +378,7 @@ def native_view_launch_environment(manifest: dict, root: Path) -> dict:
     destination = root.as_posix().rstrip('/')
     overlays = {source + suffix for suffix in ('/.vaws-runtime/metadata', '/vllm', '/vllm-ascend')}
     native = source + '/vllm-ascend/vllm_ascend'
+    vendors = [source + '/' + path for path in native_vendor_paths(manifest['files'])['ASCEND_CUSTOM_OPP_PATH']]
     result = dict(manifest['profile']['launch_env'])
     for key in ('PYTHONPATH', 'LD_LIBRARY_PATH', 'ASCEND_CUSTOM_OPP_PATH'):
         parts = []
@@ -385,7 +386,8 @@ def native_view_launch_environment(manifest: dict, root: Path) -> dict:
             if key == 'PYTHONPATH' and part in overlays:
                 part = destination + part[len(source):]
             elif key != 'PYTHONPATH' and (part in {native, native + '/_cann_ops_custom'}
-                                         or part.startswith(native + '/_cann_ops_custom/')):
+                                         or part.startswith(native + '/_cann_ops_custom/')
+                                         or any(part == vendor or part.startswith(vendor + '/') for vendor in vendors)):
                 part = destination + part[len(source):]
             if part and part not in parts:
                 parts.append(part)
@@ -394,7 +396,7 @@ def native_view_launch_environment(manifest: dict, root: Path) -> dict:
             parts = list(dict.fromkeys([*current, *parts]))
         if parts:
             result[key] = ':'.join(parts)
-    return result
+    return native_vendor_launch_environment(root, manifest['files'], result)
 
 
 def prepare_native_view(root: Path, source_root: Path, donor: dict, args: dict) -> dict:
@@ -439,7 +441,20 @@ def prepare_native_view(root: Path, source_root: Path, donor: dict, args: dict) 
     smoke = {'kind': 'native-compatibility-reuse', 'python_import_executed': False,
              'profile_key': current['profile_key'], 'build_inputs': current['build_inputs'],
              'compatibility': compatibility, 'source_mapping': mapping}
-    verify_native_compatibility(root, current, smoke, check_environment=False)
+    upgraded_loader = (native_vendor_launch_environment(source_root, donor['files'], donor['profile']['launch_env'])
+                       != donor['profile']['launch_env'])
+    if upgraded_loader and compatibility['key'] != native_compatibility_key(current):
+        # Historical imports did not prove this loader environment. Upgrade
+        # only the owned view, and keep the one-time import cost explicit.
+        smoke = native_import_smoke(root, profile, current['build_inputs'])
+        smoke.update(reason='native-loader-environment-upgrade', source_mapping=mapping)
+        if not smoke['passed']:
+            failed = safe_destination(root, '.vaws-runtime/profile-evidence/smoke.json')
+            failed.parent.mkdir(parents=True, exist_ok=True)
+            failed.write_text(json.dumps(smoke, sort_keys=True, indent=2) + '\n')
+            raise ValueError('owned native loader upgrade import smoke failed; inspect profile-evidence/smoke.json')
+    else:
+        verify_native_compatibility(root, current, smoke, check_environment=False)
     evidence = {}
     for name in ('cann', 'driver'):
         row = donor['evidence'][name]
