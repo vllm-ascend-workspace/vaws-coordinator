@@ -176,6 +176,7 @@ def test_materializer_accounts_for_entire_composite_before_inline_pack(monkeypat
     assert 'native_view' not in result and len(commands) == 1
 
 
+@pytest.mark.skipif(sys.platform != 'linux', reason='executes the Linux container worker with /proc process identities')
 def test_backend_prepares_missing_root_before_real_owned_worker_launch_and_quiet(donor, monkeypatch):
     from remote_dev.core.ssh_transport import RemoteCompleted
     from remote_dev.processes.client import worker_source
