@@ -120,6 +120,13 @@ source_root = Path(args['source_root'])
 manifest = json.loads((source_root / '.vaws-runtime/ready-profile.json').read_text())
 if args['kind'] == 'native':
     result = copy_native_view(root, source_root, manifest, args['versions'])
+    compatibility = native_compatibility_receipt(source_root, manifest)
+    if compatibility is not None:
+        relative = '.vaws-runtime/profile-evidence/native-compatibility.json'
+        proof = safe_destination(root, relative)
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text(json.dumps(compatibility, sort_keys=True) + '\n')
+        result['compatibility_evidence'] = relative
 else:
     verify(source_root, manifest)
     source_site = Path(sysconfig.get_paths()['purelib'])

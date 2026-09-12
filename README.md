@@ -172,6 +172,16 @@ path. This prevents repository directories
 in the task cwd from shadowing editable packages, while preserving the CANN
 and other support paths already supplied by the environment.
 
+The first native environment and rebuilt outputs receive a full framework
+import smoke. A fresh Python source view can reuse that original evidence when
+its dependency/native inputs, loader environment and complete artifact hashes
+match; preparation checks the current module and SCM metadata mappings without
+importing the changed business code. Its receipt explicitly records
+`python_import_executed=false`, keeps the original import result, and makes no
+claim that the new Python source passed. The business execution reports its own
+result. Incomplete old evidence or cwd-dependent loader paths retain the full
+import check.
+
 For serving, `service_port=0` asks the host coordinator to select a free port.
 If a task runtime has no declared service ports, automatic selection uses the
 host's default serving range (30000–45999). A nonempty declaration restricts
