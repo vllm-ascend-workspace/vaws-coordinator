@@ -1,4 +1,4 @@
-"""Stdio MCP server for the four task-facing tools.
+"""Stdio MCP server for task lifecycle and optional coordination messages.
 
 `vaws_session`, `vaws_run`, `vaws_execution` and `vaws_finish` are coordinator
 semantics. This process is their home. It is local-first: `vaws_session` and
@@ -25,8 +25,9 @@ PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 ALIASES = {name.replace(".", "_"): name for name in TOOL_SCHEMAS}
 INSTRUCTIONS = (
     "VAWS task tools. Pass the context_file supplied by the native session "
-    "hook; never guess a task from cwd or history. vaws_session and "
-    "vaws_finish are local. vaws_run uses this process's local runtime pool."
+    "hook; never guess a task from cwd or history. Sessions with no managed "
+    "hosts stay local. Normal run/status calls receive coordination messages "
+    "opportunistically; use vaws_message only for a substantive request or reply."
 )
 
 

@@ -20,6 +20,7 @@ from vaws_coordinator.provision.task_environment import (  # noqa: F401
     task_runtime_id,
 )
 from vaws_coordinator.ready_runtime import safe_id, user_container_name
+from vaws_coordinator.user_identity import load_github_identity
 
 DEFAULT_WORKDIR = host_ops.DEFAULT_WORKDIR
 
@@ -43,7 +44,8 @@ def provision_user_container(
     reserve_port=None,
 ) -> dict[str, Any]:
     """Create or reuse `vaws-<user>` on `host` from a named image/recipe."""
-    user = safe_id(user or getpass.getuser())
+    identity = load_github_identity() if not user else None
+    user = safe_id(user or (identity["login"] if identity else getpass.getuser()))
     container = user_container_name(user)
     if not image or image in getattr(host_ops, "LEGACY_IMAGE_SELECTORS", {"auto"}):
         raise ValueError(

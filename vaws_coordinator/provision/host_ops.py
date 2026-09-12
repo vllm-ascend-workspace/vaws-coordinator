@@ -1237,7 +1237,7 @@ for item in required:
     if not exists:
         result["missing_required_paths"].append(item)
 
-for item in ["/home", "/tmp", "/weight", "/data", "/mnt"]:
+for item in ["/home", "/tmp", "/weight", "/weights", "/models", "/data", "/mnt"]:
     if pathlib.Path(item).exists():
         result["optional_mounts"].append(item)
 
@@ -2318,7 +2318,7 @@ else
   fi
 
   mount_args=()
-  for optional in /home /tmp /weight /data /mnt; do
+  for optional in /home /tmp /weight /weights /models /data /mnt; do
     if [ -e "$optional" ]; then
       mount_args+=("-v" "$optional:$optional")
     fi

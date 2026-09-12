@@ -185,6 +185,38 @@ class AgentSessions:
                              "task context file explicitly (context_file argument or VAWS_CONTEXT_FILE)")
         return self.context(matches[0]["id"])
 
+    def bind_user(self, context: dict, user: str, *, github_identity: dict | None = None,
+                  explicit: bool = False) -> dict:
+        """Bind task attribution once; resumed or associated attachments inherit it."""
+        with self.transaction() as db:
+            session = self.get(db, "session", context["session"]["id"])
+            existing = session.get("user")
+            if not existing:
+                # Older tasks stored attribution on executions only. Preserve
+                # that proven history rather than relabeling accepted work.
+                prior = {row["user"] for row in self.rows(db, "execution")
+                         if row["session_id"] == session["id"] and row.get("user")}
+                if len(prior) > 1:
+                    raise ValueError("VAWS task has inconsistent historical user attribution")
+                existing = next(iter(prior), None)
+            if existing and explicit and existing != user:
+                raise ValueError(f"VAWS task is already bound to user {existing!r}; it cannot resume as {user!r}")
+            if not session.get("user"):
+                session.update(user=existing or user, user_bound_at=time.time())
+                if github_identity is not None and (not existing or existing == user):
+                    session["github_identity"] = dict(github_identity)
+                self.put(db, "session", session)
+        return self.context(context["attachment"]["id"])
+
+    def bind_configured_user(self, context: dict, *, identity_file=None) -> dict:
+        if context["session"].get("user"):
+            return context
+        from vaws_coordinator.user_identity import load_github_identity
+        identity = load_github_identity(identity_file)
+        if identity is None:
+            return context
+        return self.bind_user(context, identity["login"], github_identity=identity)
+
     def bind_sources(self, context: dict, sources: dict[str, str]) -> dict:
         references = {}
         for name, path in sources.items():

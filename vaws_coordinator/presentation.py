@@ -42,6 +42,9 @@ def compact_data(value: dict, *, target=False) -> dict:
         rows = value["executions"]
         result["executions"] = [execution_summary(row) for row in rows[-5:]]
         result["executions_total"] = len(rows)
+    for key in ("notifications", "notification_status", "coordination_contacts", "coordination_peers", "message"):
+        if key in value:
+            result[key] = value[key]
     return result
 
 
@@ -90,12 +93,13 @@ def present(result: dict, directory: Path, *, full=False, target=False) -> dict:
         if isinstance(value, list):
             return [bound(item) for item in value[:8]]
         return value
-    compact = {**result, "data": {**bound({k: v for k, v in data.items() if k != "target"}),
+    compact = {**result, "data": {**bound({k: v for k, v in data.items() if k not in {"target", "notifications", "message"}}),
+                                  **{key: data[key] for key in ("notifications", "message") if key in data},
                                   **({"target": data["target"]} if "target" in data else {})}}
     if not target and "runtime" in compact:
         compact["runtime"] = compact_runtime(compact["runtime"])
     if len(json.dumps(compact, ensure_ascii=False).encode()) > 16000:
-        compact["data"] = {key: data[key] for key in ("execution_id", "state", "service", "error_ref") if key in data}
+        compact["data"] = {key: data[key] for key in ("execution_id", "state", "service", "error_ref", "notifications", "message") if key in data}
         compact["summary"] = str(result["summary"])[:1000]
         compact["detail_omitted"] = True
     return compact

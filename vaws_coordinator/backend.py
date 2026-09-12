@@ -46,6 +46,8 @@ def remote_shell(target: dict, command: str, *, timeout_ms: int = 45000) -> dict
 
 
 class RemoteBackend:
+    supports_task_messages = True
+
     def __init__(self, *, shell=None, host_queue=None, machines=None, host_queue_module=None):
         self.shell = shell or RemoteDev()
         self.machines = machines or MachineDirectory()
@@ -263,6 +265,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         )
         from vaws_coordinator.parity_support import SshEndpoint, ssh_exec_stream
         from vaws_coordinator.provision.task_environment import INSTALL_STEPS, create_venv_script
+        from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
 
         endpoint = spec["endpoint"]
         root = endpoint["root"]
@@ -348,7 +351,10 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         steps = () if not native_recipe or (reuse and reuse['kind'] == 'native') else INSTALL_STEPS
         if reuse and reuse['kind'] == 'dependencies':
             steps = tuple(step for step in steps if step != 'install-vllm-ascend-requirements')
-        for step in steps:
+        compiled_native = False
+
+        def install(step):
+            nonlocal compiled_native
             log = progress(step)
             run_runtime_install_step(
                 container=container,
@@ -362,11 +368,87 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                 log_path=log,
                 process=owned_process(step),
             )
+            if step == 'install-vllm-ascend':
+                compiled_native = True
+
+        cached_native = False
+
+        def rebuild(reason):
+            nonlocal cached_native
+            progress('shared-native-cache', {'status': 'miss', 'reason': str(reason)[:500]})
+            discarded = self._shared_native(spec, 'discard', versions, process=owned_process('shared-native-discard'))
+            if discarded.get('status') != 'discarded':
+                raise RuntimeError('cannot discard incomplete cached outputs: ' + discarded.get('reason', 'unknown'))
+            cached_native = False
+            install('install-vllm-ascend')
+            install('verify-imports')
+            install('verify-deps')
+
+        for step in steps:
+            if step == 'install-vllm-ascend':
+                cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
+                progress('shared-native-cache', cache)
+                cached_native = cache.get('status') == 'hit'
+                if cached_native:
+                    continue
+            try:
+                install(step)
+            except (PreparationCancelled, PreparationUncertain):
+                raise
+            except Exception as exc:
+                if not cached_native or step not in {'verify-imports', 'verify-deps'}:
+                    raise
+                rebuild(exc)
         check_cancel()
         log = progress("verify-profile")
-        self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
-                                  process=owned_process("verify-profile"), log_path=log)
-        return self.inspect(spec)
+        try:
+            self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
+                                      process=owned_process("verify-profile"), log_path=log)
+        except (PreparationCancelled, PreparationUncertain):
+            raise
+        except Exception as exc:
+            if not cached_native:
+                raise
+            rebuild(exc)
+            self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
+                                      process=owned_process("verify-profile"), log_path=log)
+        result = self.inspect(spec)
+        if compiled_native:
+            progress('shared-native-cache', self._shared_native(spec, 'store', versions, process=owned_process('shared-native-store')))
+        return result
+
+    def _shared_native(self, spec, action, versions, *, process=None):
+        """One bounded automatic cache lookup/copy; no other user's runtime."""
+        from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE, task_python_exports
+        from vaws_coordinator.preparation_cache import REMOTE_SHARED_SUFFIX
+        from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
+        try:
+            root, python = spec['endpoint']['root'], spec['python']
+            request = {'root': root, 'action': action, 'preparation': spec.get('preparation', {}), 'versions': versions}
+            if action == 'restore':
+                host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
+                name = shlex.quote(spec['container_name'])
+                request['image_digest'] = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
+            module = _package_file('runtime_profile.py').read_text()
+            cache = _package_file('preparation_cache.py').read_text()
+            preamble = '\n'.join(['set -euo pipefail', 'export VAWS_RUNTIME_ROOT=' + shlex.quote(root),
+                                   *DEFAULT_ENV_PREAMBLE, *task_python_exports(python),
+                                   'export PYTHONPATH=' + shlex.quote(':'.join([root + '/.vaws-runtime/metadata',
+                                                                            root + '/vllm', root + '/vllm-ascend']))])
+            command = (preamble + '\n' + shlex.quote(python) + ' - ' + shlex.quote(json.dumps(request))
+                       + " <<'VAWS_SHARED_NATIVE'\n" + module + '\nexec(' + repr(cache) + ', globals())\n'
+                       + REMOTE_SHARED_SUFFIX + '\nVAWS_SHARED_NATIVE\n')
+            if process is None:
+                return json.loads(self.bash(spec['endpoint'], command))
+            from vaws_coordinator.parity_support import SshEndpoint, ssh_exec_stream
+            endpoint = spec['endpoint']
+            result = ssh_exec_stream(SshEndpoint(endpoint['host'], int(endpoint['port']), endpoint['user']),
+                                     command, stream_progress=False, process=process)
+            return json.loads(result.stdout)
+        except (PreparationCancelled, PreparationUncertain):
+            raise
+        except Exception as exc:
+            return {'status': 'miss', 'reason': str(exc)[:500]}
 
     def _write_ready_profile(self, spec, environment, *, native_recipe=True, source_versions=None,
                              process=None, log_path=None):

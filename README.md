@@ -120,9 +120,34 @@ would pin every consumer to that tag.
 
 ## Start the task server
 
-`vaws-coordinator task-server` serves the four task tools over stdio MCP:
+`vaws-coordinator task-server` serves task and coordination tools over stdio MCP:
 
-`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`.
+`vaws_session`, `vaws_run`, `vaws_execution`, `vaws_finish`, `vaws_message`.
+
+For a substantive coordination request, pass a `coordination_peers[].reference`
+returned while waiting and the message text to `vaws_message`. Reply with the
+received `notifications[].reply_reference`. The task supplies the sender;
+there are no owner, host endpoint, thread, cursor or ACK parameters to fill in.
+Messages never execute commands, release leases or stop another user's task.
+
+Normal run/status calls return locally cached notifications and trigger at most
+one short polling worker for the task's already known hosts, with a five-second
+minimum interval after each completed poll. They do not wait for remote inbox
+I/O or scan the fleet. The existing local coordinator owns the worker; there
+is no new daemon, SSE service or background Agent wakeup. A later normal call
+delivers newly fetched text. A task without managed hosts remains local.
+
+The host stores messages alongside the existing queue database, so independent
+local coordinator/session stores can exchange offline messages. The queue's
+default `/tmp` state can disappear on host reset; this is not reboot-durable
+storage. Local `mail-message` records preserve fetched text before advancing
+the host cursor. Automatic delivery records that the local coordinator returned
+the text, not that the native client received it or the Agent accepted it;
+there is no exactly-once end-to-end or manual acknowledgement claim. Peer
+timestamps are contact observations, never evidence that resources are free.
+Custom backends opt in with `supports_task_messages = True`; older backends
+receive no new host actions. Embedded service owners call `close_messages()`
+before removing their state; the daemon closes its workers on shutdown.
 
 Example Cursor / Claude `.mcp.json` (or `.cursor/mcp.json`):
 
@@ -193,7 +218,7 @@ executed on the physical host. Durable host state defaults to
 | Path | Role |
 | --- | --- |
 | `vaws_coordinator/cli.py` | `vaws-coordinator` / `python -m vaws_coordinator` |
-| `vaws_coordinator/task_server.py` | Stdio MCP for the four task tools |
+| `vaws_coordinator/task_server.py` | Stdio MCP for task and coordination tools |
 | `vaws_coordinator/host_queue.py` | Public host NPU API |
 | `vaws_coordinator/host/` | Host allocation module, shipped to the host |
 | `vaws_coordinator/backend.py` | Container/host probes via `remote_dev` |

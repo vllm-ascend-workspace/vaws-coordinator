@@ -47,6 +47,7 @@ from vaws_coordinator.preparation_process import (
 )
 from vaws_coordinator.ready_runtime import RuntimePool, user_container_name
 from vaws_coordinator.state_paths import coordinator_state_dir
+from vaws_coordinator.task_messages import TaskMessages
 
 SOCKET_NAME = "coordinator.sock"
 LOCK_NAME = "coordinator.lock"
@@ -155,7 +156,7 @@ def aggregate_job_states(states: list[str | None]) -> str:
     return live[0]
 
 
-class CoordinatorService:
+class CoordinatorService(TaskMessages):
     def __init__(self, state_dir: Path, *, pool: RuntimePool | None = None, backend=None,
                  sessions: AgentSessions | None = None):
         self.state_dir = Path(client_path(state_dir)).expanduser().resolve()
@@ -168,6 +169,8 @@ class CoordinatorService:
         self._lock_registry: dict[tuple[str, str], threading.Lock] = {}
         self._registry_guard = threading.Lock()
         self._stopped = threading.Event()
+        self._mail_stopped = threading.Event()
+        self._mail_workers: set[threading.Thread] = set()
         self._lifecycle_lock = threading.Lock()
         self._active_requests = 0
         self._async_progress = False
@@ -278,6 +281,11 @@ class CoordinatorService:
             value = self.finish(request["sessions_dir"], request["user"], request["session_id"],
                                 force=bool(request.get("force")))
             return {"ok": True, "value": value}
+        if op == "notifications":
+            return {"ok": True, "value": self.notifications(request["sessions_dir"], request["user"], request["session_id"])}
+        if op == "message":
+            return {"ok": True, "value": self.message(request["sessions_dir"], request["user"], request["session_id"],
+                                                       request["recipient"], request["text"])}
         if op == "pool":
             method = getattr(self.pool, request["method"])
             value = method(*request.get("args", []), **request.get("kwargs", {}))
@@ -1318,6 +1326,7 @@ class CoordinatorService:
                 threading.Thread(target=self._serve_conn, args=(conn,), daemon=True).start()
         finally:
             self._stopped.set()
+            self.close_messages()
             if server is not None:
                 server.close()
             try:
@@ -1488,6 +1497,33 @@ class CoordinatorClient:
     def runtime_register(self, runtime_id, spec):
         return self.call("runtime_register", runtime_id=runtime_id, spec=spec)
 
+    def notifications(self, sessions_dir, user, session_id):
+        return self.call("notifications", sessions_dir=str(sessions_dir), user=user, session_id=session_id)
+
+    def message(self, sessions_dir, user, session_id, recipient, text):
+        return self.call("message", sessions_dir=str(sessions_dir), user=user, session_id=session_id,
+                         recipient=recipient, text=text)
+
+
+_DAEMON_UPGRADE_RETRY_SECONDS = 60.0
+_daemon_upgrade_attempts: dict[str, tuple[int | None, float]] = {}
+
+
+def _daemon_upgrade_due(client: CoordinatorClient) -> bool:
+    """Only a newer loaded caller may request the existing idle restart."""
+    from packaging.version import InvalidVersion, Version
+
+    current = next((row for row in LOADED_RUNTIMES if row.get("package") == "vaws-coordinator"), {})
+    loaded = next((row.get("loaded") or {} for row in client.runtime or []
+                   if (row.get("loaded") or {}).get("package") == "vaws-coordinator"), {})
+    try:
+        if Version(str(current.get("version"))) <= Version(str(loaded.get("version"))):
+            return False
+    except InvalidVersion:
+        return False
+    previous = _daemon_upgrade_attempts.get(str(client.state_dir))
+    return previous is None or previous[0] != loaded.get("pid") or time.monotonic() >= previous[1]
+
 
 def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     state_dir = Path(client_path(state_dir)).expanduser().resolve()
@@ -1495,7 +1531,8 @@ def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     client = CoordinatorClient(state_dir)
     try:
         client.runtime = (client.call("ping") or {}).get("runtime")
-        return client
+        if not _daemon_upgrade_due(client):
+            return client
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
     Path(state_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1521,9 +1558,29 @@ def _ensure_daemon_locked(state_dir: Path, client: CoordinatorClient) -> Coordin
     require_native_owner(state_dir)
     try:
         client.runtime = (client.call("ping") or {}).get("runtime")
-        return client
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
+    else:
+        if not _daemon_upgrade_due(client):
+            return client
+        loaded = next((row.get("loaded") or {} for row in client.runtime or []
+                       if (row.get("loaded") or {}).get("package") == "vaws-coordinator"), {})
+        # Busy or unsupported older daemons stay usable. Reuse the ordinary
+        # ping and limit extra restart requests for this state/PID in-process.
+        _daemon_upgrade_attempts[str(state_dir)] = (
+            loaded.get("pid"), time.monotonic() + _DAEMON_UPGRADE_RETRY_SECONDS,
+        )
+        try:
+            reply = client.call("restart_if_idle")
+        except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+            return client
+        if not isinstance(reply, dict) or reply.get("status") != "stopping":
+            return client
+        deadline = time.monotonic() + 5
+        while socket_path(state_dir).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if socket_path(state_dir).exists():
+            raise RuntimeError("daemon shutdown is still pending")
     log_path = Path(state_dir) / "daemon.log"
     environment = dict(os.environ)
     environment.setdefault("REMOTE_DEV_STATE_DIR", str(Path(state_dir).resolve().parent / "remote-dev-state"))

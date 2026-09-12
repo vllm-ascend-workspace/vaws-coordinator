@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shutil
+import sysconfig
+import tempfile
 from pathlib import Path
 
 
@@ -47,7 +49,7 @@ def copy_dependencies(source_site: Path, destination_site: Path) -> list[str]:
     return copied
 
 
-def write_source_metadata(root: Path, versions: dict) -> None:
+def write_source_metadata(root: Path, versions: dict, distributions: dict | None = None) -> None:
     """Generate source version files and distribution overlays from real SCM."""
     metadata_root = safe_destination(root, '.vaws-runtime/metadata')
     metadata_root.mkdir(parents=True, exist_ok=True)
@@ -58,20 +60,22 @@ def write_source_metadata(root: Path, versions: dict) -> None:
         if name not in {'vllm', 'vllm-ascend'}:
             raise ValueError('unsupported native source metadata: ' + name)
         package = name.replace('-', '_')
-        dist = importlib.metadata.distribution(name)
-        installed = dist.version
+        saved = (distributions or {}).get(name)
+        dist = importlib.metadata.distribution(name) if saved is None else None
+        installed = saved['version'] if saved else dist.version
+        read_text = (lambda filename: saved['files'].get(filename)) if saved else dist.read_text
         # vLLM's supported empty-device recipe adds this package suffix.
         package_version = version + ('.empty' if '+' in version else '+empty') if name == 'vllm' and installed.endswith('empty') else version
         metadata_relative = '.vaws-runtime/metadata/' + package + '-' + package_version + '.dist-info'
         destination = safe_destination(root, metadata_relative)
         destination.mkdir(exist_ok=True)
-        metadata = dist.read_text('METADATA')
+        metadata = read_text('METADATA')
         if not metadata:
             raise ValueError('installed distribution has no metadata: ' + name)
         metadata = re.sub(r'^Version: .*$', 'Version: ' + package_version, metadata, count=1, flags=re.MULTILINE)
         safe_destination(root, metadata_relative + '/METADATA').write_text(metadata, encoding='utf-8')
         for filename in ('entry_points.txt', 'top_level.txt', 'WHEEL'):
-            value = dist.read_text(filename)
+            value = read_text(filename)
             output = safe_destination(root, metadata_relative + '/' + filename)
             if value is not None:
                 output.write_text(value, encoding='utf-8')
@@ -110,6 +114,133 @@ def copy_native_view(root: Path, source_root: Path, manifest: dict, versions: di
     return {'kind': 'native', 'source_root': str(source_root), 'build_key': manifest['build_key'],
             'soc': manifest['profile']['soc'], 'compiler': manifest['profile']['compiler'],
             'toolchain': toolchain}
+
+
+SHARED_NATIVE_CACHE = '/tmp/vaws-native-cache'
+
+
+def shared_input_key(preparation: dict, image_digest: str) -> str:
+    """One lookup from fixed inputs; a first-use donor has no measured profile."""
+    if not image_digest or not all(preparation.get('native', {}).get(name) for name in ('vllm', 'vllm-ascend')):
+        raise ValueError('shared native cache requires fixed native inputs and image digest')
+    environment = preparation.get('environment', {})
+    return digest({'image': image_digest, 'dependencies': preparation.get('dependencies'),
+                   'native': preparation['native'], 'environment': environment.get('environment', {}),
+                   'build_env': environment.get('build_env', {})})
+
+
+def store_shared_native(root: Path, cache: Path) -> dict:
+    """Automatically cache only the existing verified output bundle and metadata."""
+    manifest = json.loads((root / '.vaws-runtime/ready-profile.json').read_text())
+    preparation = manifest['preparation']
+    key = shared_input_key(preparation, manifest['profile']['image_digest'])
+    metadata = {}
+    for name in ('vllm', 'vllm-ascend'):
+        distribution = importlib.metadata.distribution(name)
+        metadata[name] = {'version': distribution.version, 'files': {
+            filename: distribution.read_text(filename) for filename in
+            ('METADATA', 'WHEEL', 'entry_points.txt', 'top_level.txt')}}
+    manifest = {**manifest, 'distributions': metadata}
+    bundle = publish(root, cache / 'bundles', manifest)
+    # publish already atomically verifies and installs the complete directory.
+    # The small index does not register or expose any donor interpreter/runtime.
+    cache.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.index-', dir=cache)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'bundle': bundle.name, 'native_key': preparation['native_key']}, stream)
+        os.replace(temporary, cache / (key + '.json'))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return {'status': 'stored', 'native_key': preparation['native_key']}
+
+
+def discard_shared_native(root: Path) -> None:
+    """Remove only cache-created files in this not-yet-running execution view."""
+    marker = root / '.vaws-runtime/shared-native.json'
+    if not marker.is_file():
+        return
+    receipt = json.loads(marker.read_text())
+    for relative in receipt.get('copied', []):
+        safe_destination(root, relative).unlink(missing_ok=True)
+    metadata = safe_destination(root, '.vaws-runtime/metadata')
+    if metadata.exists():
+        shutil.rmtree(metadata)
+    safe_destination(root, '.vaws-runtime/reuse.json').unlink(missing_ok=True)
+    marker.unlink()
+
+
+def restore_shared_native(root: Path, cache: Path, preparation: dict, image_digest: str, versions: dict) -> dict:
+    """Copy an ABI-compatible cached bundle into this execution's own sources."""
+    key = shared_input_key(preparation, image_digest)
+    index = cache / (key + '.json')
+    if not index.is_file():
+        return {'status': 'miss', 'reason': 'no matching compiled outputs'}
+    pointer = json.loads(index.read_text())
+    if not re.fullmatch('[0-9a-f]{64}', pointer.get('bundle', '')):
+        raise ValueError('invalid shared native cache pointer')
+    bundle = cache / 'bundles' / pointer['bundle']
+    manifest = json.loads((bundle / 'manifest.json').read_text())
+    profile = manifest['profile']
+    expected = verified_preparation(preparation, profile)
+    if (pointer.get('native_key') != expected['native_key'] or
+            manifest.get('preparation', {}).get('native_key') != expected['native_key'] or
+            profile['image_digest'] != image_digest):
+        raise ValueError('cached native inputs or image differ')
+    if profile['python_abi'] != sysconfig.get_config_var('SOABI'):
+        raise ValueError('cached Python ABI differs')
+    for field, package in (('torch', 'torch'), ('torch_npu', 'torch-npu')):
+        if importlib.metadata.version(package) != profile[field]:
+            raise ValueError('cached package ABI differs: ' + package)
+    for row in profile['system_files'].values():
+        if file_digest(Path(row['path'])) != row['sha256']:
+            raise ValueError('cached CANN/driver support differs')
+    verify(bundle, manifest, check_environment=False)
+    if 'vllm-ascend/vllm_ascend/_build_info.py' not in manifest['files']:
+        raise ValueError('cached generated build metadata is missing')
+    # Preflight all destinations before writing any cached output.
+    for name in manifest['files']:
+        if safe_destination(root, name).exists():
+            raise ValueError('native output already exists in fresh view: ' + name)
+    receipt = {'status': 'hit', 'native_key': expected['native_key'], 'copied': list(manifest['files'])}
+    marker = safe_destination(root, '.vaws-runtime/shared-native.json')
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(receipt))
+    try:
+        for name, identity in manifest['files'].items():
+            target = safe_destination(root, name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(checked_file(bundle, name), target)
+            if file_digest(target) != identity['sha256']:
+                raise ValueError('shared artifact changed while copying: ' + name)
+        write_source_metadata(root, versions, manifest['distributions'])
+        reuse = {'kind': 'shared-native', 'native_key': expected['native_key'],
+                 'soc': profile['soc'], 'compiler': profile['compiler']}
+        safe_destination(root, '.vaws-runtime/reuse.json').write_text(json.dumps(reuse))
+    except Exception:
+        discard_shared_native(root)
+        raise
+    return receipt
+
+
+REMOTE_SHARED_SUFFIX = r'''
+import sys
+args = json.loads(sys.argv[1])
+root = Path(args['root'])
+cache = Path(args.get('cache', SHARED_NATIVE_CACHE))
+try:
+    if args['action'] == 'store':
+        result = store_shared_native(root, cache)
+    elif args['action'] == 'discard':
+        discard_shared_native(root)
+        result = {'status': 'discarded'}
+    else:
+        result = restore_shared_native(root, cache, args['preparation'], args['image_digest'], args['versions'])
+except Exception as exc:
+    result = {'status': 'miss', 'reason': str(exc)}
+print(json.dumps(result))
+'''
 
 
 REMOTE_REUSE_SUFFIX = r'''

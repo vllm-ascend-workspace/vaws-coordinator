@@ -1229,6 +1229,14 @@ def runtime_install_step_script(
     lines.extend(DEFAULT_ENV_PREAMBLE)
     if python:
         lines.extend(task_python_exports(python))
+    if step in {'verify-imports', 'verify-deps'}:
+        # Shared native reuse copies outputs instead of installing an editable
+        # package. Verify this execution view, as the final profile probe does.
+        lines.extend([
+            'if [ -f "$VAWS_RUNTIME_ROOT/.vaws-runtime/shared-native.json" ]; then',
+            '  export PYTHONPATH="$VAWS_RUNTIME_ROOT/.vaws-runtime/metadata:$VAWS_RUNTIME_ROOT/vllm:$VAWS_RUNTIME_ROOT/vllm-ascend${PYTHONPATH:+:$PYTHONPATH}"',
+            'fi',
+        ])
     if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-requirements', 'check-build-compat'}:
         source_name = 'vllm' if step == 'install-vllm' else 'vllm-ascend'
         # Only package-created fixed input data enters the build shell. Never

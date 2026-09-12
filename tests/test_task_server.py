@@ -72,13 +72,14 @@ class TaskRegistry:
 
 
 class CapabilityTests(unittest.TestCase):
-    def test_tools_list_advertises_the_four_portable_names_with_their_own_schemas(self):
+    def test_tools_list_advertises_portable_names_with_their_own_schemas(self):
         tools = list_tools()
-        self.assertEqual([tool["name"] for tool in tools], ["vaws_session", "vaws_run", "vaws_execution", "vaws_finish"])
+        self.assertEqual([tool["name"] for tool in tools], ["vaws_session", "vaws_run", "vaws_execution", "vaws_finish", "vaws_message"])
         from jsonschema import Draft202012Validator, ValidationError
 
         examples = {"vaws_session": {"sources": {}}, "vaws_run": {"command": "echo ready"},
-                    "vaws_execution": {"execution_id": "a" * 64}, "vaws_finish": {}}
+                    "vaws_execution": {"execution_id": "a" * 64}, "vaws_finish": {},
+                    "vaws_message": {"recipient": {"host": "host-ref", "user": "bob", "session_id": "task-bob"}, "text": "hello"}}
         for tool in tools:
             with self.subTest(tool=tool["name"]):
                 self.assertTrue(tool["description"])
@@ -313,7 +314,7 @@ class LiveStdioTests(unittest.TestCase):
         self.assertEqual(init["result"]["serverInfo"]["version"], package_version())
         client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         names = [tool["name"] for tool in client.rpc("tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["vaws_session", "vaws_run", "vaws_execution", "vaws_finish"])
+        self.assertEqual(names, ["vaws_session", "vaws_run", "vaws_execution", "vaws_finish", "vaws_message"])
         first = client.rpc("tools/call", {"name": "vaws_session", "arguments": {"context_file": self.registry.context_file}})
         second = client.rpc("tools/call", {"name": "vaws_session", "arguments": {"context_file": self.registry.context_file}})
         for reply in (first, second):

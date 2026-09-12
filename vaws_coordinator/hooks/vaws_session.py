@@ -119,6 +119,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             context = store.attach(client, native, str(cwd), agent_id=context["attachment"].get("agent_id") or "")
             context = bind_native_defaults(store, context)
 
+    context = store.bind_configured_user(context)
     hint = ("VAWS task context:\n" + context["context_file"] + "\n"
             "Pass this as context_file to vaws_session/vaws_run/vaws_execution/vaws_finish. "
             "Local editing needs no remote resources. For a child or authorized cross-tool handoff, "

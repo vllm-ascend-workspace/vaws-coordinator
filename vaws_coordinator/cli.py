@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import sys
 
@@ -19,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     daemon = sub.add_parser("daemon", help="Run the persistent coordinator for this user/state-dir")
     daemon.add_argument("--state-dir", default="")
     daemon.add_argument("--action", choices=("serve", "status", "restart-if-idle"), default="serve")
-    task = sub.add_parser("task-server", help="Serve the four VAWS task tools over stdio MCP")
+    task = sub.add_parser("task-server", help="Serve VAWS task and coordination tools over stdio MCP")
     task.add_argument("--describe", action="store_true",
                       help="print the capability declaration and tool list as JSON, then exit")
     provision = sub.add_parser(
@@ -28,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     provision.add_argument("--host", required=True)
     provision.add_argument("--image", required=True, help="local-latest, rc, main, stable, or a full image reference")
-    provision.add_argument("--user", default=getpass.getuser())
+    provision.add_argument("--user")
     provision.add_argument("--host-user", default="root")
     provision.add_argument("--host-port", type=int, default=22)
     provision.add_argument("--ssh-port", type=int)
@@ -39,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Adopt a prepared work root in this user's container (root==cwd)",
     )
     register.add_argument("--runtime-id", required=True)
-    register.add_argument("--user", default=getpass.getuser())
+    register.add_argument("--user")
     register.add_argument("--host", required=True)
     register.add_argument("--ssh-port", type=int, required=True)
     register.add_argument("--root", required=True, help="Absolute prepared work root inside the container")
@@ -74,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         from vaws_coordinator.execution_sources import capture_sources
         from vaws_coordinator.service import ensure_daemon, require_native_owner
         from vaws_coordinator.state_paths import coordinator_state_dir
+        from vaws_coordinator.task_client import coordinator_user
 
         state = Path(client_path(args.state_dir)).expanduser().resolve() if args.state_dir else coordinator_state_dir()
         require_native_owner(state)
@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--source is only supported with --reuse-only")
         ports = [int(item) for item in args.service_ports.split(",") if item.strip()]
         spec = {
-            "user": args.user,
+            "user": coordinator_user(args.user),
             "python": args.python,
             "host_endpoint": {"host": args.host, "port": args.host_port, "user": args.host_user},
             "endpoint": {"host": args.host, "port": args.ssh_port, "user": args.ssh_user, "root": args.root},
