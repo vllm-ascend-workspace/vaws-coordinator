@@ -345,9 +345,13 @@ Short root preparation reuses that endpoint's Python RPC connection; owned
 preparation jobs wait for exit within their bounded polling interval instead
 of returning early merely because output arrived. First admission persists
 the observed host epoch before submitting and acquiring in one host exchange.
-Container identity and compact source/environment verification run concurrently
-within the same preflight; both must finish successfully before host preflight.
-They are not cached across queue waits.
+New managed runs read their exact task and container facts together, verify the
+compact source/environment view, then reuse a newly issued grant's occupancy
+sample for host preflight. Queue recovery verifies again; facts are not cached
+across queue waits. Startup and release operations record monotonic durations
+in the existing run events, without command contents or heartbeat log entries.
+Completed managed shared leases retain the host process-guard and port checks;
+they need no whole-device visibility scan to release their own ownership.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;

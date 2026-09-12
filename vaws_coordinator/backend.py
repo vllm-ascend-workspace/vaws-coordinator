@@ -73,6 +73,11 @@ class RemoteBackend:
         """The caller just verified this new run's fixed runtime inputs."""
         return self.host(runtime, {**request, "action": "submit-acquire-preflight"})
 
+    def startup_context(self, runtime, task_id):
+        """Read this new task's epoch and container identity in one host call."""
+        return self.host(runtime, {"action": "startup-context", "task_id": task_id,
+                                   "container_name": runtime["container_name"]})
+
     def preflight(self, binding, command, env):
         from vaws_coordinator.managed_execution import ExecutionRequestError, task_preamble
         script = "set -e\n" + "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
@@ -181,7 +186,7 @@ print(json.dumps({'pid':matches[0]}))
         return {**manifest, "container_id": info["Id"],
                 "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
 
-    def verify_preflight(self, runtime, *, snapshots=None):
+    def verify_preflight(self, runtime, *, snapshots=None, _container_info=None):
         """Check the registered launch view with a compact remote reply.
 
         Owned native publications reuse their completed output proof and check
@@ -203,7 +208,10 @@ print(json.dumps({'pid':matches[0]}))
         expected_digest = digest(manifest)
 
         def check_container():
-            info = self._inspect_container(runtime)
+            info = self._inspect_container(runtime) if _container_info is None else _container_info
+            if _container_info is not None and (not info["State"]["Running"]
+                    or info["State"].get("Paused") or info["State"].get("Restarting")):
+                raise RuntimeError("prepared container is not running normally")
             if info["Id"] != expected.get("container_id"):
                 raise ValueError("runtime container changed before launch")
 

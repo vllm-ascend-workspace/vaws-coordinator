@@ -227,7 +227,8 @@ class ManagedExecution:
                                      "prepared_timeout_seconds": max(120, job["request"]["queue_seconds"])
                                      if job.get("hold_go") else 120}
                     job["service_port"] = run.get("service_port")
-                    observed = self.backend.job(runtime, job["job_id"], "prepare", spec=specification)
+                    with self._run_operation(run, "prepare"):
+                        observed = self.backend.job(runtime, job["job_id"], "prepare", spec=specification)
                     job["remote"] = observed
                     if observed["state"] != "prepared":
                         raise RuntimeError("start gate has no verified waiting supervisor")
@@ -254,7 +255,8 @@ class ManagedExecution:
                             if self._refresh_managed_cancel(job):
                                 return self._cancel_managed_launch(job, run, binding, runtime, observed)
                             authorization = {"run_id": key, "epoch": run["epoch"], "fence": run["task"]["fence_token"]}
-                            observed = self.backend.job(runtime, job["job_id"], "go", authorization=authorization)
+                            with self._run_operation(run, "go"):
+                                observed = self.backend.job(runtime, job["job_id"], "go", authorization=authorization)
                     elif observed["state"] == "absent":
                         raise RuntimeError("active lease lost its job receipt; do not relaunch")
                     job.update(state="running", remote=observed, lease_state=run["state"])

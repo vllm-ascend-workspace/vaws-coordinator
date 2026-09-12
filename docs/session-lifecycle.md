@@ -116,8 +116,9 @@ requires `restart=True` and confirmed old-process cleanup. An execution/service
 reference connects to the original execution without rereading local sources.
 
 **Stop or finish.** Stop only this execution's managed process family, including
-children. Confirm it is terminal, its assigned devices are observable and free,
-and its service ports are no longer listening before releasing its resources.
+children. Confirm it is terminal and its service ports are no longer listening
+before releasing its resources. Strict leases also require their assigned
+devices to be observable and free.
 An execution admitted with `resources.allow_external_busy=true` on one explicit
 physical device may leave external NPU users running. It releases only its own
 lease after managed descendant completion and port checks; external occupancy

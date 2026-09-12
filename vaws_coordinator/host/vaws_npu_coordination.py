@@ -157,6 +157,24 @@ def unguarded_shared_process(row: sqlite3.Row) -> bool:
             and (row['state'] == 'active' or (row['state'] == 'orphaned_busy' and row['started_at'] is not None)))
 
 
+def _managed_shared_completion(row, completion_confirmed):
+    """A drained managed shared lease releases ownership, not whole-card idleness.
+
+    This selects the hardware-independent path, not proof of process completion:
+    release still checks the stored guard's boot/marker and live family, ports
+    and fence. Malformed or legacy guards retain the original hardware path.
+    """
+    if completion_confirmed is not True or not row['allow_external_busy'] or row['state'] not in {'active', 'orphaned_busy'}:
+        return False
+    try:
+        guard = json.loads(row['process_guard']) if row['process_guard'] else None
+        return (isinstance(guard, dict) and guard.get('retain_until_release') is True
+                and isinstance(guard.get('marker'), str) and re.fullmatch(r'[0-9a-f]{32}', guard['marker']) is not None
+                and isinstance(guard.get('boot_id'), str) and bool(guard['boot_id']))
+    except (ValueError, TypeError):
+        return False
+
+
 def utc_now_iso(epoch: float | None = None) -> str:
     value = time.time() if epoch is None else epoch
     return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1757,13 +1775,12 @@ class NpuCoordinator:
             row = self._task_row(connection, task_id)
             self._check_token(row, token)
             devices = set(_load_devices(row["granted_devices"]))
-            conflicts = (
+            managed_completion = _managed_shared_completion(row, completion_confirmed)
+            conflicts = [] if managed_completion else (
                 sorted((set() if row["allow_external_busy"] else devices & busy) | (devices - visible))
-                if busy is not None and visible is not None
-                else sorted(devices)
-            )
+                if busy is not None and visible is not None else sorted(devices))
             busy_ports = self._service_ports_busy(connection, task_id, listening)
-            if ((devices and (busy is None or visible is None or conflicts)) or busy_ports or unguarded_cpu_process(row)
+            if ((devices and not managed_completion and (busy is None or visible is None or conflicts)) or busy_ports or unguarded_cpu_process(row)
                     or unguarded_shared_process(row)
                     or process_guard_busy(row["process_guard"], completion_confirmed=completion_confirmed)):
                 connection.execute(
@@ -1840,16 +1857,35 @@ class NpuCoordinator:
             return (bool(int(row["requested_count"]) or _load_devices(row["granted_devices"])),
                     row["requested_service_port"] is not None or bool(self._task_service_ports(connection, task_id)))
 
-    def release_probe(self, task_id, probe, *, samples=2, interval_seconds=2.0):
+    def release_probe(self, task_id, probe, *, samples=2, interval_seconds=2.0, completion_confirmed=False):
         with self._transaction() as connection:
             row = self._task_row(connection, require_safe_id(task_id, label="task id"))
             shared = bool(row["allow_external_busy"])
-        # A shared lease explicitly permits unrelated occupancy. One fresh
+            if _managed_shared_completion(row, completion_confirmed):
+                return None
+        # A legacy/unconfirmed shared lease still needs visibility. One fresh
         # sample establishes device visibility; repeating a free-device
         # confirmation cannot add evidence about the owned process family.
         # release() still requires its guard to be quiet and its ports clear.
         return probe() if shared else _confirmed_free_probe(
             samples=samples, interval_seconds=interval_seconds, probe=probe)
+
+    def startup_context(self, task_id, container_name):
+        """New-run discovery needs exact facts, not global recovery/housekeeping.
+
+        Actual acquisition performs the original housekeeping and epoch check.
+        An existing task is returned explicitly and cannot use an absent proof.
+        """
+        task_id = require_safe_id(task_id, label="task id")
+        container_name = require_safe_id(container_name, label="container name")
+        with self._transaction() as connection:
+            epoch = connection.execute("SELECT value FROM meta WHERE key='coordination_epoch'").fetchone()[0]
+            task = connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        info = json.loads(subprocess.check_output(
+            ["docker", "inspect", "--format", '{"Id":{{json .Id}},"State":{{json .State}}}', container_name],
+            text=True, encoding="utf-8"))
+        return {"status": "ok", "coordination_epoch": epoch,
+                "tasks": [self._serialize_task(task)] if task is not None else [], "container": info}
 
     def snapshot(
         self,
@@ -1973,6 +2009,8 @@ def handle_request(
         return coordinator.message(request)
     if action == "message-events":
         return coordinator.message_events(request)
+    if action == "startup-context":
+        return coordinator.startup_context(request["task_id"], request["container_name"])
     if action == "submit":
         return coordinator.submit(request)
     if action in {"submit-acquire", "submit-acquire-preflight"}:
@@ -2041,6 +2079,7 @@ def handle_request(
             request["task_id"], probe,
             samples=int(request.get("free_samples") or 2),
             interval_seconds=float(request.get("interval_seconds") or 2.0),
+            completion_confirmed=request.get("completion_confirmed") is True,
         ) if needs_npu else None
         return coordinator.release(
             request["task_id"],
