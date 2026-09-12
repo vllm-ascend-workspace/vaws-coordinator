@@ -79,6 +79,11 @@ def native_loader(tmp_path, monkeypatch):
                    'SOC_VERSION': '1.0'}
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
+    # The native child reads PYTHONPATH at interpreter startup. The capture
+    # suffix also runs in this already-started test process, so give its real
+    # module/metadata resolver the same owned source view.
+    for path in reversed(environment['PYTHONPATH'].split(':')):
+        monkeypatch.syspath_prepend(path)
     monkeypatch.setenv('CXX', '1.0')
     monkeypatch.setattr(profile.importlib.metadata, 'version', lambda name: '1.0')
     settings = {name: '1.0' for name in profile.PROFILE_FIELDS}
@@ -117,6 +122,14 @@ def test_actual_capture_publishes_the_environment_used_by_its_native_child(nativ
     manifest = json.loads((root / '.vaws-runtime/ready-profile.json').read_text())
     smoke = json.loads((root / '.vaws-runtime/profile-evidence/smoke.json').read_text())
     assert smoke['passed'] is True and 'loaded-owned-opapi=' + str(library) in smoke['stdout']
+    assert smoke['source_mapping'] == {
+        'vllm': str(root / 'vllm/vllm/__init__.py'),
+        'vllm_version': '1.0',
+        'vllm_ascend': str(root / 'vllm-ascend/vllm_ascend/__init__.py'),
+        'vllm-ascend_version': '1.0',
+        'extension': str(root / 'vllm-ascend/vllm_ascend'
+                         / ('vllm_ascend_C' + importlib.machinery.EXTENSION_SUFFIXES[0])),
+    }
     assert manifest['profile']['launch_env']['LD_LIBRARY_PATH'].split(':') == [str(library.parent), str(image)]
     assert manifest['profile']['launch_env']['ASCEND_CUSTOM_OPP_PATH'].split(':')[0] == str(library.parents[2])
 
