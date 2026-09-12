@@ -226,8 +226,11 @@ def test_renderer_contains_owned_single_operator_build_without_pip():
     from vaws_coordinator.parity import runtime_install_step_script
     script = runtime_install_step_script(runtime_root='/execution', marker_dirname='.runtime',
                                          container_identity='vaws-fixture', step='install-vllm-ascend-incremental', python='/python')
-    assert 'build_incremental_kernel(Path(sys.argv[1]))' in script
+    assert 'build_incremental_kernel(Path(sys.argv[1]), compile_recipe=' in script
+    assert 'read_recipe=compiled_opc_recipe' in script
     assert "'--opkernel', '--ops=' + plan['operator']" in script
     assert 'pip install --no-deps -v -e .' not in script
     assert 'spec.get("build_env", {})' in script
     assert 'SETUPTOOLS_SCM_PRETEND_VERSION=' in script
+    program = script.split("<<'VAWS_NATIVE_INCREMENTAL'\n", 1)[1].split('\nVAWS_NATIVE_INCREMENTAL', 1)[0]
+    compile(program, '<owned incremental program>', 'exec')

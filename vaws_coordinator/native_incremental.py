@@ -83,9 +83,20 @@ def kernel_rebuild_plan(root: Path, bundle: Path, manifest: dict, preparation: d
         unit = PurePosixPath(configs[0]).parent.name
         if not re.fullmatch(r'ascend[a-z0-9_]+', unit):
             return None
-        return {'operator': op, 'source': name, 'installed_source': installed,
+        plan = {'operator': op, 'source': name, 'installed_source': installed,
                 'kernel_root': kernel, 'unit': unit, 'source_sha256': hashlib.sha256(current).hexdigest(),
                 'native_from': old_native['vllm-ascend'], 'native_to': current_native['vllm-ascend']}
+        recipe_file = '.vaws-runtime/kernel-compile-recipe.json'
+        if recipe_file in manifest['files']:
+            tbe = kernel.removesuffix('/kernel')
+            vendor = installed.split('/op_impl/ai_core/tbe/', 1)[0]
+            plan['recipe_files'] = {path: row['sha256'] for path, row in manifest['files'].items()
+                if (path == recipe_file or path == configs[0]
+                    or path.startswith(kernel + '/' + unit + '/' + op + '/')
+                    or path.startswith(tbe + '/config/')
+                    or path.startswith(vendor + '/op_tiling/')
+                    or (path.startswith(tbe + '/') and ('/ascendc/' in path or path.endswith('/dynamic/' + op + '.py'))))}
+        return plan
     return None
 
 
@@ -184,7 +195,7 @@ def merge_kernel_outputs(root: Path, plan: dict) -> list[str]:
     return [str(path.relative_to(root)) for path in destination.iterdir()]
 
 
-def build_incremental_kernel(root: Path) -> dict:
+def build_incremental_kernel(root: Path, *, compile_recipe=None) -> dict:
     plan_path = _child(root, '.vaws-runtime/native-incremental.json')
     plan = json.loads(plan_path.read_text())
     _validate_operator(plan)
@@ -198,9 +209,12 @@ def build_incremental_kernel(root: Path) -> dict:
     catlass = repository / 'csrc/third_party/catlass/include'
     if catlass.is_dir():
         environment['CPATH'] = str(catlass) + (':' + environment['CPATH'] if environment.get('CPATH') else '')
-    command = ['bash', 'build.sh', '--opkernel', '--ops=' + plan['operator'], '--soc=' + plan['unit']]
-    print('native-incremental: ' + ' '.join(command), flush=True)
-    subprocess.run(command, cwd=repository / 'csrc', env=environment, check=True)
+    # Only an explicit metadata miss may take the ordinary build. Errors after
+    # any compiler has started propagate to the existing owned-process owner.
+    if compile_recipe is None or not compile_recipe(root, plan, environment):
+        command = ['bash', 'build.sh', '--opkernel', '--ops=' + plan['operator'], '--soc=' + plan['unit']]
+        print('native-incremental: ' + ' '.join(command), flush=True)
+        subprocess.run(command, cwd=repository / 'csrc', env=environment, check=True)
     changed = merge_kernel_outputs(root, plan)
     result = {**plan, 'status': 'compiled', 'outputs': changed}
     plan_path.write_text(json.dumps(result, sort_keys=True) + '\n')
