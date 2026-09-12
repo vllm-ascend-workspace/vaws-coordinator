@@ -334,6 +334,12 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
         marker.write_text(json.dumps(receipt))
         reuse = {'kind': 'shared-native', 'native_key': expected['native_key'],
                  'soc': profile['soc'], 'compiler': profile['compiler']}
+        atb = re.search(r'/cxx_abi_([01])/?$', profile.get('launch_env', {}).get('ATB_HOME_PATH', ''))
+        if atb:
+            # This comes from the verified donor's real ATB activation. The
+            # consumer checks its current torch version/Python ABI before
+            # giving ATB's supported argument, otherwise ATB detects normally.
+            reuse['atb_abi'] = {'cxx_abi': atb[1], 'torch': profile['torch'], 'python_abi': profile['python_abi']}
         safe_destination(root, '.vaws-runtime/reuse.json').write_text(json.dumps(reuse))
         if plan:
             safe_destination(root, '.vaws-runtime/native-incremental.json').write_text(json.dumps(plan))

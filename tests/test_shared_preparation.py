@@ -104,6 +104,22 @@ def test_explicit_reference_reuses_same_measured_image_with_current_request_iden
     assert result['native_key'] != manifest['preparation']['native_key']
 
 
+@pytest.mark.parametrize('home,expected', [('/image/atb/cxx_abi_1', '1'), ('/image/atb/unknown', None)])
+def test_verified_atb_selection_is_carried_without_guessing_abi(bundle, home, expected):
+    source, target, shared, request, manifest, relative, versions = bundle
+    manifest['profile']['launch_env']['ATB_HOME_PATH'] = home
+    manifest['profile_key'] = profile.profile_key(manifest['profile'])
+    manifest['build_key'] = profile.build_key(manifest['profile'], manifest['build_inputs'])
+    (source / '.vaws-runtime/ready-profile.json').write_text(json.dumps(manifest))
+    cache.store_shared_native(source, shared)
+    assert cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions)['status'] == 'hit'
+    receipt = json.loads((target / '.vaws-runtime/reuse.json').read_text())
+    assert receipt.get('atb_abi', {}).get('cxx_abi') == expected
+    if expected:
+        assert receipt['atb_abi']['torch'] == manifest['profile']['torch']
+        assert receipt['atb_abi']['python_abi'] == manifest['profile']['python_abi']
+
+
 @pytest.mark.parametrize('constraint', ['soc', 'cann', 'python_abi', 'machine_type'])
 def test_coarse_image_lookup_still_checks_explicit_measured_constraints(bundle, constraint):
     source, target, shared, request, manifest, relative, versions = bundle

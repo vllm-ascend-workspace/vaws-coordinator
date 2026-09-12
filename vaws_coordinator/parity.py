@@ -267,6 +267,17 @@ PYTHON_METADATA_PREAMBLE = (
 )
 
 
+ATB_CXX_ABI_PROBE = '''import importlib.metadata, json, sys, sysconfig
+try:
+    row = json.load(open(sys.argv[1])).get('atb_abi', {})
+    if (row.get('cxx_abi') in ('0', '1') and row.get('torch') == importlib.metadata.version('torch')
+            and row.get('python_abi') == sysconfig.get_config_var('SOABI')):
+        print(row['cxx_abi'])
+except (OSError, ValueError, TypeError, AttributeError, importlib.metadata.PackageNotFoundError):
+    pass
+'''
+
+
 DEFAULT_ENV_PREAMBLE = (
     'export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
     'export VAWS_RUNTIME_ROOT="${VAWS_RUNTIME_ROOT:-/vllm-workspace}"',
@@ -282,7 +293,16 @@ DEFAULT_ENV_PREAMBLE = (
     '  file="$1"',
     '  if [ -f "$file" ]; then',
     '    set +u',
-    '    source "$file" >/dev/null 2>&1 || true',
+    '    local -a _vaws_source_args=()',
+    '    if [ "$file" = /usr/local/Ascend/nnal/atb/set_env.sh ] && [ -f "$VAWS_RUNTIME_ROOT/.vaws-runtime/reuse.json" ]; then',
+    '      local _vaws_atb_abi',
+    '      _vaws_atb_abi="$(python3 - "$VAWS_RUNTIME_ROOT/.vaws-runtime/reuse.json" <<\'VAWS_ATB_CXX_ABI\'',
+    ATB_CXX_ABI_PROBE,
+    'VAWS_ATB_CXX_ABI',
+    '      )" || _vaws_atb_abi=""',
+    '      case "$_vaws_atb_abi" in 0|1) _vaws_source_args=("--cxx_abi=$_vaws_atb_abi");; esac',
+    '    fi',
+    '    source "$file" "${_vaws_source_args[@]}" >/dev/null 2>&1 || true',
     '    set -u',
     '  fi',
     '}',
