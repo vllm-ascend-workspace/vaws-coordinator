@@ -514,6 +514,7 @@ class PoolTests(unittest.TestCase):
         recovered = self.pool.control("alice", run["id"], "poll")
         self.assertEqual(recovered["state"], "granted")
         self.assertEqual(recovered["task_id"], run["task_id"])
+        self.assertEqual(self.backend.calls.count(("host", "submit")), 1)
         record = json.loads((self.root / "manager/runs" / (run["id"] + ".json")).read_text())
         self.assertEqual(record["resources"]["state"], "granted")
         self.assertFalse(record["resources"]["released"])
@@ -524,6 +525,32 @@ class PoolTests(unittest.TestCase):
         self.assertIsNone(pending["epoch"])
         recovered = self.pool.control("bob", pending["id"], "poll")
         self.assertEqual(recovered["state"], "queued")
+
+    def test_first_submission_reuses_discovery_status(self):
+        binding = self.bind("alice", self.root / "a")
+        self.backend.calls.clear()
+        run = self.request("alice", binding)
+        self.assertEqual(run["state"], "granted")
+        self.assertEqual([action for kind, action in self.backend.calls if kind == "host"],
+                         ["status", "submit", "acquire"])
+
+    def test_epoch_change_after_discovery_rejects_submit_without_creating_host_task(self):
+        binding = self.bind("alice", self.root / "a")
+        original = self.backend.host
+        def host(runtime, request):
+            reply = original(runtime, request)
+            if request["action"] == "status" and "coordination_epoch" not in request:
+                import sqlite3
+                with closing(sqlite3.connect(self.backend.state / "192_0_2_1" / "coordinator.sqlite3")) as db, db:
+                    db.execute("UPDATE meta SET value='new-epoch' WHERE key='coordination_epoch'")
+            return reply
+        with mock.patch.object(self.backend, "host", side_effect=host):
+            run = self.request("alice", binding)
+        self.assertEqual(run["state"], "uncertain")
+        self.assertFalse(run["submitted"])
+        self.assertIn("epoch changed", run["error"])
+        tasks = original(runtime_spec(1), {"action": "status", "no_probe": True})["tasks"]
+        self.assertFalse(any(task["task_id"] == run["task_id"] for task in tasks))
 
     def test_unsubmitted_request_expires_without_allocating_after_outage(self):
         import time

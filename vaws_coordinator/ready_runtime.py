@@ -518,6 +518,7 @@ class RuntimePool(ManagedExecution):
                     f"cannot {action} an unsubmitted pending execution; poll it first"
                 )
             try:
+                pending_status = None
                 if run["state"] == "uncertain":
                     # A previous timed-out action may have succeeded. Recover by
                     # observing its exact task; never submit a replacement.
@@ -546,11 +547,16 @@ class RuntimePool(ManagedExecution):
                     else:
                         status = self.backend.host(runtime, {"action": "status", "no_probe": True})
                         run["epoch"] = status["coordination_epoch"]
+                        pending_status = status
                         with self.lock, self.transaction() as db:
                             self.put(db, "run", run)
                 request = {"task_id": run["task_id"], "coordination_epoch": run["epoch"]}
                 if run["state"] == "pending":
-                    status = self.backend.host(runtime, {"action": "status", "no_probe": True, "coordination_epoch": run["epoch"]})
+                    # Initial discovery already includes this epoch's tasks.
+                    # A resumed request still observes them afresh; submit
+                    # enforces the discovered epoch if the host changed.
+                    status = pending_status if pending_status is not None else self.backend.host(
+                        runtime, {"action": "status", "no_probe": True, "coordination_epoch": run["epoch"]})
                     existing = [task for task in status["tasks"] if task["task_id"] == run["task_id"]]
                     if existing:
                         run["task"], run["state"], run["submitted"] = existing[0], existing[0]["state"], True
