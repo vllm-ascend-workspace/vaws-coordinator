@@ -255,6 +255,18 @@ def _fixed_inline_pack(repo, commit, carrier, previous, *, limit=65536):
             'sha256': hashlib.sha256(data).hexdigest(), 'data': base64.b64encode(data).decode('ascii')}
 
 
+PYTHON_METADATA_PREAMBLE = (
+    'export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
+    'PYTHON_CANDIDATE="$(ls -1d /usr/local/python*/bin/python3 2>/dev/null | sort -V | tail -n 1 || true)"',
+    'if [ -n "$PYTHON_CANDIDATE" ]; then export PYTHON="$PYTHON_CANDIDATE"; elif command -v python3 >/dev/null 2>&1; then export PYTHON="$(command -v python3)"; elif command -v python >/dev/null 2>&1; then export PYTHON="$(command -v python)"; else echo "python not found" >&2; exit 127; fi',
+    # Metadata, hashing and venv creation need libpython, not CANN/ATB setup.
+    # In paired images ATB set_env itself imports torch and costs seconds.
+    'VAWS_IMAGE_PYTHON_ROOT="$(dirname "$(dirname "$(readlink -f "$PYTHON")")")"',
+    'if [ -d "$VAWS_IMAGE_PYTHON_ROOT/lib" ]; then export LD_LIBRARY_PATH="$VAWS_IMAGE_PYTHON_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi',
+    'export PATH="$(dirname "$PYTHON"):$PATH"',
+)
+
+
 DEFAULT_ENV_PREAMBLE = (
     'export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
     'export VAWS_RUNTIME_ROOT="${VAWS_RUNTIME_ROOT:-/vllm-workspace}"',
@@ -1402,8 +1414,9 @@ def runtime_install_step_script(
     lines = ['set -euo pipefail', f'cd {quoted(runtime_root)}']
     lines.extend(remote_runtime_env_exports())
     lines.append(f'export VAWS_RUNTIME_ROOT={quoted(runtime_root)}')
-    lines.extend(DEFAULT_ENV_PREAMBLE)
-    if python:
+    if step != 'write-marker':
+        lines.extend(DEFAULT_ENV_PREAMBLE)
+    if python and step != 'write-marker':
         lines.extend(task_python_exports(python))
     if step in {'verify-imports', 'verify-deps'}:
         # Shared native reuse copies outputs instead of installing an editable

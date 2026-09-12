@@ -24,7 +24,7 @@ def test_image_pip_installs_only_in_new_owned_venv(tmp_path, monkeypatch):
     from vaws_coordinator.provision.task_environment import create_venv_script
     root = tmp_path / 'execution'
     interpreter = root / '.venv/bin/python'
-    monkeypatch.setattr(parity, 'DEFAULT_ENV_PREAMBLE', ['PYTHON=' + shlex.quote(sys.executable)])
+    monkeypatch.setattr(parity, 'PYTHON_METADATA_PREAMBLE', ['PYTHON=' + shlex.quote(sys.executable)])
     script = create_venv_script(str(root), str(interpreter))
     environment = dict(os.environ)
     pip = importlib.util.find_spec('pip')

@@ -593,7 +593,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
 
     def _shared_native(self, spec, action, versions, *, process=None, candidate=None):
         """One bounded automatic cache lookup/copy; no other user's runtime."""
-        from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE, task_python_exports
+        from vaws_coordinator.parity import PYTHON_METADATA_PREAMBLE, task_python_exports
         from vaws_coordinator.preparation_cache import REMOTE_SHARED_SUFFIX
         from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
         try:
@@ -611,7 +611,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             incremental = _package_file('native_incremental.py').read_text()
             cache = _package_file('preparation_cache.py').read_text()
             preamble = '\n'.join(['set -euo pipefail', 'export VAWS_RUNTIME_ROOT=' + shlex.quote(root),
-                                   *DEFAULT_ENV_PREAMBLE, *task_python_exports(python),
+                                   *PYTHON_METADATA_PREAMBLE, *task_python_exports(python),
                                    'export PYTHONPATH=' + shlex.quote(':'.join([root + '/.vaws-runtime/metadata',
                                                                             root + '/vllm', root + '/vllm-ascend']))])
             command = (preamble + '\n' + shlex.quote(python) + ' - ' + shlex.quote(json.dumps(request))

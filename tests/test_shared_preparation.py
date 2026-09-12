@@ -318,6 +318,33 @@ def test_known_host_weight_mounts_keep_original_paths():
     assert 'if [ -e "$optional" ]; then' in bootstrap
 
 
+@pytest.mark.parametrize('action', ['restore', 'store', 'discard'])
+def test_cache_metadata_steps_do_not_activate_cann_or_atb(monkeypatch, action):
+    backend = RemoteBackend()
+    commands = []
+    def bash(endpoint, command):
+        commands.append(command)
+        return '"sha256:image"' if command.startswith('docker inspect') else '{"status":"fixture"}'
+    monkeypatch.setattr(backend, 'bash', bash)
+    spec = {'endpoint': {'root': '/execution'}, 'host_endpoint': {},
+            'container_name': 'vaws-fixture', 'python': '/execution/.venv/bin/python'}
+    assert backend._shared_native(spec, action, {})['status'] == 'fixture'
+    assert 'safe_source()' not in commands[-1]
+    assert '/nnal/atb/set_env.sh' not in commands[-1]
+    assert 'readlink -f "$PYTHON"' in commands[-1]
+
+
+def test_marker_and_venv_do_not_activate_native_runtime():
+    from vaws_coordinator.parity import runtime_install_step_script
+    from vaws_coordinator.provision.task_environment import create_venv_script
+    marker = runtime_install_step_script(runtime_root='/execution', marker_dirname='.runtime',
+                                         container_identity='vaws-fixture', step='write-marker', python='/unused-python')
+    venv = create_venv_script('/execution', '/execution/.venv/bin/python')
+    assert '/unused-python' not in marker
+    assert 'safe_source()' not in marker and 'safe_source()' not in venv
+    assert '/nnal/atb/set_env.sh' not in marker and '/nnal/atb/set_env.sh' not in venv
+
+
 @pytest.mark.skipif(os.name == 'nt', reason='generated shell payload executes in the Linux recipient')
 def test_actual_verification_payload_reads_execution_source_and_metadata(tmp_path):
     from vaws_coordinator.parity import runtime_install_step_script

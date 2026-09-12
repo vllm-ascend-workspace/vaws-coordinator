@@ -55,7 +55,7 @@ def task_runtime_id(session_id: str, host: str, role_name: str) -> str:
 
 def create_venv_script(root: str, python: str, donor_python: str | None = None) -> str:
     """Create a task-owned venv. Image packages may be reused; donor venv is not."""
-    from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE
+    from vaws_coordinator.parity import PYTHON_METADATA_PREAMBLE
     from vaws_coordinator.parity_support import quoted
 
     donor = quoted(donor_python or "")
@@ -63,7 +63,7 @@ def create_venv_script(root: str, python: str, donor_python: str | None = None) 
         [
             "set -euo pipefail",
             f"mkdir -p {quoted(root)}",
-            *DEFAULT_ENV_PREAMBLE,
+            *PYTHON_METADATA_PREAMBLE,
             'IMAGE_PYTHON="$PYTHON"',
             'if [ -z "$IMAGE_PYTHON" ]; then echo "image python3 not found" >&2; exit 1; fi',
             f"DONOR={donor}",
