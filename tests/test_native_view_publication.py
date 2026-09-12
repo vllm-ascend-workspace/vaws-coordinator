@@ -291,6 +291,7 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
         for name in ('vllm', 'vllm-ascend')]}
     spec = {'user': 'alice', 'python': '/donor/bin/python',
             'endpoint': {'host': 'local.invalid', 'port': 46001, 'user': 'root', 'root': '/execution'},
+            'host_endpoint': {'host': 'local.invalid', 'port': 22, 'user': 'root'},
             'source_snapshot': snapshot}
     def materialize(**kwargs):
         from vaws_coordinator.preparation_process import PreparationProcess
@@ -328,12 +329,12 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
         from vaws_coordinator.preparation_process import PreparationUncertain
         with pytest.raises(PreparationUncertain):
             prepare()
-        assert seen == ['materialize']
+        assert seen == ['prepare-root', 'materialize']
         return
     result = prepare()
     assert isinstance(result, adapters.PreparedNativeView) and result.attestation is published
-    assert seen == (['materialize'] if mode == 'combined' else ['materialize', 'publish'])
-    assert progress == (['materialize'] if mode == 'combined' else ['materialize', 'publish-native-view'])
+    assert seen == (['prepare-root', 'materialize'] if mode == 'combined' else ['prepare-root', 'materialize', 'publish'])
+    assert progress == (['prepare-root', 'materialize'] if mode == 'combined' else ['prepare-root', 'materialize', 'publish-native-view'])
 
 
 @pytest.mark.parametrize('uncertain', [False, True])

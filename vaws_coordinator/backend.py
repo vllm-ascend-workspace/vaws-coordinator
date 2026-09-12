@@ -430,10 +430,9 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
 
         if log_dir is not None:
             Path(log_dir).mkdir(parents=True, exist_ok=True)
-        # Fixed materialization already creates and validates its private root.
-        # A same-native view can publish in that owned operation, without a
-        # preceding reset/RPC or a second publication process.
-        scripts = [] if publication is not None else [("prepare-root", prepare_isolated_root_script(root))]
+        # The owned worker resolves root/cwd before running any script. Keep
+        # this short RPC even when materialization and publication share a job.
+        scripts = [("prepare-root", prepare_isolated_root_script(root))]
         if (native_recipe and (not reuse or reuse['kind'] != 'native')) or (not native_recipe and not donor_python):
             scripts.append(("create-venv", create_venv_script(root, python, donor_python)))
         for step, script in scripts:

@@ -1,4 +1,5 @@
 """The actual composed Bash argument publishes only after fixed Git success."""
+import copy
 import inspect
 import json
 import os
@@ -173,3 +174,70 @@ def test_materializer_accounts_for_entire_composite_before_inline_pack(monkeypat
         endpoint={'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': str(tmp_path / 'view')},
         native_publication=OversizedPublication(), container_cache_root=str(tmp_path / 'cache'))
     assert 'native_view' not in result and len(commands) == 1
+
+
+def test_backend_prepares_missing_root_before_real_owned_worker_launch_and_quiet(donor, monkeypatch):
+    from remote_dev.core.ssh_transport import RemoteCompleted
+    from remote_dev.processes.client import worker_source
+    from remote_dev.processes.worker import control_job
+    from test_fixed_materialization import make_record, snapshot
+    from vaws_coordinator.backend import PreparedNativeView, RemoteBackend
+    from vaws_coordinator.preparation_process import stop_preparation_process
+
+    publication, request = fixed_plan(donor)
+    source, root = Path(publication.request['source_root']), Path(request['root'])
+    records = [make_record(source / name, name) for name in ('vllm', 'vllm-ascend')]
+    for row in records:
+        row.scm_version = '2.1'
+        row.build_inputs = publication.request['build_inputs'][row.relpath]
+    fixed = snapshot(records)
+    endpoint = {'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': str(root), 'cwd': str(root)}
+    spec = {'user': 'fixture', 'python': sys.executable, 'endpoint': endpoint, 'host_endpoint': None,
+            'source_snapshot': fixed, 'preparation': {**publication.request['preparation'], 'source_id': fixed['id']}}
+    mirrors = {row['relpath']: row['mirror'] for row in request['records']}
+    monkeypatch.setattr(parity, 'mirror_path_for', lambda cache, workspace, row: mirrors[row.relpath])
+    saved, actions = [], []
+    worker = worker_source()
+    assert not root.exists()
+    # This is the real worker precondition that a direct bash-c test misses.
+    with pytest.raises(FileNotFoundError):
+        control_job({'root': str(root), 'job_id': 'absent-root', 'action': 'status'}, worker)
+
+    def rpc(endpoint, command, **kwargs):
+        assert not root.exists() and not saved
+        actions.append('prepare-root-rpc')
+        # Disable only image hostname repair; this local test must not edit
+        # /etc/hosts. Run the actual package root filesystem script unchanged.
+        result = subprocess.run(['/bin/bash', '-c', 'hostname() { return 1; }\n' + command],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert root.is_dir()
+        return RemoteCompleted(result.returncode, result.stdout, result.stderr)
+
+    def control(actual_endpoint, job_id, action, **kwargs):
+        assert actual_endpoint == endpoint and root.is_dir()
+        actions.append(action)
+        return control_job({'root': actual_endpoint['root'], 'job_id': job_id, 'action': action, **kwargs}, worker)
+
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script', rpc)
+    monkeypatch.setattr('vaws_coordinator.preparation_process.control', control)
+    backend = RemoteBackend()
+    monkeypatch.setattr(backend, '_prepare_native_view', lambda *a, **k: pytest.fail('publication must share the owned job'))
+    monkeypatch.setattr(backend, 'bash', lambda *a, **k: pytest.fail('no extra shell operation'))
+    try:
+        result = backend.prepare_task_root(spec, sources={name: str(source / name) for name in mirrors},
+            environment={}, source_snapshot=fixed, reuse={'kind': 'native', 'runtime': publication.previous},
+            on_preparation_job=lambda row: saved.append(copy.deepcopy(row)))
+        assert isinstance(result, PreparedNativeView)
+        assert result.attestation['execution_view']['source_id'] == fixed['id']
+        assert actions[0] == 'prepare-root-rpc' and actions.count('launch') == 1
+        assert len({row['job_id'] for row in saved}) == 1
+        assert saved[-1]['endpoint'] == endpoint and saved[-1]['quiet'] is True
+        assert saved[-1]['result']['exit_code'] == 0
+        # A restarted controller can observe the exact job under the same root.
+        final = control(endpoint, saved[-1]['job_id'], 'status')
+        assert final['quiet'] is True and final['processes'] == []
+        assert final['result']['descendants_drained'] is True
+    finally:
+        if saved:
+            assert stop_preparation_process(saved[-1], lambda _: None, force=True)
