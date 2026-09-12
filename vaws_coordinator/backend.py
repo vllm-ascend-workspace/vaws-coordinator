@@ -55,7 +55,7 @@ class RemoteBackend:
     def __init__(self, *, shell=None, host_queue=None, machines=None, host_queue_module=None):
         self.shell = shell or RemoteDev()
         self.machines = machines or MachineDirectory()
-        self.host_queue = host_queue or HostQueue(self.bash, module_path=host_queue_module)
+        self.host_queue = host_queue or HostQueue(self.bash if shell is not None else None, module_path=host_queue_module)
 
     def job(self, runtime, job_id, action, **parameters):
         from remote_dev.processes import control
