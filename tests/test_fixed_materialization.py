@@ -121,6 +121,51 @@ def test_cold_owner_automatically_exports_legacy_exact_objects(peer, tmp_path, m
     assert len(calls) == 1 and len(peer.commands) == 2 and not peer.transfers
 
 
+def test_cold_owner_small_edit_uses_shared_fixed_base_without_full_push(peer, tmp_path, monkeypatch):
+    first = make_record(peer.source, 'project')
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'new recipient edit')
+    second = make_record(peer.source, 'project')
+    def unexpected_discovery(*args):
+        pytest.fail('shared fixed base should avoid host discovery')
+    monkeypatch.setattr(parity, '_export_existing_source_objects', unexpected_discovery)
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([second], root='new-owner-edit', owner='other', shared_cache=shared,
+                      host={'host': 'fixture'})
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert result['commits'] == {'project': second.commit}
+    assert (peer.root.parent / 'new-owner-edit/project/model.py').read_text() == 'value = 2\n'
+    assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
+    private = parity.mirror_path_for(str(peer.cache), 'other', second)
+    assert git(private, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+
+
+def test_unknown_local_shared_base_keeps_normal_git_fallback(peer, tmp_path):
+    first = make_record(peer.source, 'project')
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    # A different local history cannot construct an inline pack excluding the
+    # shared SHA, even though its private remote now has that negotiation base.
+    unrelated = tmp_path / 'unrelated'
+    unrelated.mkdir()
+    git(unrelated, 'init', '-q')
+    git(unrelated, 'config', 'user.name', 'Test')
+    git(unrelated, 'config', 'user.email', 'test@example.invalid')
+    (unrelated / 'model.py').write_text('different admitted input\n')
+    git(unrelated, 'add', '.')
+    git(unrelated, 'commit', '-qm', 'unrelated source')
+    record = make_record(unrelated, 'project')
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([record], root='unrelated-owner', owner='other', shared_cache=shared)
+    assert len(peer.commands) == 2 and len(peer.transfers) == 1
+    assert result['commits'] == {'project': record.commit}
+    assert (peer.root.parent / 'unrelated-owner/project/model.py').read_text() == 'different admitted input\n'
+
+
 def test_shared_publications_are_serialized_and_keep_both_snapshots(peer, tmp_path):
     from vaws_coordinator.shared_source_objects import copy_fixed_objects
     first = make_record(peer.source, 'project')
