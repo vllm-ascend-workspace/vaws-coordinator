@@ -194,6 +194,7 @@ def test_known_host_weight_mounts_keep_original_paths():
     assert 'if [ -e "$optional" ]; then' in bootstrap
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='executes Linux container import and dependency payload locally')
 def test_actual_verification_payload_reads_execution_source_and_metadata(tmp_path):
     from vaws_coordinator.parity import runtime_install_step_script
     root, image = tmp_path / 'execution', tmp_path / 'image-python'
@@ -219,5 +220,5 @@ def test_actual_verification_payload_reads_execution_source_and_metadata(tmp_pat
                                               container_identity='vaws-bob', step=step, python=sys.executable)
         result = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
                                 env={**os.environ, 'PYTHONPATH': str(image)}, timeout=30)
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == 0, result.stdout + result.stderr
         assert ('current-source' if step == 'verify-imports' else 'dependency-check=ok') in result.stdout
