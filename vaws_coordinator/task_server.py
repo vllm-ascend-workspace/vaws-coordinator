@@ -102,6 +102,18 @@ def call_tool(name: str, arguments: dict[str, Any] | None, metadata: dict | None
         if supplied and supplied != context["context_file"]:
             raise ValueError("context_file differs from this native Kimi caller")
         arguments["context_file"] = context["context_file"]
+    elif metadata and "x-codex-turn-metadata" in metadata:
+        # Native Codex tools/call supplies this object per invocation, including
+        # calls inside functions.exec which do not pass through PreToolUse.
+        turn = metadata["x-codex-turn-metadata"]
+        native = turn.get("thread_id") if isinstance(turn, dict) else None
+        if not isinstance(native, str) or not native.strip():
+            raise ValueError("invalid native Codex call identity")
+        context = AgentSessions().native_context("codex", native)
+        supplied = arguments.get("context_file")
+        if supplied and supplied != context["context_file"]:
+            raise ValueError("context_file differs from this native Codex caller")
+        arguments["context_file"] = context["context_file"]
     payload = vaws_call(canonical, arguments, allow_native_context=False)
     result = payload["result"]
     return {

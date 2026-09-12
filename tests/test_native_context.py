@@ -104,6 +104,80 @@ def test_kimi_mcp_call_metadata_is_per_call_and_visible_as_text(native_env, monk
         call_tool("vaws_session", {}, {"kimi_code/session_id": "first", "kimi_code/agent_id": "unknown-child"})
 
 
+def codex_call_metadata(native):
+    # Native Desktop capture: x-codex-turn-metadata is an object, not JSON text.
+    # Identity and unrelated values are synthetic; no user paths are retained.
+    return {"callId": "call-fixture", "threadId": native, "itemId": "item-fixture", "progressToken": 1,
+            "x-codex-turn-metadata": {
+                "session_id": native, "thread_id": native, "workspace_kind": "local", "turn_id": "turn-fixture",
+                "turn_started_at_unix_ms": 1, "thread_source": "user", "turn_trigger": "user",
+                "sandbox": "workspace-write", "sandbox_mode": "workspace-write", "auto_review_enabled": False,
+                "node_repl_auto_review_required": False, "node_repl_disabled": False, "workspaces": {},
+                "model": "fixture", "codex_version": "0.154.0-alpha.6.2", "reasoning_effort": "medium"}}
+
+
+def test_codex_native_call_metadata_routes_each_call_to_existing_attachment(native_env, monkeypatch, tmp_path):
+    import json
+    from vaws_coordinator.task_server import handle
+    store = AgentSessions(native_env)
+    first = store.attach("codex", "first", str(tmp_path / "first"))
+    second = store.attach("codex", "second", str(tmp_path / "second"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "unrelated-server-thread")
+    monkeypatch.setenv("CODEX_SESSION_ID", "unrelated-server-session")
+    monkeypatch.setattr(store, "attach", Mock(side_effect=AssertionError("call must not attach")))
+    monkeypatch.setattr("vaws_coordinator.task_server.AgentSessions", lambda: store)
+    for native, expected in (("first", first), ("second", second), ("first", first)):
+        arguments = {"full": True}
+        response = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "vaws_session", "arguments": arguments, "_meta": codex_call_metadata(native)}})
+        reply = response["result"]
+        assert not reply["isError"]
+        assert reply["structuredContent"]["data"]["session"]["id"] == expected["session"]["id"]
+        assert reply["structuredContent"]["data"]["attachment"]["cwd"] == expected["attachment"]["cwd"]
+        assert json.loads(reply["content"][0]["text"]) == reply["structuredContent"]
+        assert arguments == {"full": True}
+    assert len(store.sessions()) == 2
+    store.attach.assert_not_called()
+
+
+def test_codex_native_metadata_preserves_matching_context_and_rejects_conflict(native_env, tmp_path):
+    from vaws_coordinator.task_server import call_tool
+    store = AgentSessions(native_env)
+    first = store.attach("codex", "first", str(tmp_path))
+    second = store.attach("codex", "second", str(tmp_path))
+    assert not call_tool("vaws_session", {"context_file": first["context_file"]}, codex_call_metadata("first"))["isError"]
+    with pytest.raises(ValueError, match="differs from this native Codex caller"):
+        call_tool("vaws_session", {"context_file": second["context_file"]}, codex_call_metadata("first"))
+
+
+@pytest.mark.parametrize("turn", [None, "{\"thread_id\":\"native-first\"}", {},
+                                    {"session_id": "native-first"}, {"thread_id": ""}, {"thread_id": 42}])
+def test_codex_invalid_metadata_never_falls_back_to_process_identity(native_env, turn):
+    from vaws_coordinator.task_server import call_tool
+    with pytest.raises(ValueError, match="invalid native Codex call identity"):
+        call_tool("vaws_session", {}, {"threadId": "native-first", "x-codex-turn-metadata": turn})
+    assert not native_env.exists()
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"threadId": "native-first"}, {"session_id": "native-first"}])
+def test_codex_missing_call_metadata_has_no_alias_or_process_fallback(native_env, metadata):
+    from vaws_coordinator.task_server import call_tool
+    assert call_tool("vaws_session", {}, metadata)["isError"]
+    assert not native_env.exists()
+
+
+def test_codex_unknown_metadata_does_not_create_or_reassign_attachment(native_env, tmp_path):
+    from vaws_coordinator.task_server import call_tool
+    store = AgentSessions(native_env)
+    known = store.attach("codex", "known", str(tmp_path))
+    metadata = codex_call_metadata("unknown")
+    metadata["threadId"] = metadata["x-codex-turn-metadata"]["session_id"] = "known"
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        call_tool("vaws_session", {"context_file": known["context_file"]}, metadata)
+    assert len(store.sessions()) == 1
+    assert store.native_context("codex", "known")["context_file"] == known["context_file"]
+
+
 def test_kimi_nested_agent_hooks_keep_exact_parent(native_env, tmp_path):
     from vaws_coordinator.hooks.vaws_session import handle
     store = AgentSessions(native_env)
