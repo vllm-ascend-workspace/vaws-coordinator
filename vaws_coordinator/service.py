@@ -727,7 +727,8 @@ class CoordinatorService(TaskMessages):
         for role in roles:
             donor = self._donor_for_role(user, environment, role, used_hosts, need_distinct)
             if donor is None:
-                donor = self._ensure_user_container(user, environment, role, used_hosts, need_distinct)
+                donor = self._ensure_user_container(user, environment, role, used_hosts, need_distinct,
+                    on_progress=lambda event, role=role: self._save_container_progress(store, row, role['name'], event))
             if donor is None:
                 return {"status": "cache_miss", "reason": "no allowed host provides the requested environment",
                         "provisioning_started": False}
@@ -808,7 +809,7 @@ class CoordinatorService(TaskMessages):
         except Exception:
             return []
 
-    def _ensure_user_container(self, user, environment, role, used_hosts, require_distinct=False):
+    def _ensure_user_container(self, user, environment, role, used_hosts, require_distinct=False, *, on_progress=None):
         recipe = environment.get("recipe") or environment.get("image")
         if recipe and not provisionable_recipe(recipe):
             return None
@@ -859,6 +860,7 @@ class CoordinatorService(TaskMessages):
                     machine_type=machine_type or environment.get("machine_type"),
                     machines=getattr(self.backend, "machines", None),
                     reserve_port=reserve_port,
+                    **({'on_progress': on_progress} if on_progress is not None else {}),
                 )
                 ssh_port = result["ssh_port"]
             else:
@@ -883,6 +885,14 @@ class CoordinatorService(TaskMessages):
                 "service_ports": [],
             }
         return None
+
+    def _save_container_progress(self, store, row, role, event):
+        # Keep bounded phase facts in the existing execution log even after
+        # prepare-root replaces the current progress. No remote payloads/keys.
+        log = self.state_dir / 'runs' / row['id'] / role / 'prepare-container.log'
+        self._save_progress(store, row, role, {**event, 'log_ref': str(log)})
+        with log.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + '\n')
 
     def _save_progress(self, store, row, role, event):
         now = time.time()
