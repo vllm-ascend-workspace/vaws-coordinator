@@ -529,6 +529,7 @@ class CoordinatorService:
                                   "binding": binding, "npu_count": role.get("npu_count"),
                                   "devices": role.get("devices") or [],
                                   "service_port": role.get("service_port"),
+                                  **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
                                   "env": dict(role.get("env") or {})})
                 prepared_snapshots = placed.get("snapshots") or {}
                 if runtime_id in prepared_snapshots:
@@ -598,6 +599,7 @@ class CoordinatorService:
                 role.get("devices") or [], role.get("npu_count") or 0,
                 role["command"], merged_env, spec.get("timeout_seconds"),
                 service_port=role.get("service_port"), hold_go=hold_go,
+                **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
             )
             with self._lock_for("progress", row["id"]):
                 role["managed_job"] = job["id"]
@@ -728,6 +730,7 @@ class CoordinatorService:
         except TaskRootBusy as exc:
             return {"status": "waiting", "reason": str(exc)}
         ids = []
+        bindings = []
         snapshots = {}
         for (role, _donor), prepared in zip(placements, prepared_roles):
             if prepared is None:
@@ -739,13 +742,15 @@ class CoordinatorService:
                         "reason": "prepared environment does not match requested constraints",
                         "provisioning_started": True}
             ids.append(prepared["id"])
+            bindings.append(prepared.get("binding"))
             # Completed preparation already published and checked this exact
             # input. A second materialization would remove generated version
             # metadata/native copies and repeat successful preparation work.
             if (prepared.get("attestation", {}).get("preparation") or {}).get("source_id") == row["spec"]["source_snapshot"]["id"]:
                 snapshots[prepared["id"]] = {record["relpath"]: record["commit"]
                                              for record in row["spec"]["source_snapshot"]["records"]}
-        return {"runtime_ids": ids, "snapshots": snapshots, "reason": None, "provisioning_started": True}
+        return {"runtime_ids": ids, "bindings": bindings, "snapshots": snapshots,
+                "reason": None, "provisioning_started": True}
 
     def _donor_for_role(self, user, environment, role, used_hosts, require_distinct=False):
         catalog = self.pool.catalog()
@@ -859,7 +864,7 @@ class CoordinatorService:
 
     def _prepare_role(self, store, user, row, role, environment, donor):
         from vaws_coordinator.provision import prepare_task_environment
-        return prepare_task_environment(
+        prepared = prepare_task_environment(
             self.pool, user=user, session_id=row["id"], role_name=role["name"],
             environment=environment, donor=donor, sources=row.get("sources") or {},
             source_snapshot=row["spec"]["source_snapshot"],
@@ -867,7 +872,16 @@ class CoordinatorService:
             log_dir=self.state_dir / "runs" / row["id"] / role["name"],
             on_preparation_job=lambda job: self._save_preparation_job(store, row, role["name"], job),
             cancel_requested=lambda: self._adopt_cancel(store, row),
+            checkout_session=row["remote_session"]["id"],
         )
+        # Each finished role remains recoverable while its siblings prepare.
+        # A crash before this save is also covered by the pool's durable
+        # execution-session binding, which finish reads below.
+        if prepared.get("binding"):
+            with self._lock_for("progress", row["id"]):
+                row.setdefault("prepared_bindings", {})[role["name"]] = prepared["binding"]
+                store.save_execution(row)
+        return prepared
 
     def _save_preparation_job(self, store, row, role, job):
         with self._lock_for("progress", row["id"]):
@@ -1006,6 +1020,7 @@ class CoordinatorService:
                     "root": role["binding"]["endpoint"]["cwd"],
                     "rank": index,
                     "devices": devices,
+                    **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
                     "service_port": job.get("service_port"),
                     "state": job["state"],
                 })
@@ -1049,6 +1064,7 @@ class CoordinatorService:
             "state": job.get("state") or row.get("phase"),
             "runtime_id": role.get("runtime_id"),
             "service_port": job.get("service_port") if job.get("service_port") is not None else role.get("service_port"),
+            **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
             "host": endpoint.get("host"),
             "root": endpoint.get("cwd") or endpoint.get("root"),
             "endpoint": endpoint or None,
@@ -1179,6 +1195,7 @@ class CoordinatorService:
             "launch_env": binding.get("launch_env") or {},
             "launch_preamble": binding.get("launch_preamble") or "",
             "launch_observation": launch_observation,
+            **({"allow_external_busy": True} if (job or {}).get("request", {}).get("allow_external_busy") else {}),
             "environment": environment, "service_port": service_port,
             "state": state, "live": state in LIVE,
             "assignment": row.get("assignment"),
@@ -1252,8 +1269,11 @@ class CoordinatorService:
                 (row.get("user") for row in rows if row.get("user")), "")
             seen = set()
             for row in rows:
-                for role in row.get("roles") or []:
-                    binding = role.get("binding")
+                bindings = [role.get("binding") for role in row.get("roles") or []]
+                bindings.extend((row.get("prepared_bindings") or {}).values())
+                if row.get("remote_session"):
+                    bindings.extend(self.pool.session_bindings(user, row["remote_session"]["id"]))
+                for binding in bindings:
                     if not binding or binding["id"] in seen:
                         continue
                     seen.add(binding["id"])

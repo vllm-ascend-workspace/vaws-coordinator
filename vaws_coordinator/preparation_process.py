@@ -55,8 +55,8 @@ class PreparationProcess:
         record = {"endpoint": self.endpoint, "job_id": "prepare-" + uuid.uuid4().hex,
                   "step": self.step, "state": "pending", "quiet": False,
                   "stdout_offset": 0, "stderr_offset": 0}
-        # Persist BEFORE the first remote side effect. A lost prepare/go reply
-        # can always be stopped by this exact job id without replaying either.
+        # Persist BEFORE the first remote side effect. A lost launch reply can
+        # always be observed or stopped by this exact job id without replay.
         self.save(record)
         pending = {"stdout": "", "stderr": ""}
 
@@ -80,14 +80,13 @@ class PreparationProcess:
             return observation
 
         try:
-            observation = control(self.endpoint, record["job_id"], "prepare", spec={
+            observation = control(self.endpoint, record["job_id"], "launch", spec={
                 "command": script, "cwd": self.endpoint["cwd"], "env": {},
                 "timeout_seconds": self.timeout_seconds, "interactive": False,
-            })
+            }, authorization={}, stdout_offset=record["stdout_offset"],
+                stderr_offset=record["stderr_offset"], max_bytes=32768, yield_time_ms=1000)
+            emit(observation)
             _remember(record, observation, self.save)
-            if not self.cancel_requested():
-                observation = control(self.endpoint, record["job_id"], "go", authorization={})
-                _remember(record, observation, self.save)
             while True:
                 if self.cancel_requested():
                     if not stop_preparation_process(record, self.save):
@@ -98,7 +97,6 @@ class PreparationProcess:
                             break
                     emit({}, final=True)
                     raise PreparationCancelled("preparation command stopped with verified quiet")
-                observation = exchange()
                 if observation.get("unknown") or observation.get("state") in {"uncertain", "lost_outcome", "absent"}:
                     raise PreparationUncertain("preparation process outcome is unknown; command was not replayed")
                 if observation.get("quiet") and not any(observation.get(channel + "_bytes_remaining") for channel in pending):
@@ -108,6 +106,7 @@ class PreparationProcess:
                     if code is None:
                         raise PreparationUncertain("quiet preparation process has no command exit receipt")
                     return RemoteCompleted(int(code), "", "", timed_out=False)
+                observation = exchange()
         except (PreparationCancelled, PreparationUncertain):
             raise
         except Exception as exc:

@@ -111,6 +111,12 @@ reference connects to the original execution without rereading local sources.
 **Stop or finish.** Stop only this execution's managed process family, including
 children. Confirm it is terminal, its assigned devices are observable and free,
 and its service ports are no longer listening before releasing its resources.
+An execution admitted with `resources.allow_external_busy=true` on one explicit
+physical device may leave external NPU users running. It releases only its own
+lease after managed descendant completion and port checks; external occupancy
+is neither owned work nor evidence that the managed process is still alive.
+Its retained process guard remains authoritative after heartbeat loss. A grant
+that never activated can expire or be cancelled even while external workers run.
 Return and verify the prepared root for reuse through the existing pool path. Keep
 the container, SSH endpoint, prepared environments, worktrees and evidence.
 Thus stopping a model releases that model execution's NPUs; an idle local task

@@ -61,6 +61,12 @@ class TaskClient:
 
     def run(self, command, *, sources=None, env=None, environment=None, resources=None, topology=None,
             timeout_seconds=1800, service=None, restart=False, preflight=None):
+        """Admit fixed inputs and resources for one supervised execution.
+
+        ``resources={"devices": [id], "allow_external_busy": True}`` explicitly
+        shares one physical NPU with external processes. Other managed leases
+        remain exclusive; stopping this execution only stops its own family.
+        """
         if not command or not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
         env = validate_user_env(env)

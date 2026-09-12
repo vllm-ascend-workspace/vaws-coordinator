@@ -18,5 +18,6 @@ def launch_observation(binding, request, spec, environment):
         "machine": (binding.get("host_endpoint") or {}).get("host"),
         "command": spec["command"],
         "npu_devices": [int(value) for value in environment.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",") if value],
+        **({"allow_external_busy": True} if request.get("allow_external_busy") else {}),
         "scope": "managed launch attestation; does not inspect later runtime mutations",
     }

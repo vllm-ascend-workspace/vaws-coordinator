@@ -72,6 +72,17 @@ class TaskRegistry:
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_shared_device_schema_requires_explicit_single_card_opt_in(self):
+        from jsonschema import Draft202012Validator, ValidationError
+
+        schema = next(tool["inputSchema"] for tool in list_tools() if tool["name"] == "vaws_run")
+        validator = Draft202012Validator(schema)
+        validator.validate({"command": "serve", "resources": {"devices": [0], "allow_external_busy": True}})
+        for resources in ({"allow_external_busy": True}, {"devices": [0, 1], "allow_external_busy": True},
+                          {"devices": [0], "allow_external_busy": "true"}):
+            with self.subTest(resources=resources), self.assertRaises(ValidationError):
+                validator.validate({"command": "serve", "resources": resources})
+
     def test_tools_list_advertises_the_four_portable_names_with_their_own_schemas(self):
         tools = list_tools()
         self.assertEqual([tool["name"] for tool in tools], ["vaws_session", "vaws_run", "vaws_execution", "vaws_finish"])
@@ -187,6 +198,18 @@ class DispatchTests(unittest.TestCase):
         spec = owner.admit.call_args.args[3]
         self.assertEqual(spec["source_snapshot"]["records"], [])
         self.assertEqual(spec["resources"], {"npu_count": 0})
+
+    def test_vaws_run_forwards_explicit_shared_device_in_fixed_admission(self):
+        owner = mock.Mock()
+        owner.admit.return_value = {"execution_id": "e" * 64, "state": "queued"}
+        owner.runtime = None
+        with mock.patch("vaws_coordinator.service.ensure_daemon", return_value=owner):
+            result = self.call("vaws_run", command="serve", sources={},
+                               resources={"devices": [0], "allow_external_busy": True})
+        self.assertFalse(result["isError"])
+        spec = owner.admit.call_args.args[3]
+        self.assertEqual(spec["resources"], {"devices": [0], "allow_external_busy": True})
+        self.assertTrue(spec["roles"][0]["allow_external_busy"])
 
     def test_accepted_execution_progress_is_not_an_mcp_error(self):
         from vaws_coordinator.task_client import TaskClient

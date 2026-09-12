@@ -58,6 +58,18 @@ execution has its own work directory, while compatible prepared artifacts can
 be reused. Independent host preparations run concurrently, bounded to four
 workers and one active preparation per host.
 
+To share one explicitly selected physical NPU with existing external workers,
+pass `resources={"devices": [0], "allow_external_busy": True}` to `client.run`
+or `vaws_run`. Use `topology={"host": "selected-host"}` to bind the host too.
+The option is fixed at admission and requires exactly one explicit device;
+omitting it keeps the normal occupancy checks. It permits observed external
+process/HBM use, without estimating or reserving free memory. Other coordinator
+leases and holds still conflict, and unknown or missing hardware is not usable.
+The managed supervisor must retain its own process guard until completion.
+Stop/finish only terminates this execution's family and releases its lease once
+that family has drained and its ports are clear; existing workers remain running.
+The assignment, launch observation and execution target expose the sharing flag.
+
 `run(..., service="model")` ensures identical fixed sources and configuration.
 Changed inputs report the differing fields; `restart=True` replaces the service
 only after the old execution has stopped and released resources. Connecting
@@ -159,6 +171,16 @@ Managed launches prepend their selected source directories to Python's import
 path. This prevents repository directories
 in the task cwd from shadowing editable packages, while preserving the CANN
 and other support paths already supplied by the environment.
+
+The first native environment and rebuilt outputs receive a full framework
+import smoke. A fresh Python source view can reuse that original evidence when
+its dependency/native inputs, loader environment and complete artifact hashes
+match; preparation checks the current module and SCM metadata mappings without
+importing the changed business code. Its receipt explicitly records
+`python_import_executed=false`, keeps the original import result, and makes no
+claim that the new Python source passed. The business execution reports its own
+result. Incomplete old evidence or cwd-dependent loader paths retain the full
+import check.
 
 For serving, `service_port=0` asks the host coordinator to select a free port.
 If a task runtime has no declared service ports, automatic selection uses the
@@ -289,3 +311,10 @@ interpreter and a placeholder service port of zero, and must not require devices
 or start a service. Failure retains original stderr references and does not launch
 the business command. Planned Run Manifests can record early failure/inconclusive
 outcomes without inventing a running stage.
+
+Managed runs validate fixed inputs and binding/resource parameters before queueing;
+they verify the complete remote environment and source view after the grant,
+before preparing or authorizing the business command. A failed verification retains
+its error and drains the owned job before returning resources. Unknown process or
+host state keeps cleanup pending. Standalone `RuntimePool.request_run` also retains
+its remote verification before queueing.

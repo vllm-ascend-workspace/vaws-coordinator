@@ -7,6 +7,7 @@ may be visible through ``venv --system-site-packages``.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -115,6 +116,7 @@ def prepare_task_environment(
     log_dir=None,
     on_preparation_job=None,
     cancel_requested=None,
+    checkout_session=None,
 ) -> dict[str, Any]:
     """Create an isolated task root, install into a task-owned interpreter, register.
 
@@ -137,6 +139,7 @@ def prepare_task_environment(
     root = isolated_root(session_id, role_name, host)
     python = isolated_python(root)
     runtime_id = task_runtime_id(session_id, host, role_name)
+    checkout_request = hashlib.sha256(f"{session_id}:{runtime_id}:{role_name}".encode()).hexdigest()
     donor_python = donor.get("python")
     if donor_python and python == donor_python:
         raise ValueError("task-owned interpreter must not be the donor interpreter")
@@ -147,7 +150,14 @@ def prepare_task_environment(
         if existing.get('root') != root:
             raise ValueError('runtime identity resolves to a different execution root')
         if existing.get("state") in {"ready", "bound"}:
-            return next(row for row in _runtime_rows(pool) if row["id"] == existing["runtime_id"])
+            runtime = next(row for row in _runtime_rows(pool) if row["id"] == existing["runtime_id"])
+            if checkout_session:
+                binding = pool.checkout(user, checkout_session, runtime['attestation']['profile_key'],
+                                        checkout_request, runtime['id'])
+                if binding.get('status') == 'cache_miss':
+                    raise TaskRootBusy('execution root is not available for its managed binding')
+                return {**runtime, 'binding': binding}
+            return runtime
         raise TaskRootBusy(f"execution root {root} exists but is not verified; inspect its retained evidence")
 
     raw_host = donor.get("host_endpoint") or {}
@@ -248,6 +258,8 @@ def prepare_task_environment(
         on_progress=on_progress, log_dir=log_dir,
         on_preparation_job=on_preparation_job, cancel_requested=cancel_requested,
     )
+    if checkout_session:
+        return pool._register_checkout(runtime_id, spec, user, checkout_session, checkout_request)
     return pool.register(runtime_id, spec)
 
 

@@ -39,7 +39,8 @@ def task_preamble(binding):
 class ManagedExecution:
     def managed_start(self, owner, binding_id, request_id, snapshots, expected_build_key,
                       devices, npu_count, command, env, timeout_seconds=1800,
-                      priority=0, queue_seconds=1800, service_port=None, hold_go=False):
+                      priority=0, queue_seconds=1800, service_port=None, hold_go=False,
+                      allow_external_busy=False):
         if not isinstance(command, str) or not command.strip() or len(command) > 200000:
             raise ValueError("a bounded nonempty shell command is required")
         if not isinstance(env, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
@@ -53,10 +54,16 @@ class ManagedExecution:
             raise ValueError("queue_seconds must be 1..86400")
         if service_port is not None and (type(service_port) is not int or service_port < 0):
             raise ValueError("service_port must be None, 0, or a positive declared runtime service port")
+        if type(allow_external_busy) is not bool or (allow_external_busy and (
+                not isinstance(devices, list) or len(devices) != 1 or npu_count
+                or any(type(device) is not int or device < 0 for device in devices))):
+            raise ValueError("allow_external_busy requires a boolean and exactly one explicit physical device")
         key = digest([owner, binding_id, request_id])
         request = {"binding_id": binding_id, "request_id": request_id, "snapshots": snapshots,
                    "expected_build_key": expected_build_key, "devices": devices, "npu_count": npu_count,
                    "priority": priority, "queue_seconds": queue_seconds, "service_port": service_port}
+        if allow_external_busy:
+            request["allow_external_busy"] = True
         specification = {"command": command, "env": env, "timeout_seconds": timeout_seconds,
                          "requested_service_port": service_port}
         with self.lock, self.transaction() as db:
@@ -121,9 +128,14 @@ class ManagedExecution:
                         job["state"] = "cancelled"
                         job["runtime_returned"] = False
                         return self._save_managed(job)
-                    run = self.request_run(job["owner"], **job["request"])
+                    # Fixed inputs and binding/lease parameters are admitted
+                    # locally. The complete remote fact check runs after the
+                    # grant, before any payload is prepared or authorized.
+                    run = self._request_run(job["owner"], **job["request"], check_remote=False)
                 else:
                     run = self.control(job["owner"], key, "poll", _managed=True)
+                if run.get("preflight_error"):
+                    job["preflight_error"] = run["preflight_error"]
                 job["lease_state"] = run["state"]
                 if run.get("environment"):
                     job["environment"] = run["environment"]
@@ -138,14 +150,15 @@ class ManagedExecution:
                     # completion_confirmed or disable retain_until_release.
                     observed = {**observed, "quiet": False}
                 job["remote"] = observed
-                if run["state"] in {"uncertain", "pending"}:
+                if run["state"] in {"uncertain", "pending"} and not job.get("preflight_error"):
                     job.update(state="waiting" if run["state"] == "pending" else "uncertain", error=run.get("error"))
                     return self._save_managed(job)
 
                 timed_out = (observed.get("result") or {}).get("state") == "timeout"
                 if timed_out:
                     job["timed_out"] = True
-                if run["state"] == "orphaned_busy" and not job["cancel_requested"] and not timed_out:
+                if (run["state"] == "orphaned_busy" and not job["cancel_requested"]
+                        and not job.get("preflight_error") and not timed_out):
                     # Host quarantine is not proof of a dead family. Heartbeat
                     # is the only recovery that moves orphaned_busy back to
                     # active; a live marked family is never stopped here.
@@ -156,7 +169,7 @@ class ManagedExecution:
                                    error="host quarantines the lease; the live family is preserved")
                         return self._save_managed(job)
                 lost_lease = run["state"] in LEASE_TERMINAL
-                if job["cancel_requested"] or lost_lease or timed_out:
+                if job["cancel_requested"] or job.get("preflight_error") or lost_lease or timed_out:
                     if not observed["quiet"]:
                         job["remote"] = self.backend.job(runtime, job["job_id"], "stop", force=job["force"])
                         job["state"] = "stopping"
@@ -174,6 +187,13 @@ class ManagedExecution:
                     return self._save_managed(job)
                 if run["state"] == "granted":
                     run = self.control(job["owner"], key, "preflight", _managed=True)
+                    if run.get("preflight_error"):
+                        job["preflight_error"] = run["preflight_error"]
+                        if not observed["quiet"]:
+                            job["remote"] = self.backend.job(runtime, job["job_id"], "stop", force=job["force"])
+                            job["state"] = "stopping"
+                            return self._save_managed(job)
+                        return self._finish_managed(job, run, binding, runtime, observed)
                 if run["state"] == "starting":
                     receipt = launch_observation(binding, job["request"], job["spec"], run["environment"])
                     job["launch_observation"] = receipt
@@ -264,12 +284,14 @@ class ManagedExecution:
             return self._save_managed(job)
         # Execution owns the process family, NPU lease and service port.
         # The task keeps its mutable work root until vaws_finish.
-        state = ("cancelled" if job["cancel_requested"] else "timeout" if job.get("timed_out")
+        state = ("failed" if job.get("preflight_error") else "cancelled" if job["cancel_requested"] else "timeout" if job.get("timed_out")
                  else observed.get("state", "lost_outcome"))
         job["state"] = state if state in JOB_TERMINAL else "inconclusive"
         job["remote"] = observed
         job["runtime_returned"] = False
-        if job["state"] == "inconclusive" and run["state"] == "expired" and not job.get("had_receipt"):
+        if job.get("preflight_error"):
+            job["error"] = job["preflight_error"]
+        elif job["state"] == "inconclusive" and run["state"] == "expired" and not job.get("had_receipt"):
             job["error"] = "lease expired before the command started: " + (run.get("task", {}).get("message") or "activation deadline elapsed")
         else:
             job.pop("error", None)

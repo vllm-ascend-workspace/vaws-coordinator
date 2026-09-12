@@ -119,7 +119,14 @@ files = installed_native_files(root)
 
 evidence_dir = root / ".vaws-runtime/profile-evidence"
 evidence_dir.mkdir(parents=True, exist_ok=True)
-result = subprocess.run(
+inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))
+if reuse.get('kind') == 'native' and reuse.get('compatibility_evidence'):
+    compatibility = json.loads(checked_file(root, reuse['compatibility_evidence']).read_text())
+    smoke = {'kind': 'native-compatibility-reuse', 'python_import_executed': False,
+             'profile_key': profile_key(profile), 'build_inputs': inputs,
+             'compatibility': compatibility, 'source_mapping': native_source_mapping(root)}
+else:
+    result = subprocess.run(
     [sys.executable, "-c", """import json, pathlib, sys, importlib.metadata
 import torch_npu, vllm, vllm_ascend, acl
 import vllm_ascend.vllm_ascend_C as extension
@@ -130,15 +137,15 @@ if not all(path.is_relative_to(root) for path in paths.values()):
 print(json.dumps({'python': sys.executable, 'imports': {k: str(v) for k,v in paths.items()}, 'vllm': importlib.metadata.version('vllm'), 'vllm_ascend': importlib.metadata.version('vllm-ascend')}))
 """, str(root)],
     capture_output=True, text=True, encoding="utf-8", timeout=30,
-)
-smoke = {"passed": result.returncode == 0, "profile_key": profile_key(profile),
-         "stdout": result.stdout[-4000:], "stderr": result.stderr[-8000:]}
+    )
+    smoke = {"passed": result.returncode == 0, "profile_key": profile_key(profile),
+             "stdout": result.stdout[-4000:], "stderr": result.stderr[-8000:]}
+    if not smoke['passed']:
+        (evidence_dir / 'smoke.json').write_text(json.dumps(smoke, indent=2) + '\n')
+        raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
 (evidence_dir / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
-if not smoke["passed"]:
-    raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
 (evidence_dir / "cann.json").write_text(json.dumps(profile["system_files"]["cann"], sort_keys=True) + "\n")
 (evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
-inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))
 evidence = {name: ".vaws-runtime/profile-evidence/" + name + ".json" for name in ("cann", "driver", "smoke")}
 if toolchain:
     evidence["toolchain_log"] = toolchain["path"]
@@ -151,7 +158,8 @@ marker = root / ".vaws-runtime/ready-profile.json"
 temp = marker.with_suffix(".tmp")
 temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 os.replace(temp, marker)
-print(json.dumps(manifest))
+print(json.dumps({'manifest': str(marker), 'profile_key': manifest['profile_key'],
+                  'build_key': manifest['build_key']}))
 '''
 
 
