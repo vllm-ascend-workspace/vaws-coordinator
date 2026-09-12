@@ -394,6 +394,20 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             raise ValueError("task-owned interpreter must not be the donor interpreter")
         if source_snapshot is None:
             raise ValueError('preparation requires fixed execution source inputs')
+        versions = {record['relpath']: {'version': record.get('scm_version'), 'source_head': record.get('source_head')}
+                    for record in source_snapshot.get('records', []) if record['relpath'] in ('vllm', 'vllm-ascend')}
+        publication = None
+        if native_recipe:
+            if any(not row['version'] for row in versions.values()):
+                raise ValueError('native preparation requires captured source SCM versions')
+            if reuse and reuse['kind'] == 'native':
+                try:
+                    native_compatibility_key(reuse['runtime']['attestation'])
+                except (KeyError, ValueError):
+                    pass
+                else:
+                    from vaws_coordinator.native_publication import NativeViewPublication
+                    publication = NativeViewPublication(spec, reuse['runtime'], versions)
         container = SshEndpoint(host=endpoint["host"], port=int(endpoint["port"]), user=endpoint["user"])
         def owned_process(step):
             if on_preparation_job is None:
@@ -416,7 +430,10 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
 
         if log_dir is not None:
             Path(log_dir).mkdir(parents=True, exist_ok=True)
-        scripts = [("prepare-root", prepare_isolated_root_script(root))]
+        # Fixed materialization already creates and validates its private root.
+        # A same-native view can publish in that owned operation, without a
+        # preceding reset/RPC or a second publication process.
+        scripts = [] if publication is not None else [("prepare-root", prepare_isolated_root_script(root))]
         if (native_recipe and (not reuse or reuse['kind'] != 'native')) or (not native_recipe and not donor_python):
             scripts.append(("create-venv", create_venv_script(root, python, donor_python)))
         for step, script in scripts:
@@ -451,34 +468,29 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                                 process=owned_process(step))
             check_cancel()
         identity = spec.get("container_name") or ("vaws-" + spec["user"])
+        check_cancel()
         log = progress("materialize")
         if sources:
-            materialize_fixed_sources(
+            materialized = materialize_fixed_sources(
                 workspace_id=identity, endpoint=endpoint, source_snapshot=source_snapshot,
                 host_endpoint=spec['host_endpoint'],
                 log_path=log, process=owned_process("materialize"),
                 on_progress=lambda event: progress("materialize", event),
+                **({'native_publication': publication} if publication is not None else {}),
             )
         check_cancel()
-        versions = {record['relpath']: {'version': record.get('scm_version'), 'source_head': record.get('source_head')}
-                    for record in source_snapshot.get('records', []) if record['relpath'] in ('vllm', 'vllm-ascend')}
         if native_recipe:
-            if any(not row['version'] for row in versions.values()):
-                raise ValueError('native preparation requires captured source SCM versions')
-            if reuse and reuse['kind'] == 'native':
-                previous = reuse['runtime']
-                try:
-                    native_compatibility_key(previous['attestation'])
-                except (KeyError, ValueError):
-                    # An old environment without complete compatibility facts
-                    # still needs one ordinary preparation/attestation pass.
-                    pass
+            if publication is not None:
+                if 'native_view' in materialized:
+                    prepared = publication.accept(materialized['native_view'])
                 else:
+                    # A composite program exceeding the existing command byte
+                    # budget retains the original two-operation path.
                     log = progress('publish-native-view')
-                    prepared = self._prepare_native_view(spec, previous, versions,
+                    prepared = self._prepare_native_view(spec, reuse['runtime'], versions,
                         process=owned_process('publish-native-view'), log_path=log)
-                    check_cancel()
-                    return PreparedNativeView(prepared)
+                check_cancel()
+                return PreparedNativeView(prepared)
             preparation_data = {'versions': versions, 'build_env': source_snapshot.get('build_env', {})}
             write = 'mkdir -p ' + shlex.quote(root + '/.vaws-runtime') + '\nprintf %s ' + shlex.quote(json.dumps(preparation_data)) + ' > ' + shlex.quote(root + '/.vaws-runtime/build-source.json')
             self.bash(endpoint, write)

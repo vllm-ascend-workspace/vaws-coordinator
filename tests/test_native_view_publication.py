@@ -277,11 +277,15 @@ def test_actual_backend_script_publishes_once_and_launch_checks_only_mutable_fac
         backend.verify_preflight(runtime)
 
 
-def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch):
+@pytest.mark.parametrize('mode', ['combined', 'oversized', 'uncertain', 'cancelled-before'])
+def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch, mode):
     from vaws_coordinator import backend as adapters, parity, parity_support
     backend = adapters.RemoteBackend()
     seen = []
     published = {'completed': 'native-view'}
+    from types import SimpleNamespace
+    publication = SimpleNamespace(accept=lambda reply: published if reply == {'published': True} else pytest.fail('wrong native proof'))
+    monkeypatch.setattr('vaws_coordinator.native_publication.NativeViewPublication', lambda *args: publication)
     snapshot = {'id': 'accepted', 'records': [
         {'relpath': name, 'scm_version': '2.1', 'source_head': 'accepted-head'}
         for name in ('vllm', 'vllm-ascend')]}
@@ -293,7 +297,12 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
         assert kwargs['source_snapshot'] is snapshot
         assert kwargs['endpoint'] is spec['endpoint']
         assert isinstance(kwargs['process'], PreparationProcess)
+        assert kwargs['native_publication'] is publication
         seen.append('materialize')
+        if mode == 'uncertain':
+            from vaws_coordinator.preparation_process import PreparationUncertain
+            raise PreparationUncertain('lost composite operation')
+        return {'native_view': {'published': True}} if mode == 'combined' else {}
     monkeypatch.setattr(parity, 'materialize_fixed_sources', materialize)
     from remote_dev.core.ssh_transport import RemoteCompleted
     monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script',
@@ -304,12 +313,27 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
     monkeypatch.setattr(backend, '_write_ready_profile', lambda *a, **k: pytest.fail('hot preparation must not recapture'))
     monkeypatch.setattr(backend, '_shared_native', lambda *a, **k: pytest.fail('hot donor needs no shared cache lookup'))
     progress = []
-    result = backend.prepare_task_root(spec, sources={'vllm': '/local/vllm', 'vllm-ascend': '/local/ascend'},
-        environment={}, source_snapshot=snapshot, reuse={'kind': 'native', 'runtime': {'attestation': {}}},
-        on_progress=lambda event: progress.append(event['step']), on_preparation_job=lambda *a, **k: None)
+    def prepare():
+        return backend.prepare_task_root(spec, sources={'vllm': '/local/vllm', 'vllm-ascend': '/local/ascend'},
+            environment={}, source_snapshot=snapshot, reuse={'kind': 'native', 'runtime': {'attestation': {}}},
+            on_progress=lambda event: progress.append(event['step']), on_preparation_job=lambda *a, **k: None,
+            cancel_requested=lambda: mode == 'cancelled-before')
+    if mode == 'cancelled-before':
+        from vaws_coordinator.preparation_process import PreparationCancelled
+        with pytest.raises(PreparationCancelled):
+            prepare()
+        assert seen == [] and progress == []
+        return
+    if mode == 'uncertain':
+        from vaws_coordinator.preparation_process import PreparationUncertain
+        with pytest.raises(PreparationUncertain):
+            prepare()
+        assert seen == ['materialize']
+        return
+    result = prepare()
     assert isinstance(result, adapters.PreparedNativeView) and result.attestation is published
-    assert seen == ['prepare-root', 'materialize', 'publish']
-    assert progress == ['prepare-root', 'materialize', 'publish-native-view']
+    assert seen == (['materialize'] if mode == 'combined' else ['materialize', 'publish'])
+    assert progress == (['materialize'] if mode == 'combined' else ['materialize', 'publish-native-view'])
 
 
 @pytest.mark.parametrize('uncertain', [False, True])
