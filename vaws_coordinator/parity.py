@@ -7,11 +7,13 @@ script by filesystem path.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -162,11 +164,13 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                'records': [{'relpath': row.relpath, 'commit': row.commit, 'tree': row.tree,
                             'submodules': row.submodules,
                             'mirror': mirror_path_for(cache, workspace_id, row)} for row in records]}
-    script = ('python3 - <<\'VAWS_FIXED_SOURCES\'\n' + inspect.getsource(_materialize_fixed)
-              + '\nimport json\nprint(json.dumps(_materialize_fixed(' + repr(request)
-              + '), separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
+    def command():
+        return ('python3 - <<\'VAWS_FIXED_SOURCES\'\n' + inspect.getsource(_materialize_fixed)
+                  + '\nimport json\nprint(json.dumps(_materialize_fixed(' + repr(request)
+                  + '), separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
 
     def run():
+        script = command()
         result = ssh_exec_stream(container, script, stream_progress=False,
                                  log_path=log_path, process=process)
         try:
@@ -193,6 +197,20 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                 workspace_id=workspace_id, record=record, remote_carrier_commit=row.get('carrier'))
             if on_progress:
                 on_progress({'phase': 'push-mirror', 'relpath': record.relpath})
+            pack = _fixed_inline_pack(repo, record.commit, carrier, row.get('carrier'))
+            if pack is not None:
+                # The next persisted preparation job receives and materializes
+                # the exact objects over its existing authenticated transport.
+                request.setdefault('inline_packs', {})[str(row['index'])] = pack
+                # The owned worker invokes bash -c. Bound the whole argument,
+                # including base64, all repositories and the remote program,
+                # below Linux's per-argument limit; overflow uses Git below.
+                if len(command().encode('utf-8')) <= 96 * 1024:
+                    if on_progress:
+                        on_progress({'phase': 'push-mirror-complete', 'relpath': record.relpath,
+                                     'transport': 'owned-rpc-pack', 'bytes': pack['bytes']})
+                    continue
+                del request['inline_packs'][str(row['index'])]
             # Exact OIDs are the source, including the carrier. A concurrent
             # capture can move local refs without changing this execution.
             # Git owns its receive process/atomic refs; never kill or delete a
@@ -211,6 +229,30 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
             or result.get('root') != root or result.get('commits') != expected):
         raise ParityUnavailable('fixed source materialization did not verify the admitted inputs')
     return result
+
+
+def _fixed_inline_pack(repo, commit, carrier, previous, *, limit=65536):
+    """Bound small edits by a freshly observed carrier; cold/large input uses Git."""
+    if not previous or not re.fullmatch(r'[0-9a-f]{40,64}', previous):
+        return None
+    if git(repo, ['cat-file', '-e', previous + '^{commit}'], check=False).returncode:
+        return None
+    # A temporary file bounds memory even when a nominal edit contains a large
+    # new blob. No network or shared refs are mutated while constructing it.
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            ['git', '-C', str(repo), 'pack-objects', '--stdout', '--revs', '--delta-base-offset', '--compression=1'],
+            input=(commit + '\n' + carrier + '\n^' + previous + '\n').encode('ascii'),
+            stdout=output, stderr=subprocess.PIPE, timeout=DEFAULT_GIT_TRANSPORT_TIMEOUT_SECONDS,
+        )
+        if result.returncode:
+            raise RuntimeError('fixed source pack failed: ' + result.stderr.decode('utf-8', errors='replace'))
+        if output.tell() > limit:
+            return None
+        output.seek(0)
+        data = output.read()
+    return {'previous': previous, 'carrier': carrier, 'bytes': len(data),
+            'sha256': hashlib.sha256(data).hexdigest(), 'data': base64.b64encode(data).decode('ascii')}
 
 
 DEFAULT_ENV_PREAMBLE = (

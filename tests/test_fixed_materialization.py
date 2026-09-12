@@ -112,6 +112,9 @@ def test_concurrent_roots_ignore_mutable_mirror_refs(peer):
 
 
 def test_missing_reply_does_not_touch_root_and_transfer_failure_keeps_mirror(peer, monkeypatch):
+    # Keep exercising the large/cold Git transport fallback rather than the
+    # small edit path carried by the existing owned preparation operation.
+    monkeypatch.setattr(parity, '_fixed_inline_pack', lambda *args, **kwargs: None)
     first = make_record(peer.source, 'project')
     peer.run([first])
     receipt = peer.root / '.vaws-runtime/source-materialization.json'
@@ -131,6 +134,108 @@ def test_missing_reply_does_not_touch_root_and_transfer_failure_keeps_mirror(pee
     assert receipt.read_bytes() == before
     mirror = parity.mirror_path_for(str(peer.cache), 'test', first)
     assert git(mirror, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+
+
+def test_small_edit_uses_owned_rpc_pack_and_preserves_previous_root(peer):
+    first = make_record(peer.source, 'project')
+    peer.run([first])
+    before = (peer.root / '.vaws-runtime/source-materialization.json').read_bytes()
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    second = make_record(peer.source, 'project')
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([second], root='second')
+    assert result['commits'] == {'project': second.commit}
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert "'inline_packs':" in peer.commands[-1]
+    assert (peer.root.parent / 'second/project/model.py').read_text() == 'value = 2\n'
+    assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
+    assert (peer.root / '.vaws-runtime/source-materialization.json').read_bytes() == before
+    mirror = parity.mirror_path_for(str(peer.cache), 'test', first)
+    for row in (first, second):
+        assert git(mirror, 'rev-parse', 'refs/vaws/snapshots/' + row.commit) == row.commit
+
+
+@pytest.mark.parametrize('damage, message', [('digest', 'size or digest differs'),
+                                            ('base', 'prerequisite disappeared')])
+def test_invalid_inline_pack_never_materializes_or_changes_pins(peer, monkeypatch, damage, message):
+    first = make_record(peer.source, 'project')
+    peer.run([first])
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    second = make_record(peer.source, 'project')
+    original = parity._fixed_inline_pack
+    def corrupt(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert result is not None
+        result['sha256' if damage == 'digest' else 'previous'] = '0' * (64 if damage == 'digest' else 40)
+        return result
+    monkeypatch.setattr(parity, '_fixed_inline_pack', corrupt)
+    peer.commands.clear()
+    peer.transfers.clear()
+    with pytest.raises(RuntimeError, match=message):
+        peer.run([second], root='second')
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert not (peer.root.parent / 'second/.vaws-runtime/source-materialization.json').exists()
+    assert not (peer.root.parent / 'second/project').exists()
+    mirror = parity.mirror_path_for(str(peer.cache), 'test', first)
+    assert git(mirror, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+    assert subprocess.run(['git', '-C', mirror, 'show-ref', '--verify',
+                           'refs/vaws/snapshots/' + second.commit], capture_output=True).returncode
+
+
+def test_unknown_inline_materialization_is_not_replayed(peer, monkeypatch):
+    peer.run()
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    calls = []
+    def uncertain(endpoint, script, **kwargs):
+        calls.append(script)
+        if len(calls) == 2:
+            raise RuntimeError('owned process outcome is unknown')
+        return peer.stream(endpoint, script, **kwargs)
+    monkeypatch.setattr(parity, 'ssh_exec_stream', uncertain)
+    peer.transfers.clear()
+    with pytest.raises(RuntimeError, match='outcome is unknown'):
+        peer.run(root='second')
+    assert len(calls) == 2 and not peer.transfers
+
+
+@pytest.mark.parametrize('size', [100000, 300000])
+def test_large_edit_keeps_git_transport_fallback(peer, size):
+    peer.run()
+    (peer.source / 'large.bin').write_bytes(os.urandom(size))
+    git(peer.source, 'add', '.')
+    git(peer.source, 'commit', '-qm', 'large new blob')
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run(root='second')
+    assert len(peer.commands) == 2 and len(peer.transfers) == 1
+    assert (peer.root.parent / 'second/project/large.bin').read_bytes() == (peer.source / 'large.bin').read_bytes()
+
+
+def test_multiple_inline_packs_respect_total_command_argument_limit(peer):
+    other = peer.source.parent / 'other-source'
+    git(peer.source.parent, 'clone', '-q', str(peer.source), str(other))
+    git(other, 'config', 'user.name', 'Test')
+    git(other, 'config', 'user.email', 'test@example.invalid')
+    names = [(peer.source, 'project'), (other, 'other')]
+    peer.run([make_record(path, name) for path, name in names])
+    for path, _ in names:
+        (path / 'new.bin').write_bytes(os.urandom(50000))
+        git(path, 'add', '.')
+        git(path, 'commit', '-qm', 'medium edit')
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run([make_record(path, name) for path, name in names], root='second')
+    assert len(peer.commands) == 2 and len(peer.transfers) == 1
+    assert len(peer.commands[-1].encode()) <= 96 * 1024
+    # Exercise the exact worker invocation: argv, not bash stdin.
+    result = subprocess.run(['bash', '-c', peer.commands[-1]], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    for path, name in names:
+        assert (peer.root.parent / 'second' / name / 'new.bin').read_bytes() == (path / 'new.bin').read_bytes()
 
 
 def test_retry_same_inputs_repairs_tracked_and_untracked_files(peer):

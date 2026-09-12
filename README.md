@@ -330,6 +330,11 @@ Incomplete or conflicting evidence stays an error.
 Managed source materialization consumes the admitted Git snapshot directly in
 one remote operation. Existing immutable mirror objects are reused; a completed
 missing-object response uploads only those objects before a new owned job.
+Small edits use a bounded Git pack in that next owned job over the existing
+RPC connection. The complete command, including all encoded packs, is capped
+below the remote worker's argument limit; cold or larger transfers retain Git
+SSH. Pack contents, prerequisite commit and resulting tree are verified before
+atomically publishing snapshot refs or materializing the execution view.
 Each execution retains independent working files, a stable per-root lock, and
 final HEAD and dirty-state checks across parent repositories and submodules.
 Uncertain jobs are observed, never replayed. Runtime compatibility, native

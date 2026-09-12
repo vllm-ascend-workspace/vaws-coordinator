@@ -403,6 +403,7 @@ def _materialize_fixed(request):
     transfer requests. Only initialization and one root's checkout are locked;
     both locks are released by the OS when this process dies.
     """
+    import base64
     import contextlib
     import fcntl
     import hashlib
@@ -452,6 +453,29 @@ def _materialize_fixed(request):
                 git(mirror.parent, 'init', '--bare', str(mirror))
             if git(mirror, 'rev-parse', '--is-bare-repository').stdout.strip() != 'true':
                 raise ValueError(f'expected a bare mirror: {mirror}')
+            pack = request.get('inline_packs', {}).get(str(index))
+            if pack is not None:
+                data = base64.b64decode(pack['data'], validate=True)
+                if (len(data) > 65536 or len(data) != pack['bytes']
+                        or hashlib.sha256(data).hexdigest() != pack['sha256']):
+                    raise ValueError('fixed source pack size or digest differs')
+                if git(mirror, 'cat-file', '-e', pack['previous'] + '^{commit}', check=False).returncode:
+                    raise ValueError('fixed source pack prerequisite disappeared')
+                received = subprocess.run(['git', '-C', str(mirror), 'index-pack', '--stdin'],
+                                          input=data, capture_output=True)
+                if received.returncode:
+                    raise ValueError('fixed source pack rejected: ' + received.stderr.decode(errors='replace'))
+                if git(mirror, 'rev-parse', row['commit'] + '^{tree}').stdout.strip() != row['tree']:
+                    raise ValueError('fixed source pack has the wrong tree')
+                git(mirror, 'cat-file', '-e', pack['carrier'] + '^{commit}')
+                # Match atomic Git push semantics. Every accepted snapshot has
+                # its own immutable pin even if concurrent carriers advance.
+                refs = ('start\nupdate refs/vaws/snapshots/' + row['commit'] + ' ' + row['commit']
+                        + '\nupdate ' + request['carrier_ref'] + ' ' + pack['carrier'] + '\nprepare\ncommit\n')
+                updated = subprocess.run(['git', '-C', str(mirror), 'update-ref', '--stdin'],
+                                         input=refs, text=True, capture_output=True)
+                if updated.returncode:
+                    raise ValueError('fixed source refs rejected: ' + updated.stderr)
         tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}', check=False)
         if tree.returncode:
             carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
