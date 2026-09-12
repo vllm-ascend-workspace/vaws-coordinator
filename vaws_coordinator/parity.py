@@ -114,6 +114,105 @@ def materialize_command(
     return command
 
 
+def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snapshot: dict,
+                              log_path=None, process=None, on_progress=None,
+                              container_cache_root: str | None = None) -> dict:
+    """Materialize admitted inputs directly, without the public sync lifecycle.
+
+    One completed remote operation pins available objects, checks out the exact
+    commits, validates the resulting trees and atomically records success. Only
+    an explicit missing-object reply permits transfer followed by a new remote
+    operation. Transport uncertainty is never retried here. ``process.run``
+    supplies a fresh persisted owned job for each operation.
+    """
+    import inspect
+    from vaws_coordinator.execution_sources import validate_source_snapshot
+    from vaws_coordinator.parity_support import _materialize_fixed
+
+    validate_source_snapshot(source_snapshot)
+    workspace_id = normalize_workspace_id(workspace_id)
+    root = validate_absolute_posix_path(endpoint['root'], label='runtime root')
+    cache = validate_absolute_posix_path(container_cache_root or DEFAULT_CONTAINER_CACHE_ROOT,
+                                         label='container cache root')
+    if root == '/' or '..' in PurePosixPath(root).parts:
+        raise ValueError('fixed source root must be an isolated absolute directory')
+    records = [SnapshotRecord(**row) for row in source_snapshot['records']]
+    seen = set()
+    for record in records:
+        relpath = validate_relative_posix_path(record.relpath, label='fixed source path')
+        if relpath != record.relpath or relpath in seen or '\\' in relpath:
+            raise ValueError('fixed source paths must be unique canonical POSIX paths')
+        if PurePosixPath(relpath).parts[0] in {'.vaws-runtime', '.venv', '.git'}:
+            raise ValueError('fixed source path overlaps coordinator-owned runtime files')
+        seen.add(relpath)
+        if record.repo_id != sanitize_repo_id(relpath):
+            raise ValueError('fixed source repository identity does not match its path')
+        if not all(re.fullmatch(r'[0-9a-f]{40,64}', value) for value in (record.commit, record.tree)):
+            raise ValueError('fixed source requires exact Git object identities')
+    if not records:
+        raise ValueError('materialization requires at least one fixed source')
+    for record in records:
+        for child in record.submodules:
+            child_path = validate_relative_posix_path(child['path'], label='fixed submodule path')
+            if str(PurePosixPath(record.relpath) / child_path) not in seen:
+                raise ValueError('fixed source descriptor is missing a submodule')
+    container = SshEndpoint(host=endpoint['host'], port=int(endpoint['port']), user=endpoint['user'])
+    request = {'root': root, 'source_id': source_snapshot['id'],
+               'carrier_ref': f'refs/parity/{workspace_id}/transport-carrier',
+               'records': [{'relpath': row.relpath, 'commit': row.commit, 'tree': row.tree,
+                            'submodules': row.submodules,
+                            'mirror': mirror_path_for(cache, workspace_id, row)} for row in records]}
+    script = ('python3 - <<\'VAWS_FIXED_SOURCES\'\n' + inspect.getsource(_materialize_fixed)
+              + '\nimport json\nprint(json.dumps(_materialize_fixed(' + repr(request)
+              + '), separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
+
+    def run():
+        result = ssh_exec_stream(container, script, stream_progress=False,
+                                 log_path=log_path, process=process)
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, ValueError) as exc:
+            raise ParityUnavailable('fixed source materialization returned no complete receipt') from exc
+        if not isinstance(payload, dict):
+            raise ParityUnavailable('fixed source materialization returned an invalid receipt')
+        return payload
+
+    result = run()
+    if result.get('status') == 'missing':
+        missing = result.get('missing')
+        if (not isinstance(missing, list) or not missing
+                or any(not isinstance(row, dict) or type(row.get('index')) is not int
+                       or not 0 <= row['index'] < len(records) for row in missing)
+                or len({row['index'] for row in missing}) != len(missing)):
+            raise ParityUnavailable('fixed source materialization returned invalid missing objects')
+        for row in missing:
+            record = records[row['index']]
+            mirror = request['records'][row['index']]['mirror']
+            repo = Path(record.source_path)
+            _, carrier = build_transport_carrier(repo, container=container, mirror_path=mirror,
+                workspace_id=workspace_id, record=record, remote_carrier_commit=row.get('carrier'))
+            if on_progress:
+                on_progress({'phase': 'push-mirror', 'relpath': record.relpath})
+            # Exact OIDs are the source, including the carrier. A concurrent
+            # capture can move local refs without changing this execution.
+            # Git owns its receive process/atomic refs; never kill or delete a
+            # shared mirror to recover a failed transfer.
+            started = time.monotonic()
+            git(repo, ['push', '--porcelain', '--atomic', git_remote_url(container, mirror),
+                       f'{record.commit}:refs/vaws/snapshots/{record.commit}',
+                       f'+{carrier}:{request["carrier_ref"]}'],
+                env=git_ssh_environment(container), timeout=DEFAULT_GIT_TRANSPORT_TIMEOUT_SECONDS)
+            if on_progress:
+                on_progress({'phase': 'push-mirror-complete', 'relpath': record.relpath,
+                             'elapsed_seconds': round(time.monotonic() - started, 6)})
+        result = run()
+    expected = {row.relpath: row.commit for row in records}
+    if (result.get('status') != 'materialized' or result.get('source_id') != source_snapshot['id']
+            or result.get('root') != root or result.get('commits') != expected):
+        raise ParityUnavailable('fixed source materialization did not verify the admitted inputs')
+    return result
+
+
 DEFAULT_ENV_PREAMBLE = (
     'export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
     'export VAWS_RUNTIME_ROOT="${VAWS_RUNTIME_ROOT:-/vllm-workspace}"',
