@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -313,7 +312,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         """
         from vaws_coordinator.parity import (
             DEFAULT_MARKER_DIRNAME,
-            materialize_command,
+            materialize_fixed_sources,
             prepare_isolated_root_script,
             run_runtime_install_step,
         )
@@ -359,26 +358,13 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             ssh_exec_stream(container, script, stream_progress=False, log_path=log,
                             process=owned_process(step) if step != "prepare-root" else None)
         identity = spec.get("container_name") or ("vaws-" + spec["user"])
-        args = materialize_command(
-            workspace_id=identity,
-            runtime_id=identity,
-            endpoint=endpoint,
-            sources=sources,
-            workspace_root=workspace_root,
-            source_snapshot=source_snapshot,
-        ) if sources else None
-        env = {key: value for key, value in os.environ.items()}
         log = progress("materialize")
-        if args is None:
-            result = subprocess.CompletedProcess([], 0)
-        elif log:
-            with Path(log).open("w") as stream:
-                result = subprocess.run(args, env=env, timeout=3600, check=False, stdout=stream, stderr=stream)
-        else:
-            result = subprocess.run(args, env=env, timeout=3600, check=False, capture_output=True, text=True, encoding="utf-8")
-        if result.returncode:
-            detail = f"inspect {log}" if log else (result.stderr or result.stdout or "")
-            raise RuntimeError(f"source materialization failed: {detail}")
+        if sources:
+            materialize_fixed_sources(
+                workspace_id=identity, endpoint=endpoint, source_snapshot=source_snapshot,
+                log_path=log, process=owned_process("materialize"),
+                on_progress=lambda event: progress("materialize", event),
+            )
         check_cancel()
         versions = {record['relpath']: {'version': record.get('scm_version'), 'source_head': record.get('source_head')}
                     for record in source_snapshot.get('records', []) if record['relpath'] in ('vllm', 'vllm-ascend')}

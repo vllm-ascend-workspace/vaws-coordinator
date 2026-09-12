@@ -236,7 +236,13 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
     spec = {'user': 'alice', 'python': '/donor/bin/python',
             'endpoint': {'host': 'local.invalid', 'port': 46001, 'user': 'root', 'root': '/execution'},
             'source_snapshot': snapshot}
-    monkeypatch.setattr(parity, 'materialize_command', lambda **kwargs: None)
+    def materialize(**kwargs):
+        from vaws_coordinator.preparation_process import PreparationProcess
+        assert kwargs['source_snapshot'] is snapshot
+        assert kwargs['endpoint'] is spec['endpoint']
+        assert isinstance(kwargs['process'], PreparationProcess)
+        seen.append('materialize')
+    monkeypatch.setattr(parity, 'materialize_fixed_sources', materialize)
     monkeypatch.setattr(parity_support, 'ssh_exec_stream', lambda *a, **k: seen.append('prepare-root'))
     monkeypatch.setattr(adapters, 'native_compatibility_key', lambda manifest: 'existing-proof')
     monkeypatch.setattr(backend, '_prepare_native_view', lambda *a, **k: seen.append('publish') or published)
@@ -245,9 +251,9 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
     progress = []
     result = backend.prepare_task_root(spec, sources={'vllm': '/local/vllm', 'vllm-ascend': '/local/ascend'},
         environment={}, source_snapshot=snapshot, reuse={'kind': 'native', 'runtime': {'attestation': {}}},
-        on_progress=lambda event: progress.append(event['step']))
+        on_progress=lambda event: progress.append(event['step']), on_preparation_job=lambda *a, **k: None)
     assert isinstance(result, adapters.PreparedNativeView) and result.attestation is published
-    assert seen == ['prepare-root', 'publish']
+    assert seen == ['prepare-root', 'materialize', 'publish']
     assert progress == ['prepare-root', 'materialize', 'publish-native-view']
 
 
