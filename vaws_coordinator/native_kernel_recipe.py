@@ -158,8 +158,7 @@ def _recipe_inputs(root: Path, plan: dict, environment: dict) -> tuple[list, str
     prefix = plan['kernel_root'].removesuffix('/kernel')
     info = prefix + '/config/' + unit + '/aic-' + unit + '-ops-info.json'
     dynamics = [name for name in files if name.startswith(prefix + '/') and name.endswith('/dynamic/' + op + '.py')]
-    vendor = prefix.split('/op_impl/ai_core/tbe', 1)[0]
-    tiling = [name for name in files if name.startswith(vendor + '/op_tiling/') and name.endswith('.so')]
+    tiling = [name for name in files if name.startswith(prefix + '/op_tiling/') and name.endswith('.so')]
     if info not in files or len(dynamics) != 1 or not tiling:
         raise RecipeUnavailable('installed compiler metadata or tiling is missing')
     try:

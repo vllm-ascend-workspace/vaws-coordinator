@@ -89,12 +89,11 @@ def kernel_rebuild_plan(root: Path, bundle: Path, manifest: dict, preparation: d
         recipe_file = '.vaws-runtime/kernel-compile-recipe.json'
         if recipe_file in manifest['files']:
             tbe = kernel.removesuffix('/kernel')
-            vendor = installed.split('/op_impl/ai_core/tbe/', 1)[0]
             plan['recipe_files'] = {path: row['sha256'] for path, row in manifest['files'].items()
                 if (path == recipe_file or path == configs[0]
                     or path.startswith(kernel + '/' + unit + '/' + op + '/')
                     or path.startswith(tbe + '/config/')
-                    or path.startswith(vendor + '/op_tiling/')
+                    or path.startswith(tbe + '/op_tiling/')
                     or (path.startswith(tbe + '/') and ('/ascendc/' in path or path.endswith('/dynamic/' + op + '.py'))))}
         return plan
     return None

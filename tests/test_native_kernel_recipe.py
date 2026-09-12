@@ -113,7 +113,8 @@ def compiler(tmp_path):
         dynamic: DYNAMIC,
         prefix + '/fixture_impl/ascendc/fixture/fixture.cpp': 'old CPP\n',
         prefix + '/fixture_impl/ascendc/common/include.h': 'shared header',
-        vendor + '/op_tiling/lib/linux/aarch64/libtiling.so': 'verified tiling',
+        prefix + '/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so': 'verified tiling',
+        prefix + '/op_tiling/liboptiling.so': 'verified tiling alias',
         prefix + '/config/' + unit + '/aic-' + unit + '-ops-info.json': json.dumps({'FixtureOp': {
             'opFile': {'value': 'fixture'}, 'input0': {'dtype': 'float32,float16,bfloat16'}}}),
         kernel + '/config/' + unit + '/fixture.json': json.dumps({'binList': [1, 2, 3]}),

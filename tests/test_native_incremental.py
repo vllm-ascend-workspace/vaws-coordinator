@@ -45,6 +45,20 @@ def test_single_translation_unit_reconstructs_complete_native_identity(kernel):
     assert plan['native_to'] == preparation['native']['vllm-ascend']
 
 
+def test_recipe_plan_retains_actual_installed_tbe_tiling_layout(kernel):
+    root, bundle, source, installed, entries, manifest, preparation = kernel
+    # Paths from the captured installed manifest: tiling belongs below tbe,
+    # beside kernel/config, rather than beside the vendor's op_api directory.
+    tbe = installed.split('/custom_transformer_impl/ascendc/', 1)[0]
+    tiling = [tbe + '/op_tiling/liboptiling.so',
+              tbe + '/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so']
+    manifest['files']['.vaws-runtime/kernel-compile-recipe.json'] = {'sha256': 'recipe'}
+    manifest['files'].update({path: {'sha256': 'tiling-' + str(index)} for index, path in enumerate(tiling)})
+    plan = native.kernel_rebuild_plan(root, bundle, manifest, preparation, entries)
+    assert {path: plan['recipe_files'][path] for path in tiling} == {
+        path: manifest['files'][path]['sha256'] for path in tiling}
+
+
 @pytest.mark.parametrize('change', ['cmake', 'submodule', 'second-kernel', 'mode', 'add', 'vllm', 'unfixed'])
 def test_other_native_changes_cannot_borrow_single_kernel_proof(kernel, change):
     root, bundle, source, installed, entries, manifest, preparation = kernel
