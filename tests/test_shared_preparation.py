@@ -64,6 +64,10 @@ def bundle(tmp_path, monkeypatch):
     monkeypatch.setattr(cache.importlib.metadata, 'version', lambda _: '1.0')
     for name in ('digest', 'publish', 'verify', 'file_digest', 'checked_file', 'verified_preparation'):
         monkeypatch.setattr(cache, name, getattr(profile, name), raising=False)
+    monkeypatch.setattr(cache, 'native_tree_entries', lambda *args: {}, raising=False)
+    monkeypatch.setattr(cache, 'kernel_rebuild_plan', lambda *args: None, raising=False)
+    monkeypatch.setattr(cache, 'VLLM_ASCEND_REINSTALL_PATTERNS', (), raising=False)
+    monkeypatch.setattr(cache, 'submodule_content', None, raising=False)
     versions = {name: {'version': '2.0.dev1', 'source_head': 'bob-head'} for name in ('vllm', 'vllm-ascend')}
     return source, target, shared, request, manifest, relative, versions
 
@@ -85,6 +89,42 @@ def test_cross_user_reuse_loads_real_extension_without_donor_runtime(bundle):
     expected = original.read_bytes()
     (target / relative).write_bytes(b'local user edit')
     assert original.read_bytes() == expected
+
+
+def test_explicit_reference_reuses_same_measured_image_with_current_request_identity(bundle):
+    source, target, shared, request, manifest, relative, versions = bundle
+    cache.store_shared_native(source, shared)
+    request = copy.deepcopy(request)
+    request['environment']['environment'] = {'image': 'registry/image@sha256:reference',
+                                           'cann': '1.0', 'soc': '1.0',
+                                           'python_abi': sysconfig.get_config_var('SOABI')}
+    result = cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions)
+    assert result['status'] == 'hit'
+    assert result['native_key'] == profile.verified_preparation(request, manifest['profile'])['native_key']
+    assert result['native_key'] != manifest['preparation']['native_key']
+
+
+@pytest.mark.parametrize('constraint', ['soc', 'cann', 'python_abi', 'machine_type'])
+def test_coarse_image_lookup_still_checks_explicit_measured_constraints(bundle, constraint):
+    source, target, shared, request, manifest, relative, versions = bundle
+    cache.store_shared_native(source, shared)
+    request = copy.deepcopy(request)
+    request['environment']['environment'][constraint] = 'incompatible'
+    with pytest.raises(ValueError, match='requested ' + constraint):
+        cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions)
+    assert not (target / relative).exists()
+
+
+@pytest.mark.parametrize('fact', ['soc', 'machine_type'])
+def test_shared_lookup_rejects_recipient_hardware_mismatch(bundle, monkeypatch, fact):
+    source, target, shared, request, manifest, relative, versions = bundle
+    cache.store_shared_native(source, shared)
+    if fact == 'soc':
+        monkeypatch.setenv('SOC_VERSION', 'different')
+    with pytest.raises(ValueError, match='recipient'):
+        cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions,
+                                    machine_type='different' if fact == 'machine_type' else None)
+    assert not (target / relative).exists()
 
 
 @pytest.mark.parametrize('change', ['native', 'dependencies', 'image', 'abi', 'cann', 'corrupt'])
@@ -167,6 +207,7 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
     monkeypatch.setattr(parity, 'run_runtime_install_step', install)
     monkeypatch.setattr(backend, '_write_ready_profile', write_profile)
     monkeypatch.setattr(backend, '_shared_native', operation)
+    monkeypatch.setattr(backend, '_export_shared_native', lambda spec: {'status': 'miss'})
     if failure and failure.startswith(('cancel-', 'uncertain-')):
         with pytest.raises(PreparationCancelled if failure.startswith('cancel') else PreparationUncertain):
             backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
@@ -221,3 +262,90 @@ def test_actual_verification_payload_reads_execution_source_and_metadata(tmp_pat
                                 env={**os.environ, 'PYTHONPATH': str(image)}, timeout=30)
         assert result.returncode == 0, result.stderr
         assert ('current-source' if step == 'verify-imports' else 'dependency-check=ok') in result.stdout
+
+
+def test_shared_baseline_recognizes_kernel_delta_and_keeps_its_interpreter(bundle, monkeypatch):
+    from vaws_coordinator import native_incremental as native
+    source, target, shared, request, manifest, relative, versions = bundle
+    old, new = b'int result = 1;\n', b'int result = 2;\n'
+    def blob(data):
+        import hashlib
+        return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+    path = 'csrc/moe/add_rms_norm_bias/op_kernel/add_rms_norm_bias.cpp'
+    prefix = 'vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_impl/ai_core/tbe'
+    installed = prefix + '/custom_transformer_impl/ascendc/add_rms_norm_bias/add_rms_norm_bias.cpp'
+    config = prefix + '/kernel/config/ascend910_93/add_rms_norm_bias.json'
+    for root, name, data in ((source, installed, old), (source, config, b'{}'),
+                             (target, 'vllm-ascend/' + path, new)):
+        file = root / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(data)
+    for name in (installed, config):
+        manifest['files'][name] = {'sha256': profile.file_digest(source / name), 'role': 'metadata'}
+    current = {path: ('100644', blob(new))}
+    request['native']['vllm-ascend'] = native.native_tree_digest({path: ('100644', blob(old))})
+    manifest['preparation'] = profile.verified_preparation(request, manifest['profile'])
+    (source / '.vaws-runtime/ready-profile.json').write_text(json.dumps(manifest))
+    cache.store_shared_native(source, shared)
+    request['native']['vllm-ascend'] = native.native_tree_digest(current)
+    monkeypatch.setattr(cache, 'native_tree_entries', lambda *args: current)
+    monkeypatch.setattr(cache, 'kernel_rebuild_plan', native.kernel_rebuild_plan)
+    result = cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions)
+    assert result['status'] == 'incremental' and result['operator'] == 'add_rms_norm_bias'
+    assert (target / relative).read_bytes() == (source / relative).read_bytes()
+    plan = json.loads((target / '.vaws-runtime/native-incremental.json').read_text())
+    assert plan['source'] == path
+    assert plan['native_to'] != plan['native_from']
+    # No compiled result is published by restoration alone.
+    assert not (target / '.vaws-runtime/ready-profile.json').exists()
+
+
+@pytest.mark.parametrize('failure', [None, 'build', 'imports', 'profile', 'export'])
+def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, monkeypatch, failure):
+    import vaws_coordinator.parity as parity
+    import vaws_coordinator.parity_support as transport
+    from remote_dev.core.ssh_transport import RemoteCompleted
+    backend = RemoteBackend()
+    spec = {'user': 'bob', 'container_name': 'vaws-bob', 'python': '/bob/.venv/bin/python',
+            'endpoint': {'host': 'host', 'port': 2202, 'user': 'root', 'root': '/bob'},
+            'host_endpoint': {'host': 'host', 'port': 22, 'user': 'root'}}
+    snapshot = {'id': 'source', 'records': [{'relpath': name, 'scm_version': '1.0', 'source_head': 'head'}
+                                          for name in ('vllm', 'vllm-ascend')]}
+    monkeypatch.setattr(parity, 'materialize_fixed_sources', lambda **kwargs: None)
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script', lambda *a, **k: RemoteCompleted(0, '', ''))
+    monkeypatch.setattr(transport, 'ssh_exec_stream', lambda *a, **k: None)
+    monkeypatch.setattr(backend, 'bash', lambda *a: '')
+    installed, operations, process_steps = [], [], []
+    def install(**kwargs):
+        installed.append(kwargs['step'])
+        if ((failure == 'build' and kwargs['step'] == 'install-vllm-ascend-incremental') or
+                (failure == 'imports' and kwargs['step'] == 'verify-imports')):
+            raise RuntimeError('actual incremental failure')
+    def profile(*args, **kwargs):
+        if failure == 'profile':
+            raise RuntimeError('actual incremental failure')
+    def operation(spec, action, versions, **kwargs):
+        operations.append(action)
+        process_steps.append(kwargs['process'].step)
+        if failure == 'export' and len(operations) == 1:
+            return {'status': 'miss'}
+        return {'status': 'incremental' if action == 'restore' else 'stored'}
+    monkeypatch.setattr(parity, 'run_runtime_install_step', install)
+    monkeypatch.setattr(backend, '_write_ready_profile', profile)
+    monkeypatch.setattr(backend, '_shared_native', operation)
+    monkeypatch.setattr(backend, '_export_shared_native', lambda spec: {'status': 'stored'} if failure == 'export'
+                        else pytest.fail('cache candidate already available'))
+    def prepare():
+        return backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
+                                         source_snapshot=snapshot, on_preparation_job=lambda record: None)
+    if failure and failure != 'export':
+        with pytest.raises(RuntimeError, match='actual incremental failure'):
+            prepare()
+        assert operations == ['restore']
+    else:
+        assert prepare() is None
+        assert operations == (['restore', 'restore', 'store'] if failure == 'export' else ['restore', 'store'])
+        if failure == 'export':
+            assert process_steps == ['shared-native-restore', 'shared-native-restore-after-export', 'shared-native-store']
+    assert 'install-vllm-ascend' not in installed
+    assert installed.count('install-vllm-ascend-incremental') == 1

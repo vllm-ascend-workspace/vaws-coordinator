@@ -487,6 +487,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                 compiled_native = True
 
         cached_native = False
+        incremental_native = False
 
         def rebuild(reason):
             nonlocal cached_native
@@ -502,8 +503,21 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         for step in steps:
             if step == 'install-vllm-ascend':
                 cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
+                if cache.get('status') == 'miss':
+                    exported = self._export_shared_native(spec)
+                    progress('shared-native-export', exported)
+                    check_cancel()
+                    if exported.get('status') == 'stored':
+                        # A completed missing reply is never replayed with a
+                        # different intent: this is a new owned preparation job.
+                        cache = self._shared_native(spec, 'restore', versions,
+                            process=owned_process('shared-native-restore-after-export'))
                 progress('shared-native-cache', cache)
-                cached_native = cache.get('status') == 'hit'
+                cached_native = cache.get('status') in {'hit', 'incremental'}
+                if cache.get('status') == 'incremental':
+                    install('install-vllm-ascend-incremental')
+                    compiled_native = True
+                    incremental_native = True
                 if cached_native:
                     continue
             try:
@@ -511,7 +525,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             except (PreparationCancelled, PreparationUncertain):
                 raise
             except Exception as exc:
-                if not cached_native or step not in {'verify-imports', 'verify-deps'}:
+                if incremental_native or not cached_native or step not in {'verify-imports', 'verify-deps'}:
                     raise
                 rebuild(exc)
         check_cancel()
@@ -522,7 +536,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         except (PreparationCancelled, PreparationUncertain):
             raise
         except Exception as exc:
-            if not cached_native:
+            if incremental_native or not cached_native:
                 raise
             rebuild(exc)
             self._write_ready_profile(spec, environment, native_recipe=native_recipe, source_versions=versions,
@@ -538,19 +552,23 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
         try:
             root, python = spec['endpoint']['root'], spec['python']
-            request = {'root': root, 'action': action, 'preparation': spec.get('preparation', {}), 'versions': versions}
+            request = {'root': root, 'action': action, 'preparation': spec.get('preparation', {}),
+                       'versions': versions, 'machine_type': spec.get('machine_type')}
             if action == 'restore':
                 host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
                 name = shlex.quote(spec['container_name'])
                 request['image_digest'] = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
             module = _package_file('runtime_profile.py').read_text()
+            build_source = _package_file('build_inputs.py').read_text()
+            incremental = _package_file('native_incremental.py').read_text()
             cache = _package_file('preparation_cache.py').read_text()
             preamble = '\n'.join(['set -euo pipefail', 'export VAWS_RUNTIME_ROOT=' + shlex.quote(root),
                                    *DEFAULT_ENV_PREAMBLE, *task_python_exports(python),
                                    'export PYTHONPATH=' + shlex.quote(':'.join([root + '/.vaws-runtime/metadata',
                                                                             root + '/vllm', root + '/vllm-ascend']))])
             command = (preamble + '\n' + shlex.quote(python) + ' - ' + shlex.quote(json.dumps(request))
-                       + " <<'VAWS_SHARED_NATIVE'\n" + module + '\nexec(' + repr(cache) + ', globals())\n'
+                       + " <<'VAWS_SHARED_NATIVE'\n" + module + '\nexec(' + repr(build_source) + ', globals())\n'
+                       + 'exec(' + repr(incremental) + ', globals())\nexec(' + repr(cache) + ', globals())\n'
                        + REMOTE_SHARED_SUFFIX + '\nVAWS_SHARED_NATIVE\n')
             if process is None:
                 return json.loads(self.bash(spec['endpoint'], command))
@@ -563,6 +581,28 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             raise
         except Exception as exc:
             return {'status': 'miss', 'reason': str(exc)[:500]}
+
+    def _export_shared_native(self, spec):
+        """An existing verified donor is exported only when the cache missed."""
+        from remote_dev.core.ssh_transport import run_remote_python
+        from vaws_coordinator.preparation_process import PreparationCancelled
+        host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
+        name = shlex.quote(spec['container_name'])
+        image = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
+        source = '\n'.join(_package_file(name).read_text(encoding='utf-8')
+                           for name in ('runtime_profile.py',))
+        # Separate compile units preserve module-level future imports.
+        for name in ('build_inputs.py', 'native_incremental.py', 'preparation_cache.py'):
+            source += '\nexec(' + repr(_package_file(name).read_text(encoding='utf-8')) + ', globals())\n'
+        source += "\nimport signal\nsignal.alarm(45)\nargs=json.loads(sys.argv[1])\nprint(json.dumps(store_shared_native(Path(args['root']),Path(SHARED_NATIVE_CACHE))))\n"
+        module = _package_file('shared_native_discovery.py').read_text(encoding='utf-8')
+        script = module + '\nimport sys\nprint(json.dumps(export_verified_donor(json.load(sys.stdin))))\n'
+        reply = run_remote_python(resolve_endpoint(host), script,
+                                  {'preparation': spec.get('preparation', {}), 'image_digest': image,
+                                   'machine_type': spec.get('machine_type'), 'export_source': source}, timeout_ms=120000)
+        if reply.get('status') == 'cancelled':
+            raise PreparationCancelled('shared native export cancelled')
+        return reply
 
     def _prepare_native_view(self, spec, previous, versions, *, process=None, log_path=None):
         from vaws_coordinator.preparation_cache import REMOTE_NATIVE_VIEW_SUFFIX

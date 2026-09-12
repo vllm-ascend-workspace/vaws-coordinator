@@ -1413,7 +1413,7 @@ def runtime_install_step_script(
             '  export PYTHONPATH="$VAWS_RUNTIME_ROOT/.vaws-runtime/metadata:$VAWS_RUNTIME_ROOT/vllm:$VAWS_RUNTIME_ROOT/vllm-ascend${PYTHONPATH:+:$PYTHONPATH}"',
             'fi',
         ])
-    if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-requirements', 'check-build-compat'}:
+    if step in {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-incremental', 'install-vllm-ascend-requirements', 'check-build-compat'}:
         source_name = 'vllm' if step == 'install-vllm' else 'vllm-ascend'
         # Only package-created fixed input data enters the build shell. Never
         # derive versions from the synthetic commit's truncated history.
@@ -1631,6 +1631,16 @@ def runtime_install_step_script(
                 'fi',
             ]
         )
+    elif step == 'install-vllm-ascend-incremental':
+        from vaws_coordinator import native_incremental
+        script = Path(native_incremental.__file__).read_text(encoding='utf-8')
+        lines.extend([
+            '"$PYTHON" - "$VAWS_RUNTIME_ROOT" <<\'VAWS_NATIVE_INCREMENTAL\'',
+            script,
+            'import sys',
+            'build_incremental_kernel(Path(sys.argv[1]))',
+            'VAWS_NATIVE_INCREMENTAL',
+        ])
     elif step == 'install-vllm-ascend':
         lines.extend(
             [

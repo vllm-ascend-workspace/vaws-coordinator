@@ -128,9 +128,17 @@ def shared_input_key(preparation: dict, image_digest: str) -> str:
     if not image_digest or not all(preparation.get('native', {}).get(name) for name in ('vllm', 'vllm-ascend')):
         raise ValueError('shared native cache requires fixed native inputs and image digest')
     environment = preparation.get('environment', {})
+    # A default image and its explicit immutable reference can resolve to the
+    # same Docker image. Request spelling is not compiled-output identity;
+    # restore checks requested constraints against the measured profile.
     return digest({'image': image_digest, 'dependencies': preparation.get('dependencies'),
-                   'native': preparation['native'], 'environment': environment.get('environment', {}),
-                   'build_env': environment.get('build_env', {})})
+                   'native': preparation['native'], 'build_env': environment.get('build_env', {})})
+
+
+def shared_base_key(preparation: dict, image_digest: str) -> str:
+    """Dependency-compatible candidates; kernel reuse still proves the exact delta."""
+    baseline = {**preparation, 'native': {**preparation.get('native', {}), 'vllm-ascend': '*'}}
+    return shared_input_key(baseline, image_digest)
 
 
 def store_shared_native(root: Path, cache: Path) -> dict:
@@ -154,6 +162,13 @@ def store_shared_native(root: Path, cache: Path) -> dict:
         with os.fdopen(fd, 'w') as stream:
             json.dump({'bundle': bundle.name, 'native_key': preparation['native_key']}, stream)
         os.replace(temporary, cache / (key + '.json'))
+        # This index only selects a candidate. Its exact native delta and all
+        # copied outputs must still be checked before an incremental build.
+        base = shared_base_key(preparation, manifest['profile']['image_digest'])
+        fd, temporary = tempfile.mkstemp(prefix='.index-', dir=cache)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'bundle': bundle.name, 'native_key': preparation['native_key']}, stream)
+        os.replace(temporary, cache / ('base-' + base + '.json'))
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -172,15 +187,19 @@ def discard_shared_native(root: Path) -> None:
     if metadata.exists():
         shutil.rmtree(metadata)
     safe_destination(root, '.vaws-runtime/reuse.json').unlink(missing_ok=True)
+    safe_destination(root, '.vaws-runtime/native-incremental.json').unlink(missing_ok=True)
     marker.unlink()
 
 
-def restore_shared_native(root: Path, cache: Path, preparation: dict, image_digest: str, versions: dict) -> dict:
+def restore_shared_native(root: Path, cache: Path, preparation: dict, image_digest: str, versions: dict,
+                          machine_type: str | None = None) -> dict:
     """Copy an ABI-compatible cached bundle into this execution's own sources."""
     key = shared_input_key(preparation, image_digest)
     index = cache / (key + '.json')
     if not index.is_file():
-        return {'status': 'miss', 'reason': 'no matching compiled outputs'}
+        index = cache / ('base-' + shared_base_key(preparation, image_digest) + '.json')
+        if not index.is_file():
+            return {'status': 'miss', 'reason': 'no matching compiled outputs'}
     pointer = json.loads(index.read_text())
     if not re.fullmatch('[0-9a-f]{64}', pointer.get('bundle', '')):
         raise ValueError('invalid shared native cache pointer')
@@ -188,10 +207,32 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
     manifest = json.loads((bundle / 'manifest.json').read_text())
     profile = manifest['profile']
     expected = verified_preparation(preparation, profile)
-    if (pointer.get('native_key') != expected['native_key'] or
-            manifest.get('preparation', {}).get('native_key') != expected['native_key'] or
-            profile['image_digest'] != image_digest):
+    baseline = manifest.get('preparation', {})
+    verified_baseline = verified_preparation(baseline, profile)
+    if (pointer.get('native_key') != baseline.get('native_key') or
+            baseline.get('native_key') != verified_baseline['native_key'] or
+            baseline.get('dependency_key') != verified_baseline['dependency_key'] or
+            baseline.get('dependencies') != preparation.get('dependencies') or
+            baseline.get('environment', {}).get('build_env', {}) != preparation.get('environment', {}).get('build_env', {}) or
+            profile['image_digest'] != image_digest or
+            baseline.get('native', {}).get('vllm') != preparation.get('native', {}).get('vllm')):
         raise ValueError('cached native inputs or image differ')
+    requested = preparation.get('environment', {}).get('environment', {})
+    for name in ('soc', 'cann', 'python_abi', 'machine_type'):
+        if requested.get(name) and requested[name] != profile.get(name):
+            raise ValueError('cached profile does not satisfy requested ' + name)
+    current_soc = (os.environ.get('SOC_VERSION') or os.environ.get('VAWS_SOC_VERSION') or
+                   preparation.get('environment', {}).get('soc'))
+    if current_soc and current_soc != profile['soc']:
+        raise ValueError('cached SoC differs from recipient environment')
+    if machine_type and machine_type != profile.get('machine_type'):
+        raise ValueError('cached machine type differs from recipient host')
+    plan = None
+    if baseline.get('native') != preparation.get('native'):
+        entries = native_tree_entries(root / 'vllm-ascend', VLLM_ASCEND_REINSTALL_PATTERNS, submodule_content)
+        plan = kernel_rebuild_plan(root, bundle, manifest, preparation, entries)
+        if plan is None:
+            return {'status': 'miss', 'reason': 'native changes require a complete build'}
     if profile['python_abi'] != sysconfig.get_config_var('SOABI'):
         raise ValueError('cached Python ABI differs')
     for field, package in (('torch', 'torch'), ('torch_npu', 'torch-npu')):
@@ -207,7 +248,7 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
     for name in manifest['files']:
         if safe_destination(root, name).exists():
             raise ValueError('native output already exists in fresh view: ' + name)
-    receipt = {'status': 'hit', 'native_key': expected['native_key'], 'copied': list(manifest['files'])}
+    receipt = {'status': 'incremental' if plan else 'hit', 'native_key': expected['native_key'], 'copied': list(manifest['files'])}
     marker = safe_destination(root, '.vaws-runtime/shared-native.json')
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(receipt))
@@ -222,6 +263,9 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
         reuse = {'kind': 'shared-native', 'native_key': expected['native_key'],
                  'soc': profile['soc'], 'compiler': profile['compiler']}
         safe_destination(root, '.vaws-runtime/reuse.json').write_text(json.dumps(reuse))
+        if plan:
+            safe_destination(root, '.vaws-runtime/native-incremental.json').write_text(json.dumps(plan))
+            receipt['operator'] = plan['operator']
     except Exception:
         discard_shared_native(root)
         raise
@@ -240,7 +284,7 @@ try:
         discard_shared_native(root)
         result = {'status': 'discarded'}
     else:
-        result = restore_shared_native(root, cache, args['preparation'], args['image_digest'], args['versions'])
+        result = restore_shared_native(root, cache, args['preparation'], args['image_digest'], args['versions'], args.get('machine_type'))
 except Exception as exc:
     result = {'status': 'miss', 'reason': str(exc)}
 print(json.dumps(result))
