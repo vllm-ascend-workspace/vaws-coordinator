@@ -1768,13 +1768,18 @@ def runtime_install_step_script(
             ]
         )
     elif step == 'install-vllm-ascend-incremental':
-        from vaws_coordinator import native_incremental
+        import inspect
+        from vaws_coordinator import native_incremental, native_kernel_recipe, runtime_profile
         script = Path(native_incremental.__file__).read_text(encoding='utf-8')
+        compiler = Path(native_kernel_recipe.__file__).read_text(encoding='utf-8').replace('from __future__ import annotations\n', '')
         lines.extend([
             '"$PYTHON" - "$VAWS_RUNTIME_ROOT" <<\'VAWS_NATIVE_INCREMENTAL\'',
             script,
+            compiler,
+            inspect.getsource(runtime_profile.compiled_opc_recipe),
             'import sys',
-            'build_incremental_kernel(Path(sys.argv[1]))',
+            'build_incremental_kernel(Path(sys.argv[1]), compile_recipe=lambda root, plan, env: '
+            'compile_kernel_recipe(root, plan, env, read_recipe=compiled_opc_recipe))',
             'VAWS_NATIVE_INCREMENTAL',
         ])
     elif step == 'install-vllm-ascend':

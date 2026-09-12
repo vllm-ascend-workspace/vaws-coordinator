@@ -126,6 +126,153 @@ def checked_file(root: Path, relative: str) -> Path:
     return path
 
 
+def compiled_opc_recipe(script_path):
+    """Read one generated literal OPC command; never evaluate its shell code."""
+    import hashlib
+    import json
+    import re
+    import shlex
+    from pathlib import Path
+
+    try:
+        script = Path(script_path)
+        if script.is_symlink() or not script.is_file():
+            return None
+        text = script.read_text(encoding='utf-8')
+        commands = re.findall(r'^\s*res=\$\((opc [^\n]*)\)\s*$', text, re.MULTILINE)
+        if len(commands) != 1:
+            return None
+        args = shlex.split(commands[0])
+        if args[:2] != ['opc', '$1'] or args.count('--output=$2') != 1:
+            return None
+        for arg in args[2:]:
+            if arg == '--output=$2':
+                continue
+            if not arg.startswith('--') or any(char in arg for char in '$`;&|<>\r\n\0'):
+                return None
+        keys = [arg.partition('=')[0] for arg in args[2:]]
+        if len(keys) != len(set(keys)) or not {'--main_func', '--input_param', '--soc_version'} <= set(keys):
+            return None
+        if any(not args[keys.index(key) + 2].partition('=')[2]
+               for key in ('--main_func', '--input_param', '--soc_version')):
+            return None
+        index = keys.index('--input_param') + 2
+        parameter = Path(args[index].partition('=')[2])
+        if (parameter.is_symlink() or parameter.resolve().parent != script.resolve().parent
+                or not parameter.name.endswith('_param.json')):
+            return None
+        payload = json.loads(parameter.read_text(encoding='utf-8'))
+        variants = payload.get('op_list') if isinstance(payload, dict) else None
+        if (not isinstance(variants, list) or len(variants) != 1 or not isinstance(variants[0], dict)
+                or not re.fullmatch(r'[A-Za-z0-9_]+', str(variants[0].get('bin_filename', '')))):
+            return None
+        args[index] = '--input_param=<parameter>'
+        return {'name': script.name, 'opc_args': args, 'binary': variants[0]['bin_filename'],
+                'parameter_sha256': hashlib.sha256(json.dumps(payload, sort_keys=True,
+                    separators=(',', ':')).encode()).hexdigest()}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def capture_kernel_compile_recipe(root: Path) -> None:
+    """Keep actual completed compiler inputs in the existing native bundle.
+
+    Missing or unsupported build evidence only disables this optional shortcut.
+    Existing verified recipes survive source-only restore without a build tree.
+    """
+    root = root.resolve()
+    relative = '.vaws-runtime/kernel-compile-recipe.json'
+    target = root / relative
+    binary = root / 'vllm-ascend/csrc/build/binary'
+    if not binary.is_dir():
+        return
+    tools = root / 'vllm-ascend/csrc/cmake/scripts/util'
+    names = ('ascendc_bin_param_build.py', 'ascendc_ops_config.py',
+             'ascendc_impl_build.py', 'opdesc_parser.py', 'const_var.py')
+    try:
+        hashes = {name: file_digest(checked_file(root, (tools / name).relative_to(root).as_posix()))
+                  for name in names}
+    except (OSError, ValueError):
+        target.unlink(missing_ok=True)
+        return
+    result = {'schema_version': 1, 'tools': hashes, 'variants': {}}
+    if target.is_file() and not target.is_symlink():
+        try:
+            previous = json.loads(target.read_text(encoding='utf-8'))
+            if (isinstance(previous, dict) and previous.get('schema_version') == 1
+                    and previous.get('tools') == hashes and isinstance(previous.get('variants'), dict)
+                    and all(isinstance(value, dict) for value in previous['variants'].values())):
+                for unit, operators in previous['variants'].items():
+                    for op, entry in operators.items():
+                        outputs = entry.get('outputs') if isinstance(entry, dict) else None
+                        if not isinstance(outputs, dict) or not outputs:
+                            continue
+                        try:
+                            if all(file_digest(checked_file(root, path)) == sha for path, sha in outputs.items()):
+                                result['variants'].setdefault(unit, {})[op] = entry
+                        except (OSError, ValueError, TypeError):
+                            pass
+        except (OSError, ValueError, TypeError):
+            pass
+    vendor = root / 'vllm-ascend/vllm_ascend/_cann_ops_custom/vendors'
+    for generated in sorted(binary.glob('*/gen')):
+        unit = generated.parent.name
+        if not re.fullmatch(r'ascend[a-z0-9_]+', unit):
+            continue
+        groups = {}
+        incomplete = False
+        for script in sorted(generated.glob('*.sh')):
+            row = compiled_opc_recipe(script)
+            if row is None:
+                incomplete = True
+                break
+            op = next(arg.partition('=')[2] for arg in row['opc_args'] if arg.startswith('--main_func='))
+            if not re.fullmatch(r'[a-z][a-z0-9_]*', op):
+                incomplete = True
+                break
+            groups.setdefault(op, []).append(row)
+        if incomplete:
+            result['variants'].pop(unit, None)
+            continue
+        if not groups:
+            result['variants'].pop(unit, None)
+            continue
+        installed = result['variants'].setdefault(unit, {})
+        for op, rows in groups.items():
+            installed.pop(op, None)
+            try:
+                build = generated.parent / 'bin' / op
+                destinations = list(vendor.glob('*/op_impl/ai_core/tbe/kernel/' + unit + '/' + op))
+                if len(destinations) != 1:
+                    continue
+                destination = destinations[0]
+                objects = sorted(build.glob('*.o'))
+                if (len(objects) != len(rows) or {p.stem for p in objects} != {row['binary'] for row in rows}
+                        or {p.name for p in objects} != {p.name for p in destination.glob('*.o')}):
+                    continue
+                outputs = {}
+                for obj in objects:
+                    for path in (obj, obj.with_suffix('.json')):
+                        source = checked_file(root, path.relative_to(root).as_posix())
+                        copied = checked_file(root, (destination / path.name).relative_to(root).as_posix())
+                        sha = file_digest(copied)
+                        if file_digest(source) != sha:
+                            raise ValueError('build and installed compiler outputs differ')
+                        outputs[copied.relative_to(root).as_posix()] = sha
+                installed[op] = {'variants': rows, 'outputs': outputs}
+            except (OSError, ValueError, TypeError):
+                continue
+        if not installed:
+            result['variants'].pop(unit, None)
+    if not result['variants']:
+        target.unlink(missing_ok=True)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix('.tmp')
+    temporary.write_text(json.dumps(result, sort_keys=True) + '\n', encoding='utf-8')
+    os.replace(temporary, target)
+
+
 def installed_native_files(root: Path) -> dict[str, str]:
     """Enumerate the installed editable extension and complete custom-op tree.
 
@@ -162,7 +309,8 @@ def installed_native_files(root: Path) -> dict[str, str]:
     if not binaries or not configs:
         raise ValueError("cannot attest complete installed custom-op binaries and metadata")
     files = {}
-    generated = [path for path in (package / '_build_info.py',) if path.is_file()]
+    generated = [path for path in (package / '_build_info.py',
+                 root / '.vaws-runtime/kernel-compile-recipe.json') if path.is_file()]
     for path in [*extensions, *outputs, *generated]:
         if path.name == ".gitkeep":
             continue

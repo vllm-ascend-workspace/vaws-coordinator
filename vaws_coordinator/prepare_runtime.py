@@ -115,6 +115,7 @@ profile['launch_env']['PYTHONPATH'] = ':'.join([str(root / '.vaws-runtime/metada
 if args.get('source_versions'):
     profile['source_versions'] = args['source_versions']
 
+capture_kernel_compile_recipe(root)
 files = installed_native_files(root)
 previous_launch_env = profile['launch_env']
 profile['launch_env'] = native_vendor_launch_environment(root, files, profile['launch_env'])
