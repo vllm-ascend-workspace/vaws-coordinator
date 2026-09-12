@@ -72,6 +72,45 @@ class CoordinationError(RuntimeError):
     """Raised for deterministic coordinator input or state failures."""
 
 
+def prepared_supervisor_host_pid(prepared: dict, process_guard: dict | None) -> int:
+    """Resolve a container receipt immediately before fenced activation."""
+    receipt = prepared["receipt"]
+    if (not isinstance(process_guard, dict) or process_guard != receipt.get("process_guard")
+            or process_guard.get("boot_id") != receipt.get("boot_id")
+            or not re.fullmatch(r"[0-9a-f]{32}", str(process_guard.get("marker", "")))):
+        raise CoordinationError("prepared receipt and process guard disagree")
+    container_name = prepared["container_name"]
+    container_id = prepared["container_id"]
+    if not isinstance(container_name, str) or not container_name or not isinstance(container_id, str) or not container_id:
+        raise CoordinationError("prepared activation requires the expected container identity")
+    info = json.loads(subprocess.check_output(
+        ["docker", "inspect", "--format", "{{json .}}", container_name], text=True, encoding="utf-8"))
+    if info["Id"] != container_id:
+        raise CoordinationError("container identity changed before activation")
+    if Path("/proc/sys/kernel/random/boot_id").read_text().strip() != receipt["boot_id"]:
+        raise CoordinationError("host boot identity changed")
+    # Use the inspected immutable ID if the name is reassigned during lookup.
+    rows = subprocess.check_output(["docker", "top", container_id, "-eo", "pid"],
+                                   text=True, encoding="utf-8").splitlines()[1:]
+    marker = (JOB_TOKEN_ENV + "=" + process_guard["marker"]).encode()
+    matches = []
+    for row in rows:
+        pid = int(row.strip())
+        try:
+            process = Path(f"/proc/{pid}")
+            fields = (process / "stat").read_text().rsplit(") ", 1)[1].split()
+            status = (process / "status").read_text().splitlines()
+            namespace = next(line.split()[1:] for line in status if line.startswith("NSpid:"))
+            if (int(namespace[-1]) == receipt["pid"] and fields[19] == receipt["start_ticks"]
+                    and fields[0] != "Z" and marker in (process / "environ").read_bytes().split(b"\0")):
+                matches.append(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    if len(matches) != 1:
+        raise CoordinationError("cannot identify a unique host PID for the waiting supervisor")
+    return matches[0]
+
+
 def process_guard_busy(value: str | dict | None, *, completion_confirmed: bool = False) -> bool:
     """Retain a managed lease while its process family can still use devices.
 
@@ -1858,10 +1897,12 @@ def handle_request(
             start_ttl_seconds=int(request.get("start_ttl_seconds") or DEFAULT_START_TTL_SECONDS),
         )
     if action == "activate":
+        pid = (prepared_supervisor_host_pid(request["prepared_supervisor"], request.get("process_guard"))
+               if "prepared_supervisor" in request else int(request["pid"]))
         return coordinator.activate(
             request["task_id"],
             int(request["fence_token"]),
-            pid=int(request["pid"]),
+            pid=pid,
             process_guard=request.get("process_guard"),
             heartbeat_ttl_seconds=int(
                 request.get("heartbeat_ttl_seconds") or DEFAULT_HEARTBEAT_TTL_SECONDS

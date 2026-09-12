@@ -109,6 +109,14 @@ print(json.dumps({'pid':matches[0]}))
         command = "python3 - " + shlex.quote(json.dumps(request)) + " <<'VAWS_HOST_PID'\n" + code + "\nVAWS_HOST_PID\n"
         return json.loads(self.bash({**runtime["host_endpoint"], "root": "/", "cwd": "/"}, command))["pid"]
 
+    def activate_prepared(self, runtime, request, receipt):
+        """Map the supervisor identity and activate through one host authority call."""
+        return self.host(runtime, {**request, "action": "activate", "prepared_supervisor": {
+            "container_name": runtime["container_name"],
+            "container_id": runtime["attestation"]["container_id"],
+            "receipt": receipt,
+        }})
+
     def catalog(self):
         return self.machines.catalog()
 

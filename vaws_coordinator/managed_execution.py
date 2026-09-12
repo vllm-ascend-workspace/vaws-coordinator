@@ -148,7 +148,13 @@ class ManagedExecution:
                     job["environment"] = run["environment"]
                 if run.get("service_port") is not None:
                     job["service_port"] = run["service_port"]
-                observed = self.backend.job(runtime, job["job_id"], "status")
+                # This owner persists a run before its only prepare path. With
+                # no run on entry, no supervisor can have been sent yet. Any
+                # resumed run (even without a saved remote receipt) is observed.
+                known_absent = (not runs and run["state"] in {"pending", "queued", "granted"}
+                                and not job.get("had_receipt") and not (job.get("remote") or {}).get("receipt"))
+                observed = ({"state": "absent", "quiet": True} if known_absent
+                            else self.backend.job(runtime, job["job_id"], "status"))
                 job["had_receipt"] = bool(job.get("had_receipt") or observed.get("receipt")
                                           or (job.get("remote") or {}).get("receipt"))
                 if observed.get("state") == "absent" and job["had_receipt"]:
@@ -222,9 +228,9 @@ class ManagedExecution:
                     job["remote"] = observed
                     if observed["state"] != "prepared":
                         raise RuntimeError("start gate has no verified waiting supervisor")
-                    pid = self.backend.job_host_pid(runtime, observed["receipt"])
-                    run = self.control(job["owner"], key, "activate", pid, _managed=True,
-                                       process_guard=observed["receipt"]["process_guard"])
+                    run = self.control(job["owner"], key, "activate", _managed=True,
+                                       process_guard=observed["receipt"]["process_guard"],
+                                       _prepared_receipt=observed["receipt"])
                     renewed = run["state"] == "active"
                 if run["state"] == "active":
                     # This renewal belongs to a persisted job, not an idle AI
