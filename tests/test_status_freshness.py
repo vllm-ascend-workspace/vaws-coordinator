@@ -126,6 +126,25 @@ def test_daemon_tick_supervises_an_attached_job_once(task):
     assert task.backend.calls.count(("host", "heartbeat")) == 1
 
 
+def test_cached_status_never_admits_a_planned_execution(task):
+    from vaws_coordinator.execution_sources import capture_sources
+    spec = {"command": "true", "env": {}, "environment": {}, "resources": {}, "topology": {},
+            "roles": [{"name": "default", "command": "true", "npu_count": 1}],
+            "source_snapshot": capture_sources({}, task.store.state_dir), "timeout_seconds": 30, "service": None}
+    planned = task.store.execution(task.context, "unadmitted-status", spec)
+    task.backend.calls.clear()
+    with mock.patch.object(task.client.coordinator, "_schedule_progress") as schedule:
+        reply = task.client.observe(planned["id"], refresh=False)
+    schedule.assert_not_called()
+    assert reply["state"] == "planned"
+    assert reply["observation_freshness"]["refresh_deferred"] is False
+    assert task.backend.calls == []
+    assert task.backend.jobs == {}
+    with task.store.transaction() as db:
+        latest = task.store.get(db, "execution", planned["id"])
+    assert latest["phase"] == "planned" and not latest.get("admitted")
+
+
 def test_cached_status_still_rejects_another_task_before_remote_control(task):
     from vaws_coordinator.task_client import TaskClient
     execution = task.client.run("true")["execution_id"]

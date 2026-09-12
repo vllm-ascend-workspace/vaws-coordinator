@@ -363,7 +363,7 @@ class CoordinatorService:
             # existing execution worker to refresh asynchronously, so neither
             # a slow link nor a dead host blocks status or a bounded wait.
             stale = not self._observation_freshness(row)["fresh"]
-            deferred = stale and row.get("phase") not in DONE
+            deferred = stale and bool(row.get("admitted")) and row.get("phase") not in DONE
             if deferred:
                 self._schedule_progress(sessions_dir, user, execution_id)
             reply = self._reply(row, role=role)
