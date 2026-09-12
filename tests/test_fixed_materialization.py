@@ -1,6 +1,6 @@
 """Real local Git peers run the exact remote program without SSH or devices."""
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -141,6 +141,50 @@ def test_cold_owner_small_edit_uses_shared_fixed_base_without_full_push(peer, tm
     assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
     private = parity.mirror_path_for(str(peer.cache), 'other', second)
     assert git(private, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+
+
+def test_disconnected_snapshots_pack_only_the_cpp_edit_for_a_new_owner(peer, tmp_path, monkeypatch):
+    import random
+    # Unchanged data must exceed the inline limit. A tiny repository can send
+    # its entire tree and accidentally make the delta test appear successful.
+    (peer.source / 'unchanged.bin').write_bytes(random.Random(17).randbytes(256 * 1024))
+    cpp = peer.source / 'operator.cpp'
+    cpp.write_text('int Operator(int input) { return input + 1; }\n')
+    git(peer.source, 'add', '.')
+    git(peer.source, 'commit', '-qm', 'baseline input')
+    def fixed_record():
+        record = make_record(peer.source, 'project')
+        commit = git(peer.source, 'commit-tree', record.tree, '-m', 'fixed tree snapshot')
+        assert 'parent ' not in git(peer.source, 'cat-file', '-p', commit)
+        return replace(record, commit=commit, ref='refs/inputs/' + commit)
+    first = fixed_record()
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    donor = parity.mirror_path_for(str(peer.cache), 'test', first)
+    donor_refs = git(donor, 'show-ref')
+    cpp.write_text('int Operator(int recipient_op) { return recipient_op + 1; }\n')
+    git(peer.source, 'commit', '-am', 'one operator variable edit')
+    second = fixed_record()
+    assert parity._fixed_inline_pack(peer.source, second.commit, second.commit, first.commit) is None
+    packs = []
+    original = parity._fixed_inline_pack
+    def capture(*args, **kwargs):
+        pack = original(*args, **kwargs)
+        packs.append(pack)
+        return pack
+    monkeypatch.setattr(parity, '_fixed_inline_pack', capture)
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([second], root='new-owner', owner='recipient', shared_cache=shared)
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert len(packs) == 1 and packs[0]['bytes'] < 16 * 1024
+    carrier = packs[0]['carrier']
+    assert git(peer.source, 'rev-parse', carrier + '^') == first.commit
+    assert git(peer.source, 'rev-parse', carrier + '^{tree}') == second.tree
+    assert carrier != second.commit
+    assert result['commits'] == {'project': second.commit}
+    assert git(peer.root.parent / 'new-owner/project', 'rev-parse', 'HEAD') == second.commit
+    assert git(donor, 'show-ref') == donor_refs
 
 
 def test_unknown_local_shared_base_keeps_normal_git_fallback(peer, tmp_path):

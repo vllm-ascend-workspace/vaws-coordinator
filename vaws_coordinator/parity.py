@@ -982,6 +982,14 @@ def build_transport_carrier(
     ref = transport_carrier_ref(container, mirror_path, workspace_id, record)
     previous_result = git(repo, ['rev-parse', '--verify', ref], check=False)
     previous = previous_result.stdout.strip() if previous_result.returncode == 0 else None
+    # A fresh recipient can already own a verified shared snapshot even when
+    # this local endpoint has no carrier ref. Connect the transport history to
+    # that observed base: disconnected tree snapshots otherwise make Git send
+    # every object despite excluding the base in pack-objects --revs.
+    if (remote_carrier_commit and previous != remote_carrier_commit
+            and re.fullmatch(r'[0-9a-f]{40,64}', remote_carrier_commit)
+            and git(repo, ['cat-file', '-e', remote_carrier_commit + '^{commit}'], check=False).returncode == 0):
+        previous = remote_carrier_commit
     if not previous or previous != remote_carrier_commit:
         carrier = record.commit
     elif git_tree_for_commit(repo, previous) == record.tree:
