@@ -44,9 +44,9 @@ def validate_source_snapshot(snapshot: dict) -> dict:
 def capture_sources(sources: dict[str, str], state_dir: Path, *, attempts: int = 3) -> dict:
     """Capture selected repositories before durable admission, with bounded retry.
 
-The existing content fingerprint detects edits during capture, including a
-second edit of an already dirty file. It runs only here, never per role or
-observation. Source-free commands do not import Git/parity or scan anything.
+Fresh Git state and dirty content detect edits during capture, including a
+second edit of an already dirty file. Retained trees for unchanged repositories
+are reused. Source-free commands do not import Git/parity or scan anything.
 """
     if not isinstance(sources, dict):
         raise ValueError("sources must map repository names to actual worktrees")
@@ -54,10 +54,7 @@ observation. Source-free commands do not import Git/parity or scan anything.
     if sources:
         from vaws_coordinator.agent_session import worktree_reference
         from vaws_coordinator.build_inputs import BUILD_INPUT_ENV_KEYS
-        from vaws_coordinator.parity import (
-            DEFAULT_DENYLIST, build_snapshot_records, cleanup_synthetic_refs,
-            workspace_fingerprint,
-        )
+        from vaws_coordinator.execution_capture import capture_records, cleanup, save_cache
         from vaws_coordinator.parity_support import git
 
         roots = {}
@@ -65,38 +62,32 @@ observation. Source-free commands do not import Git/parity or scan anything.
             if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\\" in name:
                 raise ValueError("source names must be single repository names")
             roots[name] = Path(worktree_reference(path)["path"])
-        root = next(iter(roots.values())).parent
-        records = []
-        for attempt in range(attempts):
-            records = []
-            try:
-                before = {name: workspace_fingerprint(path) for name, path in roots.items()}
-                build_snapshot_records(root, "execution-inputs", uuid.uuid4().hex,
-                                       tuple(DEFAULT_DENYLIST), roots, records)
-                after = {name: workspace_fingerprint(path) for name, path in roots.items()}
-                if before == after:
-                    break
-            except Exception:
-                cleanup_synthetic_refs(root, records)
-                raise
-            cleanup_synthetic_refs(root, records)
-        else:
-            raise ValueError(f"sources changed during {attempts} capture attempts; execution was not admitted")
-        snapshot["records"] = [asdict(record) for record in records]
         snapshot["build_env"] = {key: os.environ[key] for key in BUILD_INPUT_ENV_KEYS if key in os.environ}
+        records, changed, cache = capture_records(roots, state_dir, attempts=attempts, build_env=snapshot["build_env"])
+        changed_names = {record.relpath for record in changed}
+        snapshot["records"] = [asdict(record) for record in records]
         snapshot["id"] = source_identity(snapshot)
         for record, data in zip(records, snapshot["records"]):
-            retained_ref = f"refs/vaws/inputs/{snapshot['id']}/{record.repo_id}"
-            git(Path(record.source_path), ["update-ref", retained_ref, record.commit])
-            if record.source_head:
-                git(Path(record.source_path), ["update-ref", retained_ref + "-scm", record.source_head])
-            data["ref"] = retained_ref
+            if record.relpath in changed_names:
+                retained_ref = f"refs/vaws/inputs/{snapshot['id']}/{record.repo_id}"
+                git(Path(record.source_path), ["update-ref", retained_ref, record.commit])
+                if record.source_head:
+                    git(Path(record.source_path), ["update-ref", retained_ref + "-scm", record.source_head])
+                data["ref"] = retained_ref
             if record.relpath in roots:
                 snapshot["sources"][record.relpath] = {
                     "path": str(roots[record.relpath]), "source_head": record.source_head,
                     "commit": record.commit, "tree": record.tree,
                 }
-        cleanup_synthetic_refs(root, records)
+        cleanup(changed)
+        for record, data in zip(records, snapshot["records"]):
+            record.ref = data["ref"]
+        try:
+            save_cache(*cache, records)
+        except OSError:
+            # This rebuildable acceleration is not an admission prerequisite.
+            # The immutable source records and retained refs remain authoritative.
+            pass
     snapshot["id"] = source_identity(snapshot)
     snapshot["captured_at"] = time.time()
     directory = Path(state_dir) / "source-inputs"

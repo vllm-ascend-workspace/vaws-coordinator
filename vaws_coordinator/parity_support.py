@@ -396,6 +396,132 @@ def ssh_stream_bytes_to_file(endpoint: SshEndpoint, remote_path: str, payload: b
         )
 
 
+def _materialize_fixed(request):
+    """Self-contained remote program for a coordinator-owned fixed source root.
+
+    Mirrors hold immutable commit refs, so concurrent roots need no lock across
+    transfer requests. Only initialization and one root's checkout are locked;
+    both locks are released by the OS when this process dies.
+    """
+    import contextlib
+    import fcntl
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import tempfile
+
+    def git(path, *args, check=True):
+        result = subprocess.run(['git', '-C', str(path), *args], capture_output=True,
+                                text=True, encoding='utf-8')
+        if check and result.returncode:
+            raise RuntimeError(f'git {args[0]} failed in {path}: {result.stderr.strip()}')
+        return result
+
+    @contextlib.contextmanager
+    def lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'a') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+
+    def atomic_json(path, value):
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as output:
+                json.dump(value, output, sort_keys=True)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    root = Path(request['root'])
+    if root.resolve() != root:
+        raise ValueError('fixed source root must be canonical and not traverse a symlink')
+    rows = request['records']
+    missing = []
+    for index, row in enumerate(rows):
+        mirror = Path(row['mirror'])
+        with lock(mirror.with_suffix('.init.lock')):
+            if mirror.is_symlink():
+                raise ValueError(f'mirror must not be a symlink: {mirror}')
+            if not mirror.exists():
+                git(mirror.parent, 'init', '--bare', str(mirror))
+            if git(mirror, 'rev-parse', '--is-bare-repository').stdout.strip() != 'true':
+                raise ValueError(f'expected a bare mirror: {mirror}')
+        tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}', check=False)
+        if tree.returncode:
+            carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
+            missing.append({'index': index, 'carrier': carrier.stdout.strip() if not carrier.returncode else None})
+            continue
+        if tree.stdout.strip() != row['tree']:
+            raise ValueError(f'fixed commit tree mismatch: {row["relpath"]}')
+        # Pin before materialization; another execution may move legacy refs.
+        fixed_ref = 'refs/vaws/snapshots/' + row['commit']
+        pinned = git(mirror, 'rev-parse', '--verify', fixed_ref, check=False)
+        if pinned.returncode or pinned.stdout.strip() != row['commit']:
+            git(mirror, 'update-ref', fixed_ref, row['commit'])
+    if missing:
+        return {'status': 'missing', 'missing': missing}
+
+    # The lock inode is outside anything checkout/clean can remove. It remains
+    # stable across retries and across workspace names targeting the same root.
+    token = hashlib.sha256(str(root).encode()).hexdigest()
+    with lock(root.parent / '.vaws-source-locks' / (token + '.lock')):
+        root.mkdir(parents=True, exist_ok=True)
+        marker = root / '.vaws-runtime'
+        if marker.is_symlink():
+            raise ValueError('fixed source marker directory must not be a symlink')
+        marker.mkdir(exist_ok=True)
+        owner = marker / 'fixed-source-owner.json'
+        expected_owner = {'source_id': request['source_id'], 'root': str(root)}
+        if owner.exists():
+            if json.loads(owner.read_text()) != expected_owner:
+                raise ValueError('fixed source root belongs to different inputs')
+        else:
+            if any(path.name not in {'.vaws-runtime', '.venv', '.remote-dev'} for path in root.iterdir()):
+                raise ValueError('fixed source root contains unowned files')
+            atomic_json(owner, expected_owner)
+        receipt = marker / 'source-materialization.json'
+        # A failed retry cannot leave an earlier success receipt for this run.
+        receipt.unlink(missing_ok=True)
+        for row in sorted(rows, key=lambda item: (len(Path(item['relpath']).parts), item['relpath'])):
+            repo = root / row['relpath']
+            if repo.resolve() != repo:
+                raise ValueError(f'fixed source path traverses a symlink: {repo}')
+            repo.parent.mkdir(parents=True, exist_ok=True)
+            if (repo / '.git').is_symlink() or ((repo / '.git').exists() and not (repo / '.git').is_dir()):
+                raise ValueError(f'fixed source must have its own Git directory: {repo}')
+            if not (repo / '.git').exists():
+                # Local clones hardlink immutable Git objects; fetching a whole
+                # repository into every new root would repack those same bytes.
+                git(repo.parent, 'clone', '--local', '--no-checkout', row['mirror'], str(repo))
+            git(repo, 'config', 'core.autocrlf', 'false')
+            if git(repo, 'cat-file', '-e', row['commit'] + '^{tree}', check=False).returncode:
+                git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', row['mirror'], row['commit'])
+            git(repo, 'checkout', '--detach', '--force', row['commit'])
+            git(repo, 'clean', '-ffd')
+            for child in row['submodules']:
+                child_path = str(Path(row['relpath']) / child['path'])
+                child_row = next(item for item in rows if item['relpath'] == child_path)
+                git(repo, 'config', 'submodule.' + child['name'] + '.url', child_row['mirror'])
+        observed = {}
+        for row in rows:
+            repo = root / row['relpath']
+            observed[row['relpath']] = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+            if observed[row['relpath']] != row['commit']:
+                raise ValueError(f'fixed source HEAD mismatch: {row["relpath"]}')
+            git(repo, 'diff', '--quiet', 'HEAD', '--')
+            if git(repo, 'ls-files', '--others', '--exclude-standard', '-z').stdout:
+                raise ValueError(f'fixed source contains untracked files: {row["relpath"]}')
+        result = {'status': 'materialized', **expected_owner, 'commits': observed}
+        atomic_json(receipt, result)
+        return result
+
+
 def is_git_worktree(path: Path) -> bool:
     result = git(path, ['rev-parse', '--is-inside-work-tree'], check=False)
     if result.returncode != 0 or result.stdout.strip() != 'true':

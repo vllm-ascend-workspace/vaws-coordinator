@@ -128,6 +128,7 @@ def test_cached_outputs_can_be_discarded_before_normal_build(bundle):
 def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeypatch, failure):
     import vaws_coordinator.parity as parity
     import vaws_coordinator.parity_support as transport
+    from remote_dev.core.ssh_transport import RemoteCompleted
     from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
     backend = RemoteBackend()
     spec = {'user': 'bob', 'container_name': 'vaws-bob', 'python': '/bob/.venv/bin/python',
@@ -135,11 +136,12 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
             'host_endpoint': {'host': 'host', 'port': 22, 'user': 'root'}}
     snapshot = {'id': 'source', 'records': [{'relpath': name, 'scm_version': '1.0', 'source_head': 'head'}
                                           for name in ('vllm', 'vllm-ascend')]}
-    monkeypatch.setattr(parity, 'materialize_command', lambda **kwargs: ['fixture-materialize'])
+    monkeypatch.setattr(parity, 'materialize_fixed_sources', lambda **kwargs: None)
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script',
+                        lambda *a, **k: RemoteCompleted(0, '', ''))
     monkeypatch.setattr(transport, 'ssh_exec_stream', lambda *a, **k: None)
-    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(backend, 'bash', lambda *a: '')
-    monkeypatch.setattr(backend, 'inspect', lambda spec: {'ready': True})
+    monkeypatch.setattr(backend, 'inspect', lambda *a, **k: pytest.fail('registration owns the full attestation'))
     events, installed, operations = [], [], []
     failed = False
     def install(**kwargs):
@@ -173,7 +175,7 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
         assert 'install-vllm-ascend' not in installed
         return
     assert backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
-                                     source_snapshot=snapshot, on_progress=events.append) == {'ready': True}
+                                     source_snapshot=snapshot, on_progress=events.append) is None
     assert installed.count('install-vllm-ascend') == (0 if failure is None else 1)
     assert installed.count('install-vllm-ascend-requirements') == 1
     assert 'verify-imports' in installed and 'verify-deps' in installed

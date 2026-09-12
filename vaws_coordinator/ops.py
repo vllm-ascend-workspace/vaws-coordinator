@@ -19,7 +19,7 @@ LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws
 
 TOOL_DESCRIPTIONS = {
     "vaws.session": "Inspect this native session's VAWS task or replace source defaults for future submissions. No machine is required. Tasks with known managed hosts also receive cached coordination messages without waiting for remote polling. Active executions retain their submitted inputs.",
-    "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Omitted sources uses explicit task defaults or this native attachment's automatic cwd binding; sources={} runs without source dependencies. Devices default to zero. The coordinator places, prepares, launches and supervises the execution.",
+    "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Omitted sources uses explicit task defaults or this native attachment's automatic cwd binding; sources={} runs without source dependencies. Devices default to zero. Explicit resources.allow_external_busy=true shares one named physical device with external processes while retaining managed lease and process ownership. The coordinator places, prepares, launches and supervises the execution.",
     "vaws.execution": "Use action=status (default), tail, stop or target with an execution_id or task-scoped service name belonging to this VAWS task. Status reads current progress; stop releases that execution's devices and ports. The container and execution root remain.",
     "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
     "vaws.message": "Send coordination text to a reference returned by run/status (coordination_peers[].reference), or reply using notifications[].reply_reference. Sender, host and thread are filled internally. Messages never execute commands or transfer resource ownership; normal run/status calls receive replies automatically.",
@@ -37,7 +37,12 @@ def task_schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
 RESOURCE_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     "devices": {"type": "array", "items": {"type": "integer", "minimum": 0}, "uniqueItems": True},
     "npu_count": {"type": "integer", "minimum": 0, "description": "Number of NPUs; defaults to zero. If devices is also supplied, this must equal its length."},
+    "allow_external_busy": {"type": "boolean", "default": False, "description": "Explicitly permit external occupancy on exactly one named physical device. Requires devices=[id]; other managed leases, holds and owned process/port cleanup still apply."},
     "service_port": {"type": "integer", "minimum": 0, "maximum": 65535}}}
+RESOURCE_SCHEMA["allOf"] = [{
+    "if": {"required": ["allow_external_busy"], "properties": {"allow_external_busy": {"const": True}}},
+    "then": {"required": ["devices"], "properties": {"devices": {"minItems": 1, "maxItems": 1}}},
+}]
 ROLE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["name"], "properties": {
     **RESOURCE_SCHEMA["properties"], "name": {"type": "string", "minLength": 1},
     "host": {"type": "string", "minLength": 1}, "command": {"type": "string", "minLength": 1},

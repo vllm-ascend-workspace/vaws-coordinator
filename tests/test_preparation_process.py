@@ -19,10 +19,11 @@ from vaws_coordinator.service import CoordinatorService
 ENDPOINT = {"host": "example.invalid", "port": 22, "user": "user", "root": "/tmp/task", "cwd": "/tmp/task"}
 
 
-def test_receipt_saved_before_go_and_progress_survives_split_chunks(monkeypatch, tmp_path):
+def test_receipt_saved_before_launch_and_progress_survives_split_chunks(monkeypatch, tmp_path):
     saved, actions = [], []
     chunks = iter([
         {"state": "running", "quiet": False, "stdout": "out\n", "stderr": PROGRESS_SENTINEL + '{"step": "bui',
+         "receipt": {"pid": 123, "boot_id": "test"},
          "stdout_offset": 4, "stderr_offset": 30},
         {"state": "succeeded", "quiet": True, "stderr": 'ld"}\nwarn', "stderr_offset": 40,
          "result": {"exit_code": 0}},
@@ -30,12 +31,19 @@ def test_receipt_saved_before_go_and_progress_survives_split_chunks(monkeypatch,
     def control(endpoint, job_id, action, **kwargs):
         assert saved[0]["job_id"] == job_id
         actions.append(action)
-        if action == "prepare":
+        if action == "launch":
             assert saved[-1]["state"] == "pending"
-            return {"state": "prepared", "quiet": False, "receipt": {"pid": 123, "boot_id": "test"}}
-        if action == "go":
+            assert kwargs["spec"] == {"command": "build", "cwd": ENDPOINT["cwd"], "env": {},
+                                      "timeout_seconds": 7200, "interactive": False}
+            assert kwargs["authorization"] == {}
+            assert kwargs["stdout_offset"] == kwargs["stderr_offset"] == 0
+            assert kwargs["max_bytes"] == 32768 and kwargs["yield_time_ms"] == 1000
+            assert kwargs["wait_for_exit"] is True
+        else:
+            assert action == "exchange"
             assert saved[-1]["receipt"]["pid"] == 123
-            return {"state": "running", "quiet": False}
+            assert kwargs["stdout_offset"] == 4 and kwargs["stderr_offset"] == 30
+            assert kwargs["wait_for_exit"] is True and kwargs["yield_time_ms"] == 1000
         return next(chunks)
     monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
     process = PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False)
@@ -45,22 +53,76 @@ def test_receipt_saved_before_go_and_progress_survives_split_chunks(monkeypatch,
     assert result.stdout == "out\n" and result.stderr == "warn"
     assert events == [{"step": "build"}]
     assert saved[-1]["quiet"] is True and "stdout" not in saved[-1]
-    assert actions == ["prepare", "go", "exchange", "exchange"]
+    assert actions == ["launch", "exchange"]
 
 
-def test_lost_go_reply_retains_job_and_never_replays_launch(monkeypatch):
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_short_preparation_returns_initial_output_and_exit_receipt_without_another_rpc(monkeypatch, exit_code):
+    saved, output = [], []
+    control = Mock(return_value={"state": "succeeded" if exit_code == 0 else "failed", "quiet": True,
+                                 "stdout": "complete", "stderr": "warning",
+                                 "stdout_offset": 8, "stderr_offset": 7,
+                                 "result": {"exit_code": exit_code}, "timings": {"prepare_ms": 10}})
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    result = PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False).run(
+        "build", on_output=lambda *args: output.append(args))
+    assert result.returncode == exit_code
+    assert output == [("stdout", "complete"), ("stderr", "warning")]
+    assert control.call_count == 1 and control.call_args.args[2] == "launch"
+    assert saved[-1]["quiet"] is True and saved[-1]["stdout_offset"] == 8
+    assert not ({"stdout", "stderr", "timings"} & saved[-1].keys())
+
+
+def test_quiet_launch_drains_remaining_output_from_initial_offsets(monkeypatch):
+    saved, output = [], []
+    def control(endpoint, job_id, action, **kwargs):
+        assert saved[0]["job_id"] == job_id
+        if action == "launch":
+            return {"state": "succeeded", "quiet": True, "stdout": "first",
+                    "stdout_offset": 5, "stdout_bytes_remaining": 5, "result": {"exit_code": 0}}
+        assert action == "exchange" and kwargs["stdout_offset"] == 5
+        return {"state": "succeeded", "quiet": True, "stdout": "last\n",
+                "stdout_offset": 10, "stdout_bytes_remaining": 0, "result": {"exit_code": 0}}
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    result = PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False).run(
+        "build", on_output=lambda *args: output.append(args))
+    assert result.returncode == 0 and output == [("stdout", "firstlast\n")]
+    assert saved[-1]["stdout_offset"] == 10
+
+
+@pytest.mark.parametrize("observation", [
+    {"state": "absent", "quiet": True}, {"state": "uncertain", "quiet": False},
+    {"state": "lost_outcome", "quiet": True}, {"state": "running", "quiet": False, "unknown": ["owner missing"]},
+])
+def test_initial_unknown_launch_observation_is_retained_without_relaunch(monkeypatch, observation):
+    saved = []
+    control = Mock(return_value=observation)
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    with pytest.raises(PreparationUncertain, match="outcome is unknown"):
+        PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False).run(
+            "build", on_output=lambda *args: None)
+    assert control.call_count == 1 and control.call_args.args[2] == "launch"
+    assert saved[-1]["job_id"] == saved[0]["job_id"] and saved[-1]["state"] == observation["state"]
+
+
+def test_lost_launch_reply_retains_job_and_can_stop_without_an_initial_receipt(monkeypatch):
     saved, actions = [], []
     def control(endpoint, job_id, action, **kwargs):
+        assert saved[0]["job_id"] == job_id
         actions.append(action)
-        if action == "prepare":
-            return {"state": "prepared", "quiet": False, "receipt": {"pid": 456}}
-        raise OSError("lost go reply")
+        if action == "launch":
+            raise OSError("lost launch reply")
+        assert action == "stop"
+        return {"state": "cancelled", "quiet": True, "receipt": {"pid": 456}}
     monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
     with pytest.raises(PreparationUncertain, match="was not replayed"):
         PreparationProcess(ENDPOINT, "build", lambda row: saved.append(copy.deepcopy(row)), lambda: False).run("build", on_output=lambda *a: None)
-    assert actions == ["prepare", "go"]
+    assert actions == ["launch"]
     assert saved[-1]["job_id"] == saved[0]["job_id"]
-    assert saved[-1]["receipt"]["pid"] == 456 and saved[-1]["quiet"] is False
+    assert "receipt" not in saved[-1] and saved[-1]["quiet"] is False
+    assert stop_preparation_process(saved[-1], lambda row: saved.append(copy.deepcopy(row)))
+    assert actions == ["launch", "stop"]
+    assert saved[-1]["receipt"]["pid"] == 456 and saved[-1]["quiet"] is True
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -68,11 +130,9 @@ def test_cancel_stops_owned_job_and_requires_quiet(monkeypatch, unknown):
     saved, actions, cancelled = [], [], [False]
     def control(endpoint, job_id, action, **kwargs):
         actions.append(action)
-        if action == "prepare":
-            return {"state": "prepared", "quiet": False, "receipt": {"pid": 1}}
-        if action == "go":
+        if action == "launch":
             cancelled[0] = True
-            return {"state": "running", "quiet": False}
+            return {"state": "running", "quiet": False, "receipt": {"pid": 1}}
         if action == "stop":
             return {"state": "uncertain" if unknown else "cancelled", "quiet": not unknown,
                     "unknown": ["lost supervisor"] if unknown else []}
@@ -84,6 +144,15 @@ def test_cancel_stops_owned_job_and_requires_quiet(monkeypatch, unknown):
     assert actions.count("stop") == 1
     assert saved[-1]["quiet"] is not unknown
     assert output == ([] if unknown else [("stdout", "last output\n")])
+
+
+def test_cancel_before_launch_has_no_remote_side_effect(monkeypatch):
+    control, save = Mock(), Mock()
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    with pytest.raises(PreparationCancelled, match="before command launch"):
+        PreparationProcess(ENDPOINT, "build", save, lambda: True).run("build", on_output=lambda *a: None)
+    control.assert_not_called()
+    save.assert_not_called()
 
 
 def test_stop_transport_failure_is_unknown(monkeypatch):
@@ -186,6 +255,36 @@ def test_actual_supervisor_stop_drains_child_and_preserves_output(tmp_path, monk
         final = control(endpoint, retained["job_id"], "status")
         assert final["quiet"] is True and final["processes"] == []
         assert final["result"]["descendants_drained"] is True
+    finally:
+        if saved:
+            stop_preparation_process(saved[-1], lambda _: None, force=True)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="remote-dev supervisor requires Linux /proc")
+def test_actual_supervisor_can_stop_after_losing_the_launch_reply(tmp_path, monkeypatch):
+    from remote_dev.processes.client import worker_source
+    from remote_dev.processes.worker import control_job
+
+    endpoint = {**ENDPOINT, "root": str(tmp_path), "cwd": str(tmp_path)}
+    saved, actions = [], []
+    def control(endpoint, job_id, action, **kwargs):
+        actions.append(action)
+        result = control_job({"root": endpoint["root"], "job_id": job_id, "action": action, **kwargs}, worker_source())
+        if action == "launch":
+            raise OSError("launch completed remotely but its reply was lost")
+        return result
+    monkeypatch.setattr("vaws_coordinator.preparation_process.control", control)
+    try:
+        with pytest.raises(PreparationUncertain, match="was not replayed"):
+            PreparationProcess(endpoint, "compiler", lambda row: saved.append(copy.deepcopy(row)), lambda: False).run(
+                "sleep 300 &\nprintf 'compiler started\\n'; wait", on_output=lambda *a: None)
+        retained = json.loads(json.dumps(saved[-1]))
+        assert retained["state"] == "uncertain" and "receipt" not in retained
+        assert stop_preparation_process(retained, lambda _: None)
+        final = control(endpoint, retained["job_id"], "status")
+        assert final["quiet"] is True and final["processes"] == []
+        assert final["result"]["descendants_drained"] is True
+        assert actions.count("launch") == 1 and "prepare" not in actions and "go" not in actions
     finally:
         if saved:
             stop_preparation_process(saved[-1], lambda _: None, force=True)

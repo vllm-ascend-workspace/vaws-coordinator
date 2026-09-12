@@ -58,6 +58,18 @@ execution has its own work directory, while compatible prepared artifacts can
 be reused. Independent host preparations run concurrently, bounded to four
 workers and one active preparation per host.
 
+To share one explicitly selected physical NPU with existing external workers,
+pass `resources={"devices": [0], "allow_external_busy": True}` to `client.run`
+or `vaws_run`. Use `topology={"host": "selected-host"}` to bind the host too.
+The option is fixed at admission and requires exactly one explicit device;
+omitting it keeps the normal occupancy checks. It permits observed external
+process/HBM use, without estimating or reserving free memory. Other coordinator
+leases and holds still conflict, and unknown or missing hardware is not usable.
+The managed supervisor must retain its own process guard until completion.
+Stop/finish only terminates this execution's family and releases its lease once
+that family has drained and its ports are clear; existing workers remain running.
+The assignment, launch observation and execution target expose the sharing flag.
+
 `run(..., service="model")` ensures identical fixed sources and configuration.
 Changed inputs report the differing fields; `restart=True` replaces the service
 only after the old execution has stopped and released resources. Connecting
@@ -81,8 +93,9 @@ the source inputs are fixed before verification and the donor work root cannot
 be checked out for execution. Library clients can submit the same explicit
 specification with `CoordinatorClient.runtime_register(runtime_id, spec)`.
 
-Task MCP/CLI execution status may reuse a managed-job snapshot for up to two
-seconds. `vaws execution --refresh` (or tool argument `refresh: true`) requests
+Task MCP/CLI execution status returns the latest persisted managed-job snapshot
+immediately. A sample older than two seconds schedules background progression.
+`vaws execution --refresh` (or tool argument `refresh: true`) requests
 a new status observation. Replies include `observation_freshness` with snapshot
 completion time, age, freshness, source and whether a busy execution deferred
 refresh. Per-role `status_observed_at` preserves individual sampling times;
@@ -90,12 +103,14 @@ roles are sampled concurrently with at most four workers. The top-level `observe
 response-generation time, not proof of a new remote query.
 
 `TaskClient.observe()` preserves its fresh-by-default library behavior; pass
-`refresh=False` to permit the short status cache. Tail, target, stop, resource
+`refresh=False` to read the nonblocking status cache. `TaskClient.wait()` uses
+this path so slow remote probes cannot overrun its observation timeout. Tail, target, stop, resource
 allocation and background progression retain their existing behavior. Cached
 observations neither allocate resources nor establish new ownership. A busy
 execution returns its stored observation immediately and explicitly marks a
-requested refresh as deferred. Stale or missing timestamps trigger a refresh
-when the execution is available; state/error/release fields remain visible.
+requested refresh as deferred. Cached stale or missing timestamps schedule a
+refresh on the existing execution worker; state/error/release fields remain visible
+and the reply reports its actual sample age rather than claiming fresh remote facts.
 
 ## Install
 
@@ -185,6 +200,27 @@ path. This prevents repository directories
 in the task cwd from shadowing editable packages, while preserving the CANN
 and other support paths already supplied by the environment.
 
+The first native environment and rebuilt outputs receive a full framework
+import smoke. A fresh Python source view can reuse that original evidence when
+its dependency/native inputs, loader environment and complete artifact hashes
+match; preparation checks the current module and SCM metadata mappings without
+importing the changed business code. Its receipt explicitly records
+`python_import_executed=false`, keeps the original import result, and makes no
+claim that the new Python source passed. The business execution reports its own
+result. Incomplete old evidence or cwd-dependent loader paths retain the full
+import check.
+
+For a compatible native environment, source materialization is followed by one
+native-view publication: outputs are copied and checked against the existing
+hashes, source/SCM mappings are updated, and the original import proof is carried
+forward. Its completed receipt goes directly into an atomic managed binding.
+There is no second profile capture, full registration probe, or SSH reservation.
+Before launch, coordinator checks the container, environment version facts,
+current source mappings and fixed Git inputs; it does not rehash all native
+outputs in its private execution view. Initial builds, changed native or
+dependency inputs, and explicit adoption/repair retain complete verification.
+A lost, failed or cancelled publication never publishes a successful binding.
+
 For serving, `service_port=0` asks the host coordinator to select a free port.
 If a task runtime has no declared service ports, automatic selection uses the
 host's default serving range (30000–45999). A nonempty declaration restricts
@@ -243,7 +279,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@862e9ae4ab5e4bb8252a99cfee8629dbfeeb2597"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@2de5cc32c5f3dd517e698cadfb1f9ed23589b1aa"
 uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
@@ -278,8 +314,8 @@ an unknown transport or ownership outcome remains uncertain. A restarted daemon
 can observe and stop these retained jobs without replaying preparation or
 replacing sources beneath a compiler. Queued preparation can cancel while
 another execution holds the host's preparation lock. Tail includes the current
-local preparation log. Source materialization retains its existing bounded
-upload/command deadlines and checks cancellation at its completion boundary.
+local preparation log. Fixed source materialization runs as an owned preparation
+job with bounded upload/command deadlines and cancellation support.
 Completed build-compatibility failures end preparation before editable installs
 and do not retry automatically. Completed source-sync failures retain their
 original cause; lost transport remains uncertain. Remote profile paths are
@@ -289,10 +325,22 @@ export SoC/compiler variables, attestation reads those build selections from
 the latest completed installer log and hashes that log as profile evidence.
 Incomplete or conflicting evidence stays an error.
 
-Managed source materialization checks current remote HEADs and tracked and
-untracked changes under the container lock. When every repository already
-matches the newly computed local snapshot, it skips mirror transport and reset.
-Runtime compatibility, native build checks and resource allocation still run.
+Managed source materialization consumes the admitted Git snapshot directly in
+one remote operation. Existing immutable mirror objects are reused; a completed
+missing-object response uploads only those objects before a new owned job.
+Each execution retains independent working files, a stable per-root lock, and
+final HEAD and dirty-state checks across parent repositories and submodules.
+Uncertain jobs are observed, never replayed. Runtime compatibility, native
+build checks and resource allocation still run. Host coordination uses the
+remote-dev Python RPC code cache, sending only the request after the first call.
+
+Short root preparation reuses that endpoint's Python RPC connection; owned
+preparation jobs wait for exit within their bounded polling interval instead
+of returning early merely because output arrived. First admission persists
+the observed host epoch before submitting and acquiring in one host exchange.
+Container identity and compact source/environment verification run concurrently
+within the same preflight; both must finish successfully before host preflight.
+They are not cached across queue waits.
 
 Task MCP and `python -m vaws_coordinator.vaws` return compact observations by
 default, with one local `record_ref` to the full response. MCP text is a summary;
@@ -314,3 +362,10 @@ interpreter and a placeholder service port of zero, and must not require devices
 or start a service. Failure retains original stderr references and does not launch
 the business command. Planned Run Manifests can record early failure/inconclusive
 outcomes without inventing a running stage.
+
+Managed runs validate fixed inputs and binding/resource parameters before queueing;
+they verify the complete remote environment and source view after the grant,
+before preparing or authorizing the business command. A failed verification retains
+its error and drains the owned job before returning resources. Unknown process or
+host state keeps cleanup pending. Standalone `RuntimePool.request_run` also retains
+its remote verification before queueing.

@@ -152,6 +152,33 @@ class RuntimePool(ManagedExecution):
 
     def register(self, runtime_id: str, spec: dict[str, Any]):
         """Adopt a prepared work root in the caller's fixed user container."""
+        return self._register(runtime_id, spec)
+
+    def _register_checkout(self, runtime_id, spec, owner, session, request_id):
+        """Bind a freshly prepared managed root using its registration probe."""
+        safe_id(request_id)
+        if spec["user"] != owner or spec.get("reuse_only"):
+            raise PermissionError("managed preparation must bind the owner's execution root")
+        return self._register(runtime_id, spec, checkout=(owner, session, request_id))
+
+    def _bind_prepared(self, runtime_id, spec, owner, session, request_id, attestation):
+        """Commit the backend's completed native publication, without adoption.
+
+        This is an internal handoff from prepare_task_environment, never a
+        caller-supplied registration option. A failed or uncertain preparation
+        cannot reach it: the backend requires its owned command's quiet success
+        and matching fixed-view receipt before returning this attestation.
+        """
+        safe_id(request_id)
+        if spec['user'] != owner or spec.get('reuse_only'):
+            raise PermissionError("managed preparation must bind the owner's execution root")
+        if (not attestation.get('container_id')
+                or attestation.get('runtime_root') != spec['endpoint']['root']
+                or attestation.get('execution_view', {}).get('source_id') != spec['source_snapshot']['id']):
+            raise ValueError('prepared result does not describe this fixed execution view')
+        return self._register(runtime_id, spec, checkout=(owner, session, request_id), prepared=attestation)
+
+    def _register(self, runtime_id, spec, *, checkout=None, prepared=None):
         safe_id(runtime_id)
         reuse_only = spec.get('reuse_only', False)
         if type(reuse_only) is not bool:
@@ -186,21 +213,63 @@ class RuntimePool(ManagedExecution):
             raise ValueError("service_ports must contain distinct TCP ports")
         if spec["endpoint"]["port"] in ports or spec["host_endpoint"]["port"] in ports:
             raise ValueError("service ports cannot overlap SSH endpoints")
-        with self._entity_lock("runtime", runtime_id):
+        key = digest([checkout[0], checkout[2]]) if checkout else None
+        checkout_lock = self._entity_lock("checkout", key) if checkout else contextlib.nullcontext()
+        # Match checkout's lock order. Registration and binding share one
+        # probe and one commit; no ready intermediate state is published.
+        with checkout_lock, self._entity_lock("runtime", runtime_id):
             with self.lock, self.transaction() as db:
+                if checkout:
+                    owner, session, _ = checkout
+                    self.owned(db, "session", session, owner)
+                    previous = next((item for item in self.rows(db, "binding") if item["id"] == key), None)
+                    if previous:
+                        runtime = self.get(db, "runtime", previous["runtime_id"])
+                        if (previous["intent"]["session"] != session or previous["runtime_id"] != runtime_id
+                                or any(runtime.get(name) != value for name, value in spec.items())):
+                            raise ValueError("request id reused with different checkout parameters")
+                        if previous["state"] != "bound" or runtime["state"] != "bound":
+                            raise ValueError("this checkout request id belongs to a returned binding; use a new request id")
+                        if prepared is not None and runtime['attestation'] != prepared:
+                            raise ValueError('prepared result differs from the already bound view')
+                        return {**runtime, "binding": previous}
                 self._check_registration(db, runtime_id, spec)
             # The probe runs outside the global lock; conflicts are re-checked
             # against fresh state before committing. Sibling roots in the same
             # user container are allowed; overlapping mutable roots are not.
-            observed = self.backend.inspect(spec, idle=True)
-            if not reuse_only:
+            observed = prepared if prepared is not None else self.backend.inspect(spec, idle=True)
+            if not reuse_only and prepared is None:
                 self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
                                           "container_name": container_name, "port": spec["endpoint"]["port"]})
             row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed, "draining": False}
+            if prepared is not None:
+                row['prepared_native_view'] = True
+            binding = self._checkout_row(owner, session, key, row, observed, requested_runtime=runtime_id) if checkout else None
             with self.lock, self.transaction() as db:
                 self._check_registration(db, runtime_id, spec, container_id=observed.get("container_id"))
+                if binding:
+                    self.owned(db, "session", session, owner)
+                    row["state"] = "bound"
+                    self.put(db, "binding", binding)
+                    self.event(db, owner, "runtime-bound", binding=key, runtime=runtime_id)
                 self.put(db, "runtime", row)
-            return row
+            return {**row, "binding": binding} if binding else row
+
+    def _checkout_row(self, owner, session, key, runtime, observed, *, requested_runtime):
+        profile_key = observed["profile_key"]
+        return {"id": key, "owner": owner,
+                "intent": {"session": session, "profile_key": profile_key,
+                           "runtime_id": requested_runtime},
+                "runtime_id": runtime["id"], "state": "bound", "endpoint": runtime["endpoint"],
+                "host_endpoint": runtime["host_endpoint"], "user": runtime["user"], "python": runtime["python"],
+                "container_name": runtime["container_name"], "container_id": observed.get("container_id"),
+                "profile_key": profile_key, "build_key": observed["build_key"],
+                "service_ports": runtime["service_ports"],
+                "environment": {"VAWS_ENVIRONMENT_FINGERPRINT": profile_key},
+                "build_env": observed["profile"].get("build_env", {}),
+                "launch_env": observed["profile"]["launch_env"],
+                "source_names": sorted(self.owned_source_names(owner, session)),
+                "launch_preamble": observed.get("launch_preamble", "")}
 
     def _check_registration(self, db, runtime_id: str, spec: dict[str, Any], container_id: str | None = None):
         ports = set(spec["service_ports"])
@@ -271,19 +340,7 @@ class RuntimePool(ManagedExecution):
                                 latest["error"] = str(exc)[:500]
                                 self.put(db, "runtime", latest)
                         continue
-                    row = {"id": key, "owner": owner, "intent": intent, "runtime_id": runtime["id"],
-                           "state": "bound", "endpoint": runtime["endpoint"],
-                           "host_endpoint": runtime["host_endpoint"],
-                           "user": runtime["user"], "python": runtime["python"],
-                           "container_name": runtime["container_name"],
-                           "container_id": observed.get("container_id"),
-                           "profile_key": profile_key, "build_key": observed["build_key"],
-                           "service_ports": runtime["service_ports"],
-                           "environment": {"VAWS_ENVIRONMENT_FINGERPRINT": profile_key},
-                           "build_env": observed["profile"].get("build_env", {}),
-                           "launch_env": observed["profile"]["launch_env"],
-                           "source_names": sorted(self.owned_source_names(owner, session)),
-                           "launch_preamble": observed.get("launch_preamble", "")}
+                    row = self._checkout_row(owner, session, key, runtime, observed, requested_runtime=runtime_id)
                     with self.lock, self.transaction() as db:
                         # Re-validate after the lock-free probe: a concurrent
                         # drain/return/re-register must win over this snapshot.
@@ -354,7 +411,16 @@ class RuntimePool(ManagedExecution):
 
     def request_run(self, owner: str, binding_id: str, request_id: str, snapshots: dict[str, str],
                     expected_build_key: str, devices: list[int], npu_count: int,
-                    priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None):
+                    priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None,
+                    allow_external_busy: bool = False):
+        return self._request_run(owner, binding_id, request_id, snapshots, expected_build_key,
+                                 devices, npu_count, priority, queue_seconds, service_port,
+                                 allow_external_busy=allow_external_busy)
+
+    def _request_run(self, owner: str, binding_id: str, request_id: str, snapshots: dict[str, str],
+                     expected_build_key: str, devices: list[int], npu_count: int,
+                     priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None,
+                     allow_external_busy: bool = False, *, check_remote=True):
         try:
             safe_id(request_id)
         except ValueError as exc:
@@ -367,6 +433,8 @@ class RuntimePool(ManagedExecution):
             raise ExecutionRequestError("queue_seconds must be between 1 and 86400")
         if service_port is not None and (type(service_port) is not int or service_port < 0):
             raise ExecutionRequestError("service_port must be 0 or a positive declared runtime service port")
+        if type(allow_external_busy) is not bool or (allow_external_busy and (len(devices) != 1 or npu_count)):
+            raise ExecutionRequestError("allow_external_busy requires a boolean and exactly one explicit physical device")
         if not isinstance(snapshots, dict) or any(not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit) for commit in snapshots.values()):
             raise ExecutionRequestError("snapshots must map source paths to fixed Git commits")
         for name in snapshots:
@@ -376,6 +444,8 @@ class RuntimePool(ManagedExecution):
         intent = {"snapshots": snapshots, "build_key": expected_build_key, "devices": devices,
                   "npu_count": npu_count, "priority": priority, "queue_seconds": queue_seconds,
                   "service_port": service_port}
+        if allow_external_busy:
+            intent["allow_external_busy"] = True
         with self._entity_lock("binding", binding_id):
             with self.lock, self.transaction() as db:
                 binding = self.owned(db, "binding", binding_id, owner)
@@ -389,9 +459,10 @@ class RuntimePool(ManagedExecution):
                         raise ExecutionRequestError("binding already has an unresolved execution")
                 if binding["state"] != "bound" or expected_build_key != binding["build_key"]:
                     raise ExecutionRequestError("cache miss or returned binding; prepare matching artifacts first")
-            observed = self.backend.inspect(runtime, idle=True, snapshots=snapshots)
-            if observed != runtime["attestation"]:
-                raise ExecutionRequestError("runtime/profile changed since checkout")
+            if check_remote:
+                observed = self.backend.inspect(runtime, idle=True, snapshots=snapshots)
+                if observed != runtime["attestation"]:
+                    raise ExecutionRequestError("runtime/profile changed since checkout")
             run = {"id": key, "owner": owner, "binding_id": binding_id, "intent": intent,
                    "task_id": "pool-" + uuid.uuid4().hex, "state": "pending", "epoch": None,
                    "deadline": self.clock() + queue_seconds, "last_poll": 0, "created_at": utc_now(), "submitted": False}
@@ -432,7 +503,8 @@ class RuntimePool(ManagedExecution):
             "resources": {"state": run["state"], "task_id": run["task_id"], "epoch": run["epoch"],
                           "released": run["state"] in TERMINAL,
                           "devices": run.get("task", {}).get("granted_devices", []),
-                          "service_port": run.get("service_port")},
+                          "service_port": run.get("service_port"),
+                          **({"allow_external_busy": True} if run["intent"].get("allow_external_busy") else {})},
             "process": None,
         }
         if job:
@@ -448,11 +520,13 @@ class RuntimePool(ManagedExecution):
         temporary.replace(path)
 
     def control(self, owner: str, run_id: str, action: str, pid: int = 0, *, _managed=False,
-                process_guard=None, completion_confirmed=False):
+                process_guard=None, completion_confirmed=False, _prepared_receipt=None):
         if action not in {"poll", "preflight", "activate", "heartbeat", "release", "cancel"}:
             raise ValueError("unsupported execution action")
         if completion_confirmed and not _managed:
             raise ValueError("only managed supervision can confirm descendant completion")
+        if _prepared_receipt is not None and (not _managed or action != "activate"):
+            raise ValueError("only managed activation can use a prepared supervisor receipt")
         with self._entity_lock("run", run_id):
             with self.lock, self.transaction() as db:
                 run = self.owned(db, "run", run_id, owner)
@@ -467,6 +541,8 @@ class RuntimePool(ManagedExecution):
                     f"cannot {action} an unsubmitted pending execution; poll it first"
                 )
             try:
+                pending_status = None
+                admission_reply = None
                 if run["state"] == "uncertain":
                     # A previous timed-out action may have succeeded. Recover by
                     # observing its exact task; never submit a replacement.
@@ -495,11 +571,16 @@ class RuntimePool(ManagedExecution):
                     else:
                         status = self.backend.host(runtime, {"action": "status", "no_probe": True})
                         run["epoch"] = status["coordination_epoch"]
+                        pending_status = status
                         with self.lock, self.transaction() as db:
                             self.put(db, "run", run)
                 request = {"task_id": run["task_id"], "coordination_epoch": run["epoch"]}
                 if run["state"] == "pending":
-                    status = self.backend.host(runtime, {"action": "status", "no_probe": True, "coordination_epoch": run["epoch"]})
+                    # Initial discovery already includes this epoch's tasks.
+                    # A resumed request still observes them afresh; submit
+                    # enforces the discovered epoch if the host changed.
+                    status = pending_status if pending_status is not None else self.backend.host(
+                        runtime, {"action": "status", "no_probe": True, "coordination_epoch": run["epoch"]})
                     existing = [task for task in status["tasks"] if task["task_id"] == run["task_id"]]
                     if existing:
                         run["task"], run["state"], run["submitted"] = existing[0], existing[0]["state"], True
@@ -512,31 +593,73 @@ class RuntimePool(ManagedExecution):
                               "priority": intent["priority"], "latest_start": run["deadline"],
                               "estimated_duration_seconds": 1800}
                     submit.update({"devices": intent["devices"]} if intent["devices"] else {"npu_count": intent["npu_count"]})
+                    if intent.get("allow_external_busy"):
+                        submit["allow_external_busy"] = True
                     if intent.get("service_port") is not None:
                         submit["service_port"] = intent["service_port"]
                         submit["service_ports"] = runtime.get("service_ports", [])
-                    reply = self.backend.host(runtime, submit)
+                    combined = getattr(self.backend, "submit_and_acquire", None)
+                    if callable(combined):
+                        # The epoch and exact task ID were persisted before
+                        # this potentially mutating exchange. A lost reply
+                        # follows normal uncertain-task reconciliation.
+                        reply = admission_reply = combined(runtime, submit)
+                    else:
+                        reply = self.backend.host(runtime, submit)
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run["submitted"] = True
+                    if admission_reply is not None:
+                        run.pop("error", None)
                     with self.lock, self.transaction() as db:
+                        previous = self.get(db, "run", run_id)
                         self.put(db, "run", run)
+                        if admission_reply is not None and previous["state"] != run["state"]:
+                            self.event(db, owner, "run-state", run=run_id,
+                                       state=run["state"], error=run.get("error"))
                 if run["state"] in TERMINAL:
                     reply = {"task": run.get("task", {"state": run["state"]})}
                 elif action == "poll":
-                    if run["state"] == "queued":
+                    if admission_reply is not None:
+                        reply = admission_reply
+                    elif run["state"] == "queued":
                         reply = self.backend.host(runtime, {**request, "action": "acquire"})
                     else:
                         status = self.backend.host(runtime, {**request, "action": "status", "no_probe": False})
                         reply = {"task": status["tasks"][0]}
                 else:
                     if action == "preflight":
-                        observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
-                        if observed != runtime["attestation"]:
-                            raise ValueError("runtime changed before launch")
-                    reply = self.backend.host(runtime, {**request, "action": action,
+                        try:
+                            compact_verify = getattr(self.backend, "verify_preflight", None) if _managed else None
+                            if callable(compact_verify):
+                                if compact_verify(runtime, snapshots=run["intent"]["snapshots"]) is not True:
+                                    raise ValueError("runtime verification did not confirm the registered view")
+                            else:
+                                observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
+                                if observed != runtime["attestation"]:
+                                    raise ValueError("runtime changed before launch")
+                        except Exception as exc:
+                            if _managed:
+                                # This read-only validation precedes host
+                                # preflight and payload preparation. Persist
+                                # rejection so supervision can drain/cancel
+                                # this exact job after a restart too.
+                                run["preflight_error"] = str(exc)[:500]
+                            raise
+                    host_request = {**request, "action": action,
                               "fence_token": run.get("task", {}).get("fence_token"), "pid": pid,
                               **({"completion_confirmed": True} if action == "release" and completion_confirmed else {}),
-                              **({"process_guard": process_guard} if action == "activate" and process_guard else {})})
+                              **({"process_guard": process_guard} if action == "activate" and process_guard else {})}
+                    if action == "activate" and _prepared_receipt is not None:
+                        activate_prepared = getattr(self.backend, "activate_prepared", None)
+                        if callable(activate_prepared):
+                            reply = activate_prepared(runtime, host_request, _prepared_receipt)
+                        else:
+                            # Preserve explicit embedding backends that implement
+                            # the original separate PID resolver and host adapter.
+                            host_request["pid"] = self.backend.job_host_pid(runtime, _prepared_receipt)
+                            reply = self.backend.host(runtime, host_request)
+                    else:
+                        reply = self.backend.host(runtime, host_request)
                 if reply.get("task"):
                     run["task"], run["state"] = reply["task"], reply["task"]["state"]
                     run.pop("error", None)
@@ -549,7 +672,8 @@ class RuntimePool(ManagedExecution):
                     run["service_port"] = int(service_port)
             except Exception as exc:
                 # No host epoch means no mutating host request was sent yet.
-                run["state"] = "uncertain" if run["epoch"] is not None else "pending"
+                if not (_managed and action == "preflight" and run.get("preflight_error")):
+                    run["state"] = "uncertain" if run["epoch"] is not None else "pending"
                 run["error"] = str(exc)[:500]
             run["last_poll"] = self.clock()
             with self.lock, self.transaction() as db:
@@ -621,14 +745,14 @@ class RuntimePool(ManagedExecution):
         return {"run": run, "jobs": jobs, "event": event,
                 "next": "return the runtime for quarantine and re-verification before any reuse"}
 
-    def tick(self, limit: int = 4):
+    def tick(self, limit: int = 4, *, exclude_managed=()):
         """Observe manual leases and supervise explicitly registered jobs."""
         with self.transaction() as db:
             managed = {row["id"] for row in self.rows(db, "job")}
             rows = [row for row in self.rows(db, "run") if row["state"] not in TERMINAL and row["id"] not in managed]
         for row in sorted(rows, key=lambda row: row["last_poll"])[:limit]:
             self.control(row["owner"], row["id"], "poll")
-        self.managed_tick(limit)
+        self.managed_tick(limit, exclude=exclude_managed)
 
     def status(self, owner: str):
         with self.transaction() as db:

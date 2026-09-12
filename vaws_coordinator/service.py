@@ -366,6 +366,20 @@ class CoordinatorService(TaskMessages):
         if user and row.get("user") and row["user"] != user:
             raise PermissionError("execution belongs to another principal")
         user = user or row.get("user")
+        if action == "status" and not refresh:
+            # Observation reads persisted facts. A stale sample asks the
+            # existing execution worker to refresh asynchronously, so neither
+            # a slow link nor a dead host blocks status or a bounded wait.
+            stale = not self._observation_freshness(row)["fresh"]
+            deferred = stale and bool(row.get("admitted")) and row.get("phase") not in DONE
+            if deferred:
+                self._schedule_progress(sessions_dir, user, execution_id)
+            reply = self._reply(row, role=role)
+            reply["observation_freshness"].update(
+                source="cache" if row.get("jobs_observed_at") else "local",
+                refresh_requested=False, refresh_deferred=deferred,
+            )
+            return reply
         lock = self._lock_for("execution", execution_id)
         acquired = lock.acquire(blocking=False)
         refreshed = False
@@ -537,6 +551,7 @@ class CoordinatorService(TaskMessages):
                                   "binding": binding, "npu_count": role.get("npu_count"),
                                   "devices": role.get("devices") or [],
                                   "service_port": role.get("service_port"),
+                                  **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
                                   "env": dict(role.get("env") or {})})
                 prepared_snapshots = placed.get("snapshots") or {}
                 if runtime_id in prepared_snapshots:
@@ -596,7 +611,9 @@ class CoordinatorService(TaskMessages):
         hold_go = len(row["roles"]) > 1
         def start_role(role):
             if role.get("managed_job"):
-                return self.pool.managed_control(user, role["managed_job"], "status")
+                observed = self.pool.managed_control(user, role["managed_job"], "status")
+                role["status_observed_at"] = time.time()
+                return observed
             if self._adopt_cancel(store, row):
                 return None
             merged_env = {**(spec.get("env") or {}), **(role.get("env") or {})}
@@ -606,10 +623,12 @@ class CoordinatorService(TaskMessages):
                 role.get("devices") or [], role.get("npu_count") or 0,
                 role["command"], merged_env, spec.get("timeout_seconds"),
                 service_port=role.get("service_port"), hold_go=hold_go,
+                **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
             )
             with self._lock_for("progress", row["id"]):
                 role["managed_job"] = job["id"]
                 role["observation"] = job
+                role["status_observed_at"] = time.time()
                 store.save_execution(row)
             return job
 
@@ -663,6 +682,7 @@ class CoordinatorService(TaskMessages):
 
         row["managed_job"] = jobs[0]["id"]
         row["observation"] = jobs[0]
+        row["jobs_observed_at"] = time.time()
         row["phase"] = aggregate_job_states([job["state"] for job in jobs])
         if row["phase"] == "running":
             self._record_assignment(row, jobs)
@@ -736,6 +756,7 @@ class CoordinatorService(TaskMessages):
         except TaskRootBusy as exc:
             return {"status": "waiting", "reason": str(exc)}
         ids = []
+        bindings = []
         snapshots = {}
         for (role, _donor), prepared in zip(placements, prepared_roles):
             if prepared is None:
@@ -747,13 +768,15 @@ class CoordinatorService(TaskMessages):
                         "reason": "prepared environment does not match requested constraints",
                         "provisioning_started": True}
             ids.append(prepared["id"])
+            bindings.append(prepared.get("binding"))
             # Completed preparation already published and checked this exact
             # input. A second materialization would remove generated version
             # metadata/native copies and repeat successful preparation work.
             if (prepared.get("attestation", {}).get("preparation") or {}).get("source_id") == row["spec"]["source_snapshot"]["id"]:
                 snapshots[prepared["id"]] = {record["relpath"]: record["commit"]
                                              for record in row["spec"]["source_snapshot"]["records"]}
-        return {"runtime_ids": ids, "snapshots": snapshots, "reason": None, "provisioning_started": True}
+        return {"runtime_ids": ids, "bindings": bindings, "snapshots": snapshots,
+                "reason": None, "provisioning_started": True}
 
     def _donor_for_role(self, user, environment, role, used_hosts, require_distinct=False):
         catalog = self.pool.catalog()
@@ -867,7 +890,7 @@ class CoordinatorService(TaskMessages):
 
     def _prepare_role(self, store, user, row, role, environment, donor):
         from vaws_coordinator.provision import prepare_task_environment
-        return prepare_task_environment(
+        prepared = prepare_task_environment(
             self.pool, user=user, session_id=row["id"], role_name=role["name"],
             environment=environment, donor=donor, sources=row.get("sources") or {},
             source_snapshot=row["spec"]["source_snapshot"],
@@ -875,7 +898,16 @@ class CoordinatorService(TaskMessages):
             log_dir=self.state_dir / "runs" / row["id"] / role["name"],
             on_preparation_job=lambda job: self._save_preparation_job(store, row, role["name"], job),
             cancel_requested=lambda: self._adopt_cancel(store, row),
+            checkout_session=row["remote_session"]["id"],
         )
+        # Each finished role remains recoverable while its siblings prepare.
+        # A crash before this save is also covered by the pool's durable
+        # execution-session binding, which finish reads below.
+        if prepared.get("binding"):
+            with self._lock_for("progress", row["id"]):
+                row.setdefault("prepared_bindings", {})[role["name"]] = prepared["binding"]
+                store.save_execution(row)
+        return prepared
 
     def _save_preparation_job(self, store, row, role, job):
         with self._lock_for("progress", row["id"]):
@@ -1014,6 +1046,7 @@ class CoordinatorService(TaskMessages):
                     "root": role["binding"]["endpoint"]["cwd"],
                     "rank": index,
                     "devices": devices,
+                    **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
                     "service_port": job.get("service_port"),
                     "state": job["state"],
                 })
@@ -1057,6 +1090,7 @@ class CoordinatorService(TaskMessages):
             "state": job.get("state") or row.get("phase"),
             "runtime_id": role.get("runtime_id"),
             "service_port": job.get("service_port") if job.get("service_port") is not None else role.get("service_port"),
+            **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
             "host": endpoint.get("host"),
             "root": endpoint.get("cwd") or endpoint.get("root"),
             "endpoint": endpoint or None,
@@ -1187,6 +1221,7 @@ class CoordinatorService(TaskMessages):
             "launch_env": binding.get("launch_env") or {},
             "launch_preamble": binding.get("launch_preamble") or "",
             "launch_observation": launch_observation,
+            **({"allow_external_busy": True} if (job or {}).get("request", {}).get("allow_external_busy") else {}),
             "environment": environment, "service_port": service_port,
             "state": state, "live": state in LIVE,
             "assignment": row.get("assignment"),
@@ -1260,8 +1295,11 @@ class CoordinatorService(TaskMessages):
                 (row.get("user") for row in rows if row.get("user")), "")
             seen = set()
             for row in rows:
-                for role in row.get("roles") or []:
-                    binding = role.get("binding")
+                bindings = [role.get("binding") for role in row.get("roles") or []]
+                bindings.extend((row.get("prepared_bindings") or {}).values())
+                if row.get("remote_session"):
+                    bindings.extend(self.pool.session_bindings(user, row["remote_session"]["id"]))
+                for binding in bindings:
                     if not binding or binding["id"] in seen:
                         continue
                     seen.add(binding["id"])
@@ -1359,15 +1397,28 @@ class CoordinatorService(TaskMessages):
                 self._active_requests -= 1
 
     def _dispatch_progress_active(self) -> None:
-        self.pool.tick()
+        sessions = []
+        execution_jobs = set()
         for directory in list(self._session_dirs):
             try:
                 store = self.store(directory)
+                executions = store.all_executions()
+                sessions.append((directory, store, executions))
+                execution_jobs.update(role["managed_job"] for row in executions
+                                      if row.get("admitted") and row.get("phase") not in DONE
+                                      and not self._lock_for("execution", row["id"]).locked()
+                                      for role in row.get("roles", []) if role.get("managed_job"))
             except Exception as exc:
                 self._record_daemon_error(f"sessions {directory}: {exc}")
                 continue
+        # Each execution worker supervises its own roles. The pool services
+        # standalone jobs and free roles of busy executions. One stalled host
+        # must not consume healthy siblings' renewal budget while their shared
+        # execution worker remains busy. Per-job locks prevent overlap.
+        self.pool.tick(exclude_managed=execution_jobs)
+        for directory, store, executions in sessions:
             finishing = {session["id"] for session in store.sessions() if session.get("state") == "finishing"}
-            for row in store.all_executions():
+            for row in executions:
                 if row.get("session_id") in finishing:
                     continue
                 if not row.get("admitted") or row.get("phase") in DONE:

@@ -6,7 +6,9 @@ This module never installs packages, creates containers, or loads a model.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import importlib.metadata
+import importlib.util
 import json
 import os
 import re
@@ -243,6 +245,154 @@ def capture(root: Path, profile: dict[str, Any], inputs: dict[str, Any],
     }
 
 
+def native_compatibility_key(manifest: dict[str, Any]) -> str:
+    """Identify the already tested native environment independently of a view.
+
+    Python business source and its SCM version may change without changing
+    dependencies or native inputs. That source is tested by the execution,
+    while the environment and every reused output must still match here.
+    """
+    profile = manifest['profile']
+    inputs = manifest['build_inputs']
+    source_inputs = {}
+    for name in ('vllm', 'vllm-ascend'):
+        row = inputs.get(name, {})
+        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not re.fullmatch(r'[0-9a-f]{64}', row[key])
+               for key in ('native', 'dependencies')):
+            raise ValueError('native compatibility reuse requires complete build input fingerprints')
+        source_inputs[name] = {key: row[key] for key in ('native', 'dependencies')}
+    # Normalize only the source/metadata overlay and copied native tree. Other
+    # execution roots in a loader search path remain part of the identity.
+    # PATH is command lookup, not native loading: managed execution selects
+    # the shared donor interpreter by its absolute path.
+    root = manifest['runtime_root'].replace('\\', '/').rstrip('/')
+    overlays = (root + '/.vaws-runtime/metadata', root + '/vllm', root + '/vllm-ascend')
+    native_root = root + '/vllm-ascend/vllm_ascend'
+    loader_environment = {}
+    for name, value in profile['launch_env'].items():
+        if name == 'PATH':
+            continue
+        if name not in {'PYTHONPATH', 'LD_LIBRARY_PATH', 'ASCEND_CUSTOM_OPP_PATH'}:
+            loader_environment[name] = value
+            continue
+        parts = []
+        for part in value.split(':'):
+            # An empty or relative component makes loading depend on cwd.
+            # A fresh execution root therefore needs its own import smoke.
+            if not part or not PurePosixPath(part).is_absolute():
+                raise ValueError('native compatibility reuse requires absolute loader search paths')
+            if name == 'PYTHONPATH' and part in overlays:
+                part = '$EXECUTION_ROOT' + part[len(root):]
+            elif name != 'PYTHONPATH' and (part in {native_root, native_root + '/_cann_ops_custom'}
+                                            or part.startswith(native_root + '/_cann_ops_custom/')):
+                part = '$EXECUTION_NATIVE_ROOT' + part[len(native_root):]
+            if part and part not in parts:
+                parts.append(part)
+        loader_environment[name] = ':'.join(parts)
+    environment = {name: profile[name] for name in PROFILE_FIELDS if name not in ('vllm', 'vllm_ascend')}
+    environment.update(build_env=profile['build_env'], system_files=profile['system_files'],
+                       packages=profile.get('packages', {}),
+                       launch_env=loader_environment)
+    return digest({'environment': environment, 'inputs': source_inputs, 'files': manifest['files']})
+
+
+def native_source_mapping(root: Path) -> dict[str, str]:
+    """Resolve the execution overlay without importing business/native code."""
+    root = root.resolve()
+    result = {}
+    for name, source in (('vllm', 'vllm'), ('vllm_ascend', 'vllm-ascend')):
+        spec = importlib.util.find_spec(name)
+        expected = root / source / name
+        if not spec or not spec.origin or Path(spec.origin).resolve() != expected / '__init__.py':
+            raise ValueError('module mapping escaped the execution source view: ' + name)
+        result[name] = str(Path(spec.origin).resolve())
+        dist = importlib.metadata.distribution(source)
+        metadata_root = root / '.vaws-runtime/metadata'
+        if Path(dist.locate_file('')).resolve() != metadata_root:
+            raise ValueError('distribution metadata escaped the execution source view: ' + source)
+        result[source + '_version'] = dist.version
+    extension = importlib.machinery.PathFinder.find_spec(
+        'vllm_ascend.vllm_ascend_C', [str(root / 'vllm-ascend/vllm_ascend')])
+    if (not extension or not extension.origin
+            or not isinstance(extension.loader, importlib.machinery.ExtensionFileLoader)
+            or Path(extension.origin).resolve().parent != root / 'vllm-ascend/vllm_ascend'):
+        raise ValueError('extension mapping escaped the execution source view')
+    result['extension'] = str(Path(extension.origin).resolve())
+    return result
+
+
+def native_compatibility_receipt(root: Path, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy an already verified donor's original import proof, without chains."""
+    try:
+        key = native_compatibility_key(manifest)
+    except (KeyError, ValueError):
+        # Older incomplete attestations still need the ordinary import smoke.
+        return None
+    evidence = manifest['evidence']['smoke']
+    data = checked_file(root, evidence['path']).read_bytes()
+    if hashlib.sha256(data).hexdigest() != evidence['sha256']:
+        raise ValueError('donor import evidence changed after verification')
+    smoke = json.loads(data)
+    if smoke.get('kind') == 'native-compatibility-reuse':
+        return smoke['compatibility']
+    if smoke.get('passed') is not True:
+        raise ValueError('native compatibility requires a successful original import')
+    return {'key': key, 'origin': {'profile_key': manifest['profile_key'],
+                                  'build_key': manifest['build_key'], 'build_inputs': manifest['build_inputs'],
+                                  'smoke': smoke}}
+
+
+def verify_native_compatibility(root: Path, manifest: dict[str, Any], smoke: dict[str, Any], *, check_environment: bool):
+    certificate = smoke.get('compatibility') or {}
+    origin = certificate.get('origin') or {}
+    original = origin.get('smoke') or {}
+    if (smoke.get('python_import_executed') is not False or 'passed' in smoke
+            or smoke.get('profile_key') != manifest['profile_key'] or smoke.get('build_inputs') != manifest['build_inputs']
+            or any(not re.fullmatch(r'[0-9a-f]{64}', str(origin.get(key, ''))) for key in ('profile_key', 'build_key'))
+            or certificate.get('key') != native_compatibility_key(manifest)
+            or original.get('passed') is not True or original.get('kind') == 'native-compatibility-reuse'
+            or original.get('profile_key') not in (None, origin.get('profile_key'))
+            or original.get('build_inputs') not in (None, origin.get('build_inputs'))):
+        raise ValueError('reused native compatibility evidence does not match this environment and bundle')
+    if check_environment and native_source_mapping(root) != smoke.get('source_mapping'):
+        raise ValueError('execution source or SCM metadata mapping changed')
+
+
+def verify_environment(root: Path, manifest: dict[str, Any]) -> None:
+    """Check mutable environment facts without re-reading native outputs."""
+    if str(root.resolve()) != manifest['runtime_root']:
+        raise ValueError('runtime relocation needs separate validation')
+    profile = manifest['profile']
+    if sysconfig.get_config_var('SOABI') != profile['python_abi']:
+        raise ValueError('Python ABI changed')
+    for key, package in PACKAGES.items():
+        if importlib.metadata.version(package) != profile[key]:
+            raise ValueError(f'installed package changed: {package}')
+    for package, version in profile.get('packages', {}).items():
+        if importlib.metadata.version(package) != version:
+            raise ValueError(f'profile dependency changed: {package}')
+    for row in profile['system_files'].values():
+        if file_digest(Path(row['path'])) != row['sha256']:
+            raise ValueError('CANN/driver/runtime support file changed')
+
+
+def verify_execution_view(root: Path, manifest: dict[str, Any]) -> None:
+    """Check an owned view at launch, reusing its completed native publication.
+
+    Native bytes were checked as they were copied into this private view. They
+    are not mutable inputs of a managed execution. Explicit adoption/repair and
+    native builds still use ``verify`` to validate the complete bundle.
+    """
+    verify_environment(root, manifest)
+    row = manifest['evidence']['smoke']
+    data = checked_file(root, row['path']).read_bytes()
+    if hashlib.sha256(data).hexdigest() != row['sha256']:
+        raise ValueError('execution view evidence changed')
+    smoke = json.loads(data)
+    if native_source_mapping(root) != smoke.get('source_mapping'):
+        raise ValueError('execution source or SCM metadata mapping changed')
+
+
 def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = True) -> None:
     if manifest.get('schema_version') == 2 and manifest.get('profile', {}).get('kind') == 'command':
         if profile_key(manifest['profile']) != manifest['profile_key']:
@@ -271,27 +421,16 @@ def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = Tr
         smoke = json.loads(checked_file(root, manifest['evidence']['smoke']['path']).read_text(encoding='utf-8'))
     except (ValueError, UnicodeError) as exc:
         raise ValueError('import-smoke evidence must be a successful structured receipt') from exc
-    if smoke.get('passed') is not True:
+    if smoke.get('kind') == 'native-compatibility-reuse':
+        verify_native_compatibility(root, manifest, smoke, check_environment=check_environment)
+    elif smoke.get('passed') is not True:
         raise ValueError('import-smoke evidence did not pass')
     if smoke.get('profile_key') not in (None, manifest['profile_key']):
         raise ValueError('import-smoke evidence belongs to another profile')
     if smoke.get('build_inputs') not in (None, manifest['build_inputs']):
         raise ValueError('import-smoke evidence belongs to different build inputs')
     if check_environment:
-        if str(root.resolve()) != manifest["runtime_root"]:
-            raise ValueError("runtime relocation needs separate validation")
-        profile = manifest["profile"]
-        if sysconfig.get_config_var("SOABI") != profile["python_abi"]:
-            raise ValueError("Python ABI changed")
-        for key, package in PACKAGES.items():
-            if importlib.metadata.version(package) != profile[key]:
-                raise ValueError(f"installed package changed: {package}")
-        for package, version in profile.get("packages", {}).items():
-            if importlib.metadata.version(package) != version:
-                raise ValueError(f"profile dependency changed: {package}")
-        for row in profile["system_files"].values():
-            if file_digest(Path(row["path"])) != row["sha256"]:
-                raise ValueError("CANN/driver/runtime support file changed")
+        verify_environment(root, manifest)
 
 
 def publish(root: Path, cache: Path, manifest: dict[str, Any]) -> Path:
