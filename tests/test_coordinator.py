@@ -1047,9 +1047,6 @@ class TaskClientTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        _init_git_workspace(self.root)
-        for name in ("vllm", "vllm-ascend"):
-            _init_git_workspace(self.root / name)
         self.backend = Backend(self.root / "host")
         self.backend.require_prepared = True
         self.pool = RuntimePool(self.root / "manager", self.backend)
@@ -1058,8 +1055,14 @@ class TaskClientTests(unittest.TestCase):
         from vaws_coordinator.task_client import TaskClient
         self.store = AgentSessions(self.root / "sessions")
         self.context = self.store.attach("codex", "native-alice", str(self.root))
-        self.store.bind_sources(self.context, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
         self.client = TaskClient(self.context["context_file"], pool=self.pool, user="alice")
+
+    def bind_native_sources(self, context=None):
+        """Only source-specific tests need Git capture and native preparation."""
+        sources = {name: str(self.root / name) for name in ("vllm", "vllm-ascend")}
+        for source in sources.values():
+            _init_git_workspace(Path(source))
+        self.store.bind_sources(context or self.context, sources)
         self.client.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
 
     def _seed(self, pool, runtime_id, spec):
@@ -1122,7 +1125,8 @@ class TaskClientTests(unittest.TestCase):
         self.assertTrue(reply["target"]["live"])
         self.assertEqual(reply["target"]["user"], "alice")
         self.assertEqual(reply["target"]["container_name"], "vaws-alice")
-        self.assertTrue(reply["target"]["python"].endswith("/.venv/bin/python"))
+        prepared = self.backend.prepared[reply["target"]["endpoint"]["cwd"]]
+        self.assertEqual(reply["target"]["python"], prepared["python"])
         self.assertNotEqual(reply["target"]["endpoint"]["cwd"], "/vllm-workspace/alice/1")
         observed = self.client.observe(reply["execution_id"], "target")
         self.assertEqual(observed["target"]["runtime_id"], reply["target"]["runtime_id"])
@@ -1172,16 +1176,17 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "running")
         self.assertEqual(recovered["execution_id"], reply["execution_id"])
 
-    def test_each_execution_and_other_task_have_distinct_work_roots(self):
+    def test_same_task_gets_a_new_binding_and_root_for_each_execution(self):
         first = self.client.run("true")
         self.client.observe(first["execution_id"], "stop")
         second = self.client.run("sleep 1")
+        self.assertEqual(second["state"], "running")
         self.assertNotEqual(second["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
+        self.assertNotEqual(second["target"]["binding_id"], first["target"]["binding_id"])
+        self.assertNotEqual(second["target"]["runtime_id"], first["target"]["runtime_id"])
         other_context = self.store.attach("codex", "native-alice-2", str(self.root))
-        self.store.bind_sources(other_context, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
         from vaws_coordinator.task_client import TaskClient
         other = TaskClient(other_context["context_file"], pool=self.pool, user="alice")
-        other.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
         stolen = other.run("true")
         stolen_cwd = (stolen.get("target") or {}).get("endpoint", {}).get("cwd")
         self.assertNotEqual(stolen_cwd, second["target"]["endpoint"]["cwd"])
@@ -1190,7 +1195,6 @@ class TaskClientTests(unittest.TestCase):
         from vaws_coordinator.task_client import TaskClient
         empty = RuntimePool(self.root / "manager-empty", self.backend)
         client = TaskClient(self.context["context_file"], pool=empty, user="alice")
-        client.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
         queued = client.run("true")
         self.assertEqual(queued["state"], "waiting_for_runtime")
         execution_id = queued["execution_id"]
@@ -1215,9 +1219,7 @@ class TaskClientTests(unittest.TestCase):
         self._seed(lone, "only-a", runtime_spec(1, user="alice", recipe="rc"))
         from vaws_coordinator.task_client import TaskClient
         other_ctx = self.store.attach("codex", "native-alice-group", str(self.root))
-        self.store.bind_sources(other_ctx, {"vllm": str(self.root / "vllm"), "vllm-ascend": str(self.root / "vllm-ascend")})
         client = TaskClient(other_ctx["context_file"], pool=lone, user="alice")
-        client.coordinator.sync_binding = lambda *args, **kwargs: {"vllm": "a" * 40, "vllm-ascend": "b" * 40}
         neither = client.run("unused", topology={**topology, "distinct_hosts": True})
         self.assertNotEqual(neither["state"], "running")
         self.assertTrue(neither["state"] in {"waiting_for_runtime", "waiting", "queued"})
@@ -1271,6 +1273,7 @@ class TaskClientTests(unittest.TestCase):
             self.pool.register("empty-root", runtime_spec(9, user="alice", root="/empty/unprepared"))
 
     def test_prepare_creates_isolated_interpreter_not_donor_python(self):
+        self.bind_native_sources()
         first = self.client.run("true")
         donor_python = first["target"]["python"]
         other_context = self.store.attach("codex", "native-alice-prep", str(self.root))
@@ -1285,15 +1288,6 @@ class TaskClientTests(unittest.TestCase):
         self.assertIn("/executions/", prepared["target"]["endpoint"]["cwd"])
         self.assertNotEqual(prepared["target"]["endpoint"]["cwd"], first["target"]["endpoint"]["cwd"])
 
-    def test_same_task_gets_a_new_binding_and_root_for_each_execution(self):
-        first = self.client.run("true")
-        binding_id = first["target"]["binding_id"]
-        runtime_id = first["target"]["runtime_id"]
-        self.client.observe(first["execution_id"], "stop")
-        second = self.client.run("sleep 1")
-        self.assertEqual(second["state"], "running")
-        self.assertNotEqual(second["target"]["binding_id"], binding_id)
-        self.assertNotEqual(second["target"]["runtime_id"], runtime_id)
 
     def test_resumed_task_checks_out_returned_runtime_with_fresh_identity(self):
         previous = self.client.run("true")
@@ -1346,6 +1340,7 @@ class TaskClientTests(unittest.TestCase):
         self.assertEqual(mixed["state"], "failed")
 
     def test_same_task_materializes_independent_execution_roots_concurrently(self):
+        self.bind_native_sources()
         started = threading.Event()
         release = threading.Event()
         syncs = []
@@ -1400,14 +1395,14 @@ class TaskClientTests(unittest.TestCase):
         self.client.coordinator._async_progress = True
         started = threading.Event()
         release = threading.Event()
-        original = self.client.coordinator.sync_binding
+        original = self.client.coordinator._place_or_prepare
 
         def delayed(*args, **kwargs):
             started.set()
             self.assertTrue(release.wait(5))
             return original(*args, **kwargs)
 
-        self.client.coordinator.sync_binding = delayed
+        self.client.coordinator._place_or_prepare = delayed
         admitted = self.client.run("true")
         self.assertIn(admitted["state"], {"queued", "preparing", "bound", "waiting", "launch_pending"})
         self.assertEqual(len(admitted["execution_id"]), 64)
@@ -1435,14 +1430,14 @@ class TaskClientTests(unittest.TestCase):
         self.client.coordinator._async_progress = True
         started = threading.Event()
         release = threading.Event()
-        original = self.client.coordinator.sync_binding
+        original = self.client.coordinator._place_or_prepare
 
         def delayed(*args, **kwargs):
             started.set()
             self.assertTrue(release.wait(5))
             return original(*args, **kwargs)
 
-        self.client.coordinator.sync_binding = delayed
+        self.client.coordinator._place_or_prepare = delayed
         admitted = self.client.run(
             "unused",
             topology={"roles": [{"name": "prefill", "npu_count": 1, "host": "192.0.2.1"},
@@ -1468,14 +1463,14 @@ class TaskClientTests(unittest.TestCase):
         self.client.coordinator._async_progress = True
         started = threading.Event()
         release = threading.Event()
-        original = self.client.coordinator.sync_binding
+        original = self.client.coordinator._place_or_prepare
 
         def delayed(*args, **kwargs):
             started.set()
             self.assertTrue(release.wait(5))
             return original(*args, **kwargs)
 
-        self.client.coordinator.sync_binding = delayed
+        self.client.coordinator._place_or_prepare = delayed
         with mock.patch.object(service_mod, "TICK_SECONDS", 0.05):
             ticker = threading.Thread(target=self.client.coordinator._tick_loop, daemon=True)
             ticker.start()
@@ -1518,21 +1513,18 @@ class TaskClientTests(unittest.TestCase):
                 self.client.coordinator._stopped.set()
                 ticker.join(timeout=2.5)
 
-    def test_persisted_finishing_task_completes_after_coordinator_restart(self):
+    def test_persisted_finishing_task_releases_bound_preflight_after_coordinator_restart(self):
         from vaws_coordinator.service import CoordinatorService
 
         self.client.coordinator._async_progress = True
         started = threading.Event()
         release = threading.Event()
-        original = self.client.coordinator.sync_binding
-
         def delayed(*args, **kwargs):
             started.set()
             self.assertTrue(release.wait(5))
-            return original(*args, **kwargs)
 
-        self.client.coordinator.sync_binding = delayed
-        admitted = self.client.run("true")
+        self.backend.preflight = delayed
+        admitted = self.client.run("true", preflight="check-before-launch")
         self.assertTrue(started.wait(3))
         reply = self.client.finish()
         self.assertEqual(reply["state"], "finishing")

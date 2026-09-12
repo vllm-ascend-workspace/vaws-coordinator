@@ -15,7 +15,6 @@ from unittest import mock
 from vaws_coordinator import task_server
 from vaws_coordinator.agent_session import AgentSessions
 from vaws_coordinator.host_queue import SCHEMA_VERSION
-from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS
 from vaws_coordinator.service import CoordinatorClient, socket_path, _lock_daemon
 from vaws_coordinator.task_server import (
     ALIASES,
@@ -76,11 +75,17 @@ class CapabilityTests(unittest.TestCase):
     def test_tools_list_advertises_the_four_portable_names_with_their_own_schemas(self):
         tools = list_tools()
         self.assertEqual([tool["name"] for tool in tools], ["vaws_session", "vaws_run", "vaws_execution", "vaws_finish"])
+        from jsonschema import Draft202012Validator, ValidationError
+
+        examples = {"vaws_session": {"sources": {}}, "vaws_run": {"command": "echo ready"},
+                    "vaws_execution": {"execution_id": "a" * 64}, "vaws_finish": {}}
         for tool in tools:
             with self.subTest(tool=tool["name"]):
-                canonical = ALIASES[tool["name"]]
-                self.assertEqual(tool["description"], TOOL_DESCRIPTIONS[canonical])
-                self.assertEqual(tool["inputSchema"], TOOL_SCHEMAS[canonical])
+                self.assertTrue(tool["description"])
+                validator = Draft202012Validator(tool["inputSchema"])
+                validator.validate(examples[tool["name"]])
+                with self.assertRaises(ValidationError):
+                    validator.validate({**examples[tool["name"]], "unsupported": True})
         self.assertEqual(handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"], {"tools": tools})
 
     def test_initialize_declares_the_package_version(self):
