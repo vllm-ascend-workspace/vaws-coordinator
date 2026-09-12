@@ -311,3 +311,10 @@ interpreter and a placeholder service port of zero, and must not require devices
 or start a service. Failure retains original stderr references and does not launch
 the business command. Planned Run Manifests can record early failure/inconclusive
 outcomes without inventing a running stage.
+
+Managed runs validate fixed inputs and binding/resource parameters before queueing;
+they verify the complete remote environment and source view after the grant,
+before preparing or authorizing the business command. A failed verification retains
+its error and drains the owned job before returning resources. Unknown process or
+host state keeps cleanup pending. Standalone `RuntimePool.request_run` also retains
+its remote verification before queueing.

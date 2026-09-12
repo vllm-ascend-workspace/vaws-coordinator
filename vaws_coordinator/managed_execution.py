@@ -128,9 +128,14 @@ class ManagedExecution:
                         job["state"] = "cancelled"
                         job["runtime_returned"] = False
                         return self._save_managed(job)
-                    run = self.request_run(job["owner"], **job["request"])
+                    # Fixed inputs and binding/lease parameters are admitted
+                    # locally. The complete remote fact check runs after the
+                    # grant, before any payload is prepared or authorized.
+                    run = self._request_run(job["owner"], **job["request"], check_remote=False)
                 else:
                     run = self.control(job["owner"], key, "poll", _managed=True)
+                if run.get("preflight_error"):
+                    job["preflight_error"] = run["preflight_error"]
                 job["lease_state"] = run["state"]
                 if run.get("environment"):
                     job["environment"] = run["environment"]
@@ -145,14 +150,15 @@ class ManagedExecution:
                     # completion_confirmed or disable retain_until_release.
                     observed = {**observed, "quiet": False}
                 job["remote"] = observed
-                if run["state"] in {"uncertain", "pending"}:
+                if run["state"] in {"uncertain", "pending"} and not job.get("preflight_error"):
                     job.update(state="waiting" if run["state"] == "pending" else "uncertain", error=run.get("error"))
                     return self._save_managed(job)
 
                 timed_out = (observed.get("result") or {}).get("state") == "timeout"
                 if timed_out:
                     job["timed_out"] = True
-                if run["state"] == "orphaned_busy" and not job["cancel_requested"] and not timed_out:
+                if (run["state"] == "orphaned_busy" and not job["cancel_requested"]
+                        and not job.get("preflight_error") and not timed_out):
                     # Host quarantine is not proof of a dead family. Heartbeat
                     # is the only recovery that moves orphaned_busy back to
                     # active; a live marked family is never stopped here.
@@ -163,7 +169,7 @@ class ManagedExecution:
                                    error="host quarantines the lease; the live family is preserved")
                         return self._save_managed(job)
                 lost_lease = run["state"] in LEASE_TERMINAL
-                if job["cancel_requested"] or lost_lease or timed_out:
+                if job["cancel_requested"] or job.get("preflight_error") or lost_lease or timed_out:
                     if not observed["quiet"]:
                         job["remote"] = self.backend.job(runtime, job["job_id"], "stop", force=job["force"])
                         job["state"] = "stopping"
@@ -181,6 +187,13 @@ class ManagedExecution:
                     return self._save_managed(job)
                 if run["state"] == "granted":
                     run = self.control(job["owner"], key, "preflight", _managed=True)
+                    if run.get("preflight_error"):
+                        job["preflight_error"] = run["preflight_error"]
+                        if not observed["quiet"]:
+                            job["remote"] = self.backend.job(runtime, job["job_id"], "stop", force=job["force"])
+                            job["state"] = "stopping"
+                            return self._save_managed(job)
+                        return self._finish_managed(job, run, binding, runtime, observed)
                 if run["state"] == "starting":
                     receipt = launch_observation(binding, job["request"], job["spec"], run["environment"])
                     job["launch_observation"] = receipt
@@ -271,12 +284,14 @@ class ManagedExecution:
             return self._save_managed(job)
         # Execution owns the process family, NPU lease and service port.
         # The task keeps its mutable work root until vaws_finish.
-        state = ("cancelled" if job["cancel_requested"] else "timeout" if job.get("timed_out")
+        state = ("failed" if job.get("preflight_error") else "cancelled" if job["cancel_requested"] else "timeout" if job.get("timed_out")
                  else observed.get("state", "lost_outcome"))
         job["state"] = state if state in JOB_TERMINAL else "inconclusive"
         job["remote"] = observed
         job["runtime_returned"] = False
-        if job["state"] == "inconclusive" and run["state"] == "expired" and not job.get("had_receipt"):
+        if job.get("preflight_error"):
+            job["error"] = job["preflight_error"]
+        elif job["state"] == "inconclusive" and run["state"] == "expired" and not job.get("had_receipt"):
             job["error"] = "lease expired before the command started: " + (run.get("task", {}).get("message") or "activation deadline elapsed")
         else:
             job.pop("error", None)

@@ -223,7 +223,7 @@ class RuntimePool(ManagedExecution):
                 self.backend.host(spec, {"action": "container-ssh-reserve", "user": user,
                                           "container_name": container_name, "port": spec["endpoint"]["port"]})
             row = {"id": runtime_id, **spec, "state": "ready", "attestation": observed, "draining": False}
-            binding = self._checkout_row(owner, session, key, row, observed) if checkout else None
+            binding = self._checkout_row(owner, session, key, row, observed, requested_runtime=runtime_id) if checkout else None
             with self.lock, self.transaction() as db:
                 self._check_registration(db, runtime_id, spec, container_id=observed.get("container_id"))
                 if binding:
@@ -234,11 +234,11 @@ class RuntimePool(ManagedExecution):
                 self.put(db, "runtime", row)
             return {**row, "binding": binding} if binding else row
 
-    def _checkout_row(self, owner, session, key, runtime, observed, *, requested_runtime=None):
+    def _checkout_row(self, owner, session, key, runtime, observed, *, requested_runtime):
         profile_key = observed["profile_key"]
         return {"id": key, "owner": owner,
                 "intent": {"session": session, "profile_key": profile_key,
-                           "runtime_id": runtime["id"] if requested_runtime is None else requested_runtime},
+                           "runtime_id": requested_runtime},
                 "runtime_id": runtime["id"], "state": "bound", "endpoint": runtime["endpoint"],
                 "host_endpoint": runtime["host_endpoint"], "user": runtime["user"], "python": runtime["python"],
                 "container_name": runtime["container_name"], "container_id": observed.get("container_id"),
@@ -392,6 +392,14 @@ class RuntimePool(ManagedExecution):
                     expected_build_key: str, devices: list[int], npu_count: int,
                     priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None,
                     allow_external_busy: bool = False):
+        return self._request_run(owner, binding_id, request_id, snapshots, expected_build_key,
+                                 devices, npu_count, priority, queue_seconds, service_port,
+                                 allow_external_busy=allow_external_busy)
+
+    def _request_run(self, owner: str, binding_id: str, request_id: str, snapshots: dict[str, str],
+                     expected_build_key: str, devices: list[int], npu_count: int,
+                     priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None,
+                     allow_external_busy: bool = False, *, check_remote=True):
         try:
             safe_id(request_id)
         except ValueError as exc:
@@ -430,9 +438,10 @@ class RuntimePool(ManagedExecution):
                         raise ExecutionRequestError("binding already has an unresolved execution")
                 if binding["state"] != "bound" or expected_build_key != binding["build_key"]:
                     raise ExecutionRequestError("cache miss or returned binding; prepare matching artifacts first")
-            observed = self.backend.inspect(runtime, idle=True, snapshots=snapshots)
-            if observed != runtime["attestation"]:
-                raise ExecutionRequestError("runtime/profile changed since checkout")
+            if check_remote:
+                observed = self.backend.inspect(runtime, idle=True, snapshots=snapshots)
+                if observed != runtime["attestation"]:
+                    raise ExecutionRequestError("runtime/profile changed since checkout")
             run = {"id": key, "owner": owner, "binding_id": binding_id, "intent": intent,
                    "task_id": "pool-" + uuid.uuid4().hex, "state": "pending", "epoch": None,
                    "deadline": self.clock() + queue_seconds, "last_poll": 0, "created_at": utc_now(), "submitted": False}
@@ -574,9 +583,18 @@ class RuntimePool(ManagedExecution):
                         reply = {"task": status["tasks"][0]}
                 else:
                     if action == "preflight":
-                        observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
-                        if observed != runtime["attestation"]:
-                            raise ValueError("runtime changed before launch")
+                        try:
+                            observed = self.backend.inspect(runtime, idle=True, snapshots=run["intent"]["snapshots"])
+                            if observed != runtime["attestation"]:
+                                raise ValueError("runtime changed before launch")
+                        except Exception as exc:
+                            if _managed:
+                                # This read-only validation precedes host
+                                # preflight and payload preparation. Persist
+                                # rejection so supervision can drain/cancel
+                                # this exact job after a restart too.
+                                run["preflight_error"] = str(exc)[:500]
+                            raise
                     reply = self.backend.host(runtime, {**request, "action": action,
                               "fence_token": run.get("task", {}).get("fence_token"), "pid": pid,
                               **({"completion_confirmed": True} if action == "release" and completion_confirmed else {}),
@@ -593,7 +611,8 @@ class RuntimePool(ManagedExecution):
                     run["service_port"] = int(service_port)
             except Exception as exc:
                 # No host epoch means no mutating host request was sent yet.
-                run["state"] = "uncertain" if run["epoch"] is not None else "pending"
+                if not (_managed and action == "preflight" and run.get("preflight_error")):
+                    run["state"] = "uncertain" if run["epoch"] is not None else "pending"
                 run["error"] = str(exc)[:500]
             run["last_poll"] = self.clock()
             with self.lock, self.transaction() as db:

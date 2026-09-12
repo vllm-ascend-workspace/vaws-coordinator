@@ -324,6 +324,19 @@ class PoolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "returned binding"):
             self.pool._register_checkout("prepared", spec, "alice", session["id"], "prepared-request")
 
+    def test_public_checkout_auto_selection_preserves_null_and_default_intents(self):
+        for index, selection in enumerate(({}, {"runtime_id": None})):
+            with self.subTest(selection=selection):
+                self.pool.register("runtime-a", runtime_spec(1))
+                session = self.pool.session_open("alice", f"auto-session-{index}", {})
+                with mock.patch.object(self.backend, "inspect", wraps=self.backend.inspect) as probe:
+                    first = self.pool.checkout("alice", session["id"], "profile-a", f"auto-{index}", **selection)
+                    again = self.pool.checkout("alice", session["id"], "profile-a", f"auto-{index}", **selection)
+                self.assertEqual(first, again)
+                self.assertEqual(first["intent"]["runtime_id"], selection.get("runtime_id", ""))
+                self.assertEqual(probe.call_count, 1)
+                self.pool.return_runtime("alice", first["id"])
+
     def test_managed_registration_does_not_publish_unverified_or_half_bound_root(self):
         session = self.pool.session_open("alice", "prepared-session", {})
         original = self.backend.inspect
@@ -352,6 +365,90 @@ class PoolTests(unittest.TestCase):
         failed = self.pool.control("alice", run["id"], "preflight")
         self.assertEqual(failed["state"], "uncertain")
         self.assertIn("changed before launch", failed["error"])
+
+    def test_managed_checks_changed_source_after_queue_without_preparing_payload(self):
+        busy_binding = self.bind("bob", self.root / "bob")
+        busy = self.request("bob", busy_binding)
+        binding = self.bind("alice", self.root / "alice")
+        source = self.root / "candidate.py"
+        source.write_text("fixed input\n")
+        original = self.backend.inspect
+        def inspect(runtime, **kwargs):
+            if source.read_text() != "fixed input\n":
+                from vaws_coordinator.parity_support import RemoteCommandError
+                raise RemoteCommandError(1, "runtime source differs from pinned snapshot: vllm")
+            return original(runtime, **kwargs)
+        with mock.patch.object(self.backend, "inspect", side_effect=inspect) as probe:
+            job = self.pool.managed_start("alice", binding["id"], "managed", {"vllm": "a" * 40},
+                                          "native-a", [0], 0, "must-not-execute", {})
+            self.assertEqual(job["state"], "queued")
+            probe.assert_not_called()
+            source.write_text("changed while waiting\n")
+            self.pool.control("bob", busy["id"], "cancel")
+            rejected = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(rejected["state"], "failed")
+        self.assertEqual(rejected["lease_state"], "cancelled")
+        self.assertIn("differs from pinned snapshot", rejected["error"])
+        self.assertEqual(self.backend.jobs, {})
+        self.assertNotIn(("job", "prepare"), self.backend.calls)
+        self.assertNotIn(("job", "go"), self.backend.calls)
+
+    def test_managed_validation_transport_failure_releases_only_after_confirmed_cleanup(self):
+        binding = self.bind("alice", self.root / "alice")
+        original_host = self.backend.host
+        def host(runtime, request):
+            if request["action"] == "cancel":
+                raise TimeoutError("host cancel unavailable")
+            return original_host(runtime, request)
+        with mock.patch.object(self.backend, "inspect", side_effect=TimeoutError("validation transport unavailable")), \
+             mock.patch.object(self.backend, "host", side_effect=host):
+            job = self.pool.managed_start("alice", binding["id"], "managed", {}, "native-a",
+                                          [0], 0, "must-not-execute", {})
+        self.assertEqual(job["state"], "releasing")
+        self.assertEqual(job["lease_state"], "uncertain")
+        self.assertEqual(job["preflight_error"], "validation transport unavailable")
+        self.assertTrue(self.pool.peers())
+        # A restart must retain the rejection; an unknown owned-process
+        # observation cannot authorize releasing the host's grant.
+        restarted = RuntimePool(self.root / "manager", self.backend)
+        unknown = {"state": "uncertain", "quiet": False, "unknown": ["transport unavailable"]}
+        with mock.patch.object(self.backend, "job", return_value=unknown) as observe:
+            held = restarted.managed_control("alice", job["id"])
+        self.assertEqual(held["state"], "stopping")
+        self.assertNotIn(held["lease_state"], {"cancelled", "released", "expired"})
+        self.assertEqual(observe.call_args.args[2], "stop")
+        self.assertTrue(restarted.peers())
+        failed = restarted.managed_control("alice", job["id"])
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["lease_state"], "cancelled")
+        self.assertEqual(failed["error"], "validation transport unavailable")
+        self.assertEqual(restarted.peers(), [])
+        self.assertEqual(self.backend.jobs, {})
+        self.assertNotIn(("job", "prepare"), self.backend.calls)
+        self.assertNotIn(("job", "go"), self.backend.calls)
+
+    def test_rejected_cpu_job_recovers_temporary_port_quarantine_without_activating(self):
+        binding = self.bind("alice", self.root / "alice")
+        original_host = self.backend.host
+        def host(runtime, request):
+            if request["action"] == "cancel":
+                self.backend.listening = [48001]
+            return original_host(runtime, request)
+        with mock.patch.object(self.backend, "inspect", side_effect=ValueError("source differs")), \
+             mock.patch.object(self.backend, "host", side_effect=host):
+            job = self.pool.managed_start("alice", binding["id"], "managed", {}, "native-a",
+                                          [], 0, "must-not-execute", {}, service_port=0)
+        self.assertEqual(job["state"], "releasing")
+        self.assertEqual(job["lease_state"], "orphaned_busy")
+        self.backend.listening = []
+        self.backend.calls.clear()
+        rejected = self.pool.managed_control("alice", job["id"])
+        self.assertEqual(rejected["state"], "failed")
+        self.assertEqual(rejected["lease_state"], "released")
+        self.assertEqual(rejected["error"], "source differs")
+        self.assertEqual(self.backend.jobs, {})
+        self.assertNotIn(("host", "heartbeat"), self.backend.calls)
 
     def test_two_management_roots_share_one_runtime_and_card_authority(self):
         with ThreadPoolExecutor(2) as workers:
@@ -1197,6 +1294,18 @@ class TaskClientTests(unittest.TestCase):
         with self.pool.transaction() as db:
             self.assertEqual(self.pool.rows(db, "job"), [])
             self.assertEqual(self.pool.rows(db, "run"), [])
+
+    def test_business_preflight_changed_view_is_rejected_before_payload(self):
+        def preflight(binding, command, env):
+            self.backend.prepared[binding['endpoint']['cwd']]['build_key'] = 'changed-by-user-preflight'
+        self.backend.preflight = preflight
+        result = self.client.run("must-not-execute", sources={}, preflight="change-view", resources={"npu_count": 0})
+        self.assertEqual(result["state"], "failed")
+        self.assertTrue(result["resources_released"])
+        role = self.store.executions(self.context["session"]["id"])[0]["roles"][0]
+        self.assertIn("runtime changed before launch", role["observation"]["error"])
+        self.assertEqual(role["observation"]["lease_state"], "cancelled")
+        self.assertEqual(self.backend.jobs, {})
 
     def test_daemon_restart_refuses_active_work_and_lease_then_allows_idle(self):
         service = self.client.coordinator
