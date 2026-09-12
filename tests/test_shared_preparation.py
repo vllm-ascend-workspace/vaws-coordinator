@@ -147,10 +147,11 @@ def test_restore_dependency_check_uses_actual_recipient_metadata(monkeypatch, re
     assert bool(result['errors']) is not satisfied
 
 
+@pytest.mark.parametrize('selected', [False, True])
 @pytest.mark.parametrize('change', ['native', 'dependencies', 'image', 'abi', 'cann', 'corrupt'])
-def test_mismatches_do_not_copy_artifacts(bundle, monkeypatch, change):
+def test_mismatches_do_not_copy_artifacts(bundle, monkeypatch, change, selected):
     source, target, shared, request, manifest, relative, versions = bundle
-    cache.store_shared_native(source, shared)
+    candidate = cache.store_shared_native(source, shared)
     image = 'sha256:same-image'
     if change in ('native', 'dependencies'):
         request = copy.deepcopy(request)
@@ -164,12 +165,25 @@ def test_mismatches_do_not_copy_artifacts(bundle, monkeypatch, change):
     else:
         (next((shared / 'bundles').iterdir()) / relative).write_bytes(b'changed output')
     try:
-        result = cache.restore_shared_native(target, shared, request, image, versions)
+        result = cache.restore_shared_native(target, shared, request, image, versions,
+                                             candidate=candidate if selected else None)
     except ValueError:
         pass
     else:
         assert result['status'] == 'miss'
     assert not (target / relative).exists()
+
+
+def test_exported_bundle_restore_ignores_later_shared_index_writes(bundle):
+    source, target, shared, request, manifest, relative, versions = bundle
+    candidate = cache.store_shared_native(source, shared)
+    # A concurrent donor publishes a different index. The current selection
+    # still restores exactly the exported, independently verified bundle.
+    for index in shared.glob('*.json'):
+        index.write_text(json.dumps({'bundle': 'f' * 64, 'native_key': 'different'}))
+    result = cache.restore_shared_native(target, shared, request, 'sha256:same-image', versions, candidate=candidate)
+    assert result['status'] == 'hit' and result['bundle'] == candidate['bundle']
+    assert (target / relative).read_bytes() == (source / relative).read_bytes()
 
 
 def test_cached_outputs_can_be_discarded_before_normal_build(bundle):
@@ -370,12 +384,14 @@ def test_shared_baseline_recognizes_kernel_delta_and_keeps_its_interpreter(bundl
     assert not (target / '.vaws-runtime/ready-profile.json').exists()
 
 
-@pytest.mark.parametrize('failure', [None, 'build', 'imports', 'profile', 'export'])
+@pytest.mark.parametrize('failure', [None, 'build', 'imports', 'profile', 'export', 'later-export',
+                                    'exhausted', 'cancel-export-restore', 'uncertain-export-restore'])
 @pytest.mark.parametrize('dependency_donor', [False, True])
 def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, monkeypatch, failure, dependency_donor):
     import vaws_coordinator.parity as parity
     import vaws_coordinator.parity_support as transport
     from remote_dev.core.ssh_transport import RemoteCompleted
+    from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
     backend = RemoteBackend()
     spec = {'user': 'bob', 'container_name': 'vaws-bob', 'python': '/bob/.venv/bin/python',
             'endpoint': {'host': 'host', 'port': 2202, 'user': 'root', 'root': '/bob'},
@@ -386,36 +402,68 @@ def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, mo
     monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script', lambda *a, **k: RemoteCompleted(0, '', ''))
     monkeypatch.setattr(transport, 'ssh_exec_stream', lambda *a, **k: None)
     monkeypatch.setattr(backend, 'bash', lambda *a: '')
-    installed, operations, process_steps = [], [], []
+    installed, operations, process_steps, exports = [], [], [], []
     def install(**kwargs):
         installed.append(kwargs['step'])
         if failure == 'build' and kwargs['step'] == 'install-vllm-ascend-incremental':
             raise RuntimeError('actual incremental failure')
-    def profile(*args, **kwargs):
+    def capture_profile(*args, **kwargs):
         if failure in {'profile', 'imports'}:
             raise RuntimeError('actual incremental failure')
     def operation(spec, action, versions, **kwargs):
         operations.append(action)
         process_steps.append(kwargs['process'].step)
-        if failure == 'export' and len(operations) == 1:
+        if failure in {'export', 'later-export', 'exhausted', 'cancel-export-restore', 'uncertain-export-restore'} and len(operations) == 1:
             return {'status': 'miss'}
+        if action == 'restore' and exports:
+            if kwargs['process'].step == 'shared-native-restore-after-export':
+                assert kwargs['candidate'] == {'bundle': str(len(exports)), 'native_key': 'selected'}
+            if failure in {'cancel-export-restore', 'uncertain-export-restore'}:
+                raise (PreparationCancelled if failure.startswith('cancel') else PreparationUncertain)('interrupted')
+            if failure == 'exhausted' or (failure == 'later-export' and len(exports) == 1):
+                return {'status': 'miss', 'reason': 'base changes cannot be rebuilt incrementally'}
         return {'status': 'incremental' if action == 'restore' else 'stored', 'dependencies': {'satisfied': True}}
+    def export(spec, **kwargs):
+        assert failure in {'export', 'later-export', 'exhausted', 'cancel-export-restore', 'uncertain-export-restore'}
+        assert kwargs == ({'donors': ['remaining']} if exports else {})
+        exports.append(kwargs)
+        assert len(exports) <= 2
+        return {'status': 'stored', 'bundle': str(len(exports)), 'native_key': 'selected',
+                'remaining_donors': ['remaining'] if len(exports) == 1 and failure != 'export' else []}
     monkeypatch.setattr(parity, 'run_runtime_install_step', install)
-    monkeypatch.setattr(backend, '_write_ready_profile', profile)
+    monkeypatch.setattr(backend, '_write_ready_profile', capture_profile)
     monkeypatch.setattr(backend, '_shared_native', operation)
-    monkeypatch.setattr(backend, '_export_shared_native', lambda spec: {'status': 'stored'} if failure == 'export'
-                        else pytest.fail('cache candidate already available'))
+    monkeypatch.setattr(backend, '_export_shared_native', export)
     def prepare():
         return backend.prepare_task_root(spec, sources={'vllm': '/a', 'vllm-ascend': '/b'}, environment={},
                                          source_snapshot=snapshot, on_preparation_job=lambda record: None,
-                                         reuse={'kind': 'dependencies', 'runtime': {}} if dependency_donor else None)
-    if failure and failure != 'export':
+                                         reuse={'kind': 'dependencies', 'runtime': {
+                                             'endpoint': {'root': '/dependency-donor'},
+                                             'attestation': {'profile': {**dict.fromkeys(profile.PROFILE_FIELDS, '1.0'),
+                                                 'build_env': {}, 'launch_env': {}, 'compatibility_evidence': 'smoke.json',
+                                                 'system_files': {key: {'path': '/' + key, 'sha256': '1' * 64}
+                                                                  for key in ('cann', 'driver')}}},
+                                             'python': '/dependency-donor/.venv/bin/python'}} if dependency_donor else None)
+    if failure in {'cancel-export-restore', 'uncertain-export-restore'}:
+        with pytest.raises(PreparationCancelled if failure.startswith('cancel') else PreparationUncertain):
+            prepare()
+        assert len(exports) == 1 and operations == ['restore', 'restore']
+        assert not installed
+        return
+    if failure == 'exhausted':
+        assert prepare() is None
+        assert len(exports) == 2
+        assert installed.count('install-vllm-ascend') == 1
+        assert 'install-vllm-ascend-incremental' not in installed
+        return
+    if failure in {'build', 'imports', 'profile'}:
         with pytest.raises(RuntimeError, match='actual incremental failure'):
             prepare()
         assert operations == ['restore']
     else:
         assert prepare() is None
-        assert operations == (['restore', 'restore', 'store'] if failure == 'export' else ['restore', 'store'])
+        assert operations == (['restore', 'restore', 'restore', 'store'] if failure == 'later-export' else
+                              ['restore', 'restore', 'store'] if failure == 'export' else ['restore', 'store'])
         if failure == 'export':
             assert process_steps == ['shared-native-restore', 'shared-native-restore-after-export', 'shared-native-store']
     assert 'install-vllm-ascend' not in installed

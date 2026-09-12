@@ -13,7 +13,7 @@ def test_discovery_exports_only_compatible_verified_roots(mismatch):
     calls = []
     request = {'image_digest': 'sha256:same', 'preparation': {'native': {'vllm': 'same'}},
                'export_source': 'publish verified outputs only'}
-    container = {'Name': '/vaws-alice', 'Image': 'sha256:same',
+    container = {'Id': 'container-id', 'Name': '/vaws-alice', 'Image': 'sha256:same',
                  'Mounts': [{'Type': 'bind', 'Source': '/tmp', 'Destination': '/tmp', 'RW': True}]}
     if mismatch == 'image':
         container['Image'] = 'sha256:other'
@@ -30,7 +30,7 @@ def test_discovery_exports_only_compatible_verified_roots(mismatch):
             output = json.dumps([container])
         elif argv[2] != '-i':
             output = json.dumps([] if mismatch == 'no-profile' else [{'root': '/vllm-workspace/executions/alice/host/default',
-                                   'profile': {'launch_env': {'PATH': '/donor/.venv/bin:/usr/bin'}}}])
+                                   'profile': {'launch_env': {'PATH': '/donor/.venv/bin:/usr/bin'}}, 'exact': True}])
         else:
             assert kwargs['input'] == request['export_source']
             assert 'export PATH=/donor/.venv/bin:/usr/bin' in argv[-1]
@@ -42,6 +42,65 @@ def test_discovery_exports_only_compatible_verified_roots(mismatch):
     if mismatch in ('image', 'mount', 'unmanaged'):
         assert len(calls) == 2
     assert all('rm' not in argv and 'stop' not in argv and 'start' not in argv for argv, _ in calls)
+
+
+@pytest.mark.parametrize('failed_exact', [False, True])
+@pytest.mark.parametrize('unavailable', [None, 'timeout', 'invalid-json'])
+def test_global_exact_priority_and_finite_donor_inventory(failed_exact, unavailable):
+    calls, exported = [], []
+    request = {'image_digest': 'sha256:same', 'preparation': {}, 'export_source': 'verify then publish'}
+    containers = [{'Id': name + '-id', 'Name': '/vaws-' + name, 'Image': 'sha256:same',
+                   'Mounts': [{'Type': 'bind', 'Source': '/tmp', 'Destination': '/tmp', 'RW': True}]}
+                  for name in ('base', 'exact', 'other-base', 'unavailable')]
+    def run(argv, **kwargs):
+        calls.append(argv)
+        code, output = 0, ''
+        if argv[1] == 'ps':
+            output = 'base-id exact-id other-base-id'
+        elif argv[1] == 'inspect':
+            output = json.dumps(containers)
+        elif argv[2] != '-i':
+            if argv[2] == 'unavailable-id':
+                if unavailable == 'timeout':
+                    raise subprocess.TimeoutExpired(argv, 30)
+                return SimpleNamespace(stdout='invalid-json' if unavailable else '[]', stderr='', returncode=0)
+            output = json.dumps([{'root': '/vllm-workspace/executions/' + argv[2],
+                                  'profile': {'launch_env': {}}, 'exact': argv[2] == 'exact-id'}])
+        else:
+            exported.append(argv[3])
+            code = int(failed_exact and argv[3] == 'exact-id')
+            output = json.dumps({'status': 'stored', 'bundle': argv[3], 'native_key': argv[3]})
+        return SimpleNamespace(stdout=output, stderr='export failed' if code else '', returncode=code)
+    result = export_verified_donor(request, run)
+    assert exported == (['exact-id', 'base-id'] if failed_exact else ['exact-id'])
+    # A completed receiver miss can consume later candidates without another
+    # Docker scan. Changing/reusing a container name cannot redirect its ID.
+    inventory_calls = len(calls)
+    remaining = result['remaining_donors']
+    containers.clear()
+    while remaining:
+        result = export_verified_donor({**request, 'donors': remaining}, run)
+        assert result['status'] == 'stored'
+        assert len(result['remaining_donors']) < len(remaining)
+        remaining = result['remaining_donors']
+    assert exported == ['exact-id', 'base-id', 'other-base-id']
+    assert all(argv[:3] == ['docker', 'exec', '-i'] for argv in calls[inventory_calls:])
+    before_empty = len(calls)
+    assert export_verified_donor({**request, 'donors': []}, run)['status'] == 'miss'
+    assert len(calls) == before_empty
+
+
+@pytest.mark.parametrize('failure', ['cancelled', 'uncertain', 'remote-unknown'])
+def test_export_interruption_is_not_an_ordinary_cache_miss(monkeypatch, failure):
+    from vaws_coordinator.backend import RemoteBackend
+    from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
+    backend = RemoteBackend()
+    spec = {'container_name': 'vaws-recipient', 'host_endpoint': {'host': 'host', 'port': 22, 'user': 'root'}}
+    monkeypatch.setattr(backend, 'bash', lambda *args: '"sha256:same"')
+    result = {'status': 'failed', 'remote_outcome': 'unknown'} if failure == 'remote-unknown' else {'status': failure}
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_remote_python', lambda *args, **kwargs: result)
+    with pytest.raises(PreparationCancelled if failure == 'cancelled' else PreparationUncertain):
+        backend._export_shared_native(spec)
 
 
 @pytest.mark.parametrize('mismatch', [None, 'soc', 'build_env', 'native', 'unqualified'])

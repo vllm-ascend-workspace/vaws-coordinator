@@ -539,13 +539,21 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             # The recipient venv already sees the image packages. Restore and
             # check their real dependency metadata before any pip/copy work.
             cache = self._shared_native(spec, 'restore', versions, process=owned_process('shared-native-restore'))
-            if cache.get('status') == 'miss':
-                exported = self._export_shared_native(spec)
-                progress('shared-native-export', exported)
+            remaining_donors = None
+            while cache.get('status') == 'miss':
+                exported = self._export_shared_native(spec, **({'donors': remaining_donors}
+                                                              if remaining_donors is not None else {}))
+                remaining_donors = exported.get('remaining_donors', [])
+                progress('shared-native-export', {key: value for key, value in exported.items()
+                                                   if key != 'remaining_donors'})
                 check_cancel()
-                if exported.get('status') == 'stored':
-                    cache = self._shared_native(spec, 'restore', versions,
-                        process=owned_process('shared-native-restore-after-export'))
+                if exported.get('status') != 'stored':
+                    break
+                cache = self._shared_native(spec, 'restore', versions,
+                    candidate={key: exported[key] for key in ('bundle', 'native_key')},
+                    process=owned_process('shared-native-restore-after-export'))
+                if not remaining_donors:
+                    break
             if accept_cache(cache):
                 # Profile capture below performs this execution's real import
                 # once. No editable install or repeated native smoke is needed.
@@ -583,7 +591,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             progress('shared-native-cache', self._shared_native(spec, 'store', versions, process=owned_process('shared-native-store')))
         # Registration performs the full container/profile/source attestation.
 
-    def _shared_native(self, spec, action, versions, *, process=None):
+    def _shared_native(self, spec, action, versions, *, process=None, candidate=None):
         """One bounded automatic cache lookup/copy; no other user's runtime."""
         from vaws_coordinator.parity import DEFAULT_ENV_PREAMBLE, task_python_exports
         from vaws_coordinator.preparation_cache import REMOTE_SHARED_SUFFIX
@@ -592,6 +600,8 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
             root, python = spec['endpoint']['root'], spec['python']
             request = {'root': root, 'action': action, 'preparation': spec.get('preparation', {}),
                        'versions': versions, 'machine_type': spec.get('machine_type')}
+            if candidate is not None:
+                request['candidate'] = candidate
             if action == 'restore':
                 host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
                 name = shlex.quote(spec['container_name'])
@@ -620,10 +630,10 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         except Exception as exc:
             return {'status': 'miss', 'reason': str(exc)[:500]}
 
-    def _export_shared_native(self, spec):
+    def _export_shared_native(self, spec, *, donors=None):
         """An existing verified donor is exported only when the cache missed."""
         from remote_dev.core.ssh_transport import run_remote_python
-        from vaws_coordinator.preparation_process import PreparationCancelled
+        from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
         host = {**spec['host_endpoint'], 'root': '/', 'cwd': '/'}
         name = shlex.quote(spec['container_name'])
         image = self.bash(host, f"docker inspect --format '{{{{json .Image}}}}' {name}").strip().strip('"')
@@ -635,11 +645,15 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         source += "\nimport signal\nsignal.alarm(45)\nargs=json.loads(sys.argv[1])\nprint(json.dumps(store_shared_native(Path(args['root']),Path(SHARED_NATIVE_CACHE))))\n"
         module = _package_file('shared_native_discovery.py').read_text(encoding='utf-8')
         script = module + '\nimport sys\nprint(json.dumps(export_verified_donor(json.load(sys.stdin))))\n'
-        reply = run_remote_python(resolve_endpoint(host), script,
-                                  {'preparation': spec.get('preparation', {}), 'image_digest': image,
-                                   'machine_type': spec.get('machine_type'), 'export_source': source}, timeout_ms=120000)
+        request = {'preparation': spec.get('preparation', {}), 'image_digest': image,
+                   'machine_type': spec.get('machine_type'), 'export_source': source}
+        if donors is not None:
+            request['donors'] = donors
+        reply = run_remote_python(resolve_endpoint(host), script, request, timeout_ms=120000)
         if reply.get('status') == 'cancelled':
             raise PreparationCancelled('shared native export cancelled')
+        if reply.get('status') == 'uncertain' or reply.get('remote_outcome') == 'unknown':
+            raise PreparationUncertain('shared native export outcome is uncertain')
         return reply
 
     def _prepare_native_view(self, spec, previous, versions, *, process=None, log_path=None):

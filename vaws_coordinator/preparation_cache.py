@@ -172,7 +172,7 @@ def store_shared_native(root: Path, cache: Path) -> dict:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    return {'status': 'stored', 'native_key': preparation['native_key']}
+    return {'status': 'stored', 'native_key': preparation['native_key'], 'bundle': bundle.name}
 
 
 def discard_shared_native(root: Path) -> None:
@@ -261,15 +261,20 @@ def revalidate_shared_native(root: Path, cache: Path) -> dict:
 
 
 def restore_shared_native(root: Path, cache: Path, preparation: dict, image_digest: str, versions: dict,
-                          machine_type: str | None = None) -> dict:
+                          machine_type: str | None = None, candidate: dict | None = None) -> dict:
     """Copy an ABI-compatible cached bundle into this execution's own sources."""
     key = shared_input_key(preparation, image_digest)
-    index = cache / (key + '.json')
-    if not index.is_file():
-        index = cache / ('base-' + shared_base_key(preparation, image_digest) + '.json')
+    if candidate is None:
+        index = cache / (key + '.json')
         if not index.is_file():
-            return {'status': 'miss', 'reason': 'no matching compiled outputs'}
-    pointer = json.loads(index.read_text())
+            index = cache / ('base-' + shared_base_key(preparation, image_digest) + '.json')
+            if not index.is_file():
+                return {'status': 'miss', 'reason': 'no matching compiled outputs'}
+        pointer = json.loads(index.read_text())
+    else:
+        # An export selects immutable content, never whichever donor happened
+        # to overwrite the shared exact/base index before this restore.
+        pointer = candidate
     if not re.fullmatch('[0-9a-f]{64}', pointer.get('bundle', '')):
         raise ValueError('invalid shared native cache pointer')
     bundle = cache / 'bundles' / pointer['bundle']
@@ -353,7 +358,8 @@ try:
     elif args['action'] == 'revalidate':
         result = revalidate_shared_native(root, cache)
     else:
-        result = restore_shared_native(root, cache, args['preparation'], args['image_digest'], args['versions'], args.get('machine_type'))
+        result = restore_shared_native(root, cache, args['preparation'], args['image_digest'], args['versions'],
+                                       args.get('machine_type'), args.get('candidate'))
 except Exception as exc:
     result = {'status': 'miss', 'reason': str(exc)}
 print(json.dumps(result))
