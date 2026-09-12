@@ -358,6 +358,41 @@ def verify_native_compatibility(root: Path, manifest: dict[str, Any], smoke: dic
         raise ValueError('execution source or SCM metadata mapping changed')
 
 
+def verify_environment(root: Path, manifest: dict[str, Any]) -> None:
+    """Check mutable environment facts without re-reading native outputs."""
+    if str(root.resolve()) != manifest['runtime_root']:
+        raise ValueError('runtime relocation needs separate validation')
+    profile = manifest['profile']
+    if sysconfig.get_config_var('SOABI') != profile['python_abi']:
+        raise ValueError('Python ABI changed')
+    for key, package in PACKAGES.items():
+        if importlib.metadata.version(package) != profile[key]:
+            raise ValueError(f'installed package changed: {package}')
+    for package, version in profile.get('packages', {}).items():
+        if importlib.metadata.version(package) != version:
+            raise ValueError(f'profile dependency changed: {package}')
+    for row in profile['system_files'].values():
+        if file_digest(Path(row['path'])) != row['sha256']:
+            raise ValueError('CANN/driver/runtime support file changed')
+
+
+def verify_execution_view(root: Path, manifest: dict[str, Any]) -> None:
+    """Check an owned view at launch, reusing its completed native publication.
+
+    Native bytes were checked as they were copied into this private view. They
+    are not mutable inputs of a managed execution. Explicit adoption/repair and
+    native builds still use ``verify`` to validate the complete bundle.
+    """
+    verify_environment(root, manifest)
+    row = manifest['evidence']['smoke']
+    data = checked_file(root, row['path']).read_bytes()
+    if hashlib.sha256(data).hexdigest() != row['sha256']:
+        raise ValueError('execution view evidence changed')
+    smoke = json.loads(data)
+    if native_source_mapping(root) != smoke.get('source_mapping'):
+        raise ValueError('execution source or SCM metadata mapping changed')
+
+
 def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = True) -> None:
     if manifest.get('schema_version') == 2 and manifest.get('profile', {}).get('kind') == 'command':
         if profile_key(manifest['profile']) != manifest['profile_key']:
@@ -395,20 +430,7 @@ def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = Tr
     if smoke.get('build_inputs') not in (None, manifest['build_inputs']):
         raise ValueError('import-smoke evidence belongs to different build inputs')
     if check_environment:
-        if str(root.resolve()) != manifest["runtime_root"]:
-            raise ValueError("runtime relocation needs separate validation")
-        profile = manifest["profile"]
-        if sysconfig.get_config_var("SOABI") != profile["python_abi"]:
-            raise ValueError("Python ABI changed")
-        for key, package in PACKAGES.items():
-            if importlib.metadata.version(package) != profile[key]:
-                raise ValueError(f"installed package changed: {package}")
-        for package, version in profile.get("packages", {}).items():
-            if importlib.metadata.version(package) != version:
-                raise ValueError(f"profile dependency changed: {package}")
-        for row in profile["system_files"].values():
-            if file_digest(Path(row["path"])) != row["sha256"]:
-                raise ValueError("CANN/driver/runtime support file changed")
+        verify_environment(root, manifest)
 
 
 def publish(root: Path, cache: Path, manifest: dict[str, Any]) -> Path:

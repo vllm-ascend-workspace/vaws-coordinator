@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from remote_dev.core.endpoint import resolve_endpoint
@@ -18,7 +19,13 @@ from remote_dev.core.shell_ops import remote_bash
 
 from vaws_coordinator.host_queue import HostQueue
 from vaws_coordinator.machine_directory import MachineDirectory
-from vaws_coordinator.runtime_profile import digest, launch_preamble
+from vaws_coordinator.runtime_profile import digest, launch_preamble, native_compatibility_key
+
+
+@dataclass(frozen=True)
+class PreparedNativeView:
+    """Internal completed-publication handoff, never a registration argument."""
+    attestation: dict
 
 
 def _package_file(relative: str) -> Path:
@@ -158,11 +165,12 @@ print(json.dumps({'pid':matches[0]}))
                 "launch_preamble": launch_preamble(manifest["profile"], python=runtime.get("python"))}
 
     def verify_preflight(self, runtime, *, snapshots=None):
-        """Verify the complete registered view with a compact remote reply.
+        """Check the registered launch view with a compact remote reply.
 
-        All remote checks are shared with inspect. Only its output differs:
-        a digest confirms equality of the entire manifest, while the live
-        container and the derived launch preamble are compared separately.
+        Owned native publications reuse their completed output proof and check
+        mutable environment/source facts. Other roots retain full inspection.
+        A digest confirms the complete manifest; the live container and derived
+        launch preamble are compared separately.
         """
         expected = runtime["attestation"]
         if runtime.get('reuse_only'):
@@ -180,16 +188,17 @@ print(json.dumps({'pid':matches[0]}))
             raise ValueError("runtime launch environment changed before launch")
         expected_digest = digest(manifest)
         reply = self._inspect_manifest(runtime, snapshots=snapshots,
-                                       expected_digest=expected_digest)
+                                       expected_digest=expected_digest,
+                                       prepared_view=runtime.get('prepared_native_view', False))
         if reply != {"manifest_digest": expected_digest}:
             raise ValueError("runtime verification returned no matching manifest digest")
         return True
 
-    def _inspect_manifest(self, runtime, *, snapshots=None, expected_digest=None):
+    def _inspect_manifest(self, runtime, *, snapshots=None, expected_digest=None, prepared_view=False):
         python = runtime.get("python") or "python3"
         module = _package_file("runtime_profile.py").read_text()
         request = json.dumps({"root": runtime["endpoint"].get("cwd") or runtime["endpoint"]["root"],
-                              "snapshots": snapshots or {},
+                              "snapshots": snapshots or {}, "prepared_view": prepared_view,
                               **({"expected_manifest_digest": expected_digest} if expected_digest is not None else {})})
         build_source = _package_file("build_inputs.py").read_text()
         runner = "\n_build_namespace = {}\nexec(" + repr(build_source) + ", _build_namespace)\n" + '''
@@ -198,8 +207,13 @@ import sys
 args = json.loads(sys.argv[1])
 root = Path(args["root"])
 manifest = json.loads((root / ".vaws-runtime/ready-profile.json").read_text())
-verify(root, manifest)
-if manifest['profile'].get('kind') != 'command' and _build_namespace["runtime_build_inputs"](root, manifest["profile"], manifest["profile_key"]) != manifest["build_inputs"]:
+if args.get('prepared_view') and 'expected_manifest_digest' in args and digest(manifest) != args['expected_manifest_digest']:
+    raise ValueError('runtime changed before launch')
+if args.get('prepared_view'):
+    verify_execution_view(root, manifest)
+else:
+    verify(root, manifest)
+if not args.get('prepared_view') and manifest['profile'].get('kind') != 'command' and _build_namespace["runtime_build_inputs"](root, manifest["profile"], manifest["profile_key"]) != manifest["build_inputs"]:
     raise ValueError("cache miss: installed native artifacts do not match current source inputs")
 for name, expected in args["snapshots"].items():
     repo = root / name
@@ -292,7 +306,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
     def prepare_task_root(self, spec, *, sources, environment, donor_python=None, workspace_root=None,
                           source_snapshot=None, reuse=None,
                           on_progress=None, log_dir=None, on_preparation_job=None, cancel_requested=None):
-        """First-install isolated sources + task venv + editables + verified profile.
+        """Materialize fixed sources and prepare or reuse their native environment.
 
         Does not mutate ``donor_python`` site-packages. Image packages may be
         reused via ``venv --system-site-packages``.
@@ -371,6 +385,20 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         if native_recipe:
             if any(not row['version'] for row in versions.values()):
                 raise ValueError('native preparation requires captured source SCM versions')
+            if reuse and reuse['kind'] == 'native':
+                previous = reuse['runtime']
+                try:
+                    native_compatibility_key(previous['attestation'])
+                except (KeyError, ValueError):
+                    # An old environment without complete compatibility facts
+                    # still needs one ordinary preparation/attestation pass.
+                    pass
+                else:
+                    log = progress('publish-native-view')
+                    prepared = self._prepare_native_view(spec, previous, versions,
+                        process=owned_process('publish-native-view'), log_path=log)
+                    check_cancel()
+                    return PreparedNativeView(prepared)
             preparation_data = {'versions': versions, 'build_env': source_snapshot.get('build_env', {})}
             write = 'mkdir -p ' + shlex.quote(root + '/.vaws-runtime') + '\nprintf %s ' + shlex.quote(json.dumps(preparation_data)) + ' > ' + shlex.quote(root + '/.vaws-runtime/build-source.json')
             self.bash(endpoint, write)
@@ -411,6 +439,39 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         # The caller immediately registers this root, which performs the full
         # container/profile/source attestation. No caller consumes a second
         # copy of that probe here.
+
+    def _prepare_native_view(self, spec, previous, versions, *, process=None, log_path=None):
+        from vaws_coordinator.preparation_cache import REMOTE_NATIVE_VIEW_SUFFIX
+        from vaws_coordinator.parity_support import SshEndpoint, ssh_exec_stream
+
+        donor = {key: value for key, value in previous['attestation'].items()
+                 if key not in {'container_id', 'launch_preamble'}}
+        snapshot = spec['source_snapshot']
+        request = {'root': spec['endpoint']['root'], 'source_root': previous['endpoint']['root'],
+                   'versions': versions, 'source_id': snapshot['id'],
+                   'build_env': snapshot.get('build_env', {}), 'preparation': spec['preparation'],
+                   'build_inputs': {row['relpath']: row['build_inputs'] for row in snapshot['records']
+                                    if row['relpath'] in ('vllm', 'vllm-ascend')},
+                   'donor_manifest_digest': digest(donor)}
+        module = _package_file('runtime_profile.py').read_text()
+        build_source = _package_file('build_inputs.py').read_text()
+        cache_source = _package_file('preparation_cache.py').read_text()
+        script = (launch_preamble(donor['profile'], python=previous['python']) + '\n'
+                  + shlex.quote(previous['python']) + ' - ' + shlex.quote(json.dumps(request))
+                  + " <<'VAWS_NATIVE_VIEW'\n" + module + '\nexec(' + repr(build_source)
+                  + ', globals())\nexec(' + repr(cache_source) + ', globals())\n'
+                  + REMOTE_NATIVE_VIEW_SUFFIX + '\nVAWS_NATIVE_VIEW\n')
+        endpoint = spec['endpoint']
+        completed = ssh_exec_stream(SshEndpoint(endpoint['host'], int(endpoint['port']), endpoint['user']),
+                                   script, stream_progress=False, process=process, log_path=log_path)
+        reply = json.loads(completed.stdout)
+        manifest = {**reply['manifest'], 'files': donor['files']}
+        if (reply.get('manifest_digest') != digest(manifest)
+                or manifest.get('execution_view', {}).get('source_id') != snapshot['id']
+                or manifest.get('runtime_root') != endpoint['root']):
+            raise ValueError('native publication did not return the fixed execution view')
+        return {**manifest, 'container_id': previous['attestation']['container_id'],
+                'launch_preamble': launch_preamble(manifest['profile'], python=spec['python'])}
 
     def _write_ready_profile(self, spec, environment, *, native_recipe=True, source_versions=None,
                              process=None, log_path=None):

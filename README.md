@@ -185,6 +185,17 @@ claim that the new Python source passed. The business execution reports its own
 result. Incomplete old evidence or cwd-dependent loader paths retain the full
 import check.
 
+For a compatible native environment, source materialization is followed by one
+native-view publication: outputs are copied and checked against the existing
+hashes, source/SCM mappings are updated, and the original import proof is carried
+forward. Its completed receipt goes directly into an atomic managed binding.
+There is no second profile capture, full registration probe, or SSH reservation.
+Before launch, coordinator checks the container, environment version facts,
+current source mappings and fixed Git inputs; it does not rehash all native
+outputs in its private execution view. Initial builds, changed native or
+dependency inputs, and explicit adoption/repair retain complete verification.
+A lost, failed or cancelled publication never publishes a successful binding.
+
 For serving, `service_port=0` asks the host coordinator to select a free port.
 If a task runtime has no declared service ports, automatic selection uses the
 host's default serving range (30000–45999). A nonempty declaration restricts

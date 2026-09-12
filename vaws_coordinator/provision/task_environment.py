@@ -251,7 +251,7 @@ def prepare_task_environment(
                     spec['python'] = candidate['python']
                     break
     backend = pool.backend
-    backend.prepare_task_root(
+    prepared = backend.prepare_task_root(
         spec, sources=sources, environment=environment, donor_python=donor_python,
         source_snapshot=source_snapshot, reuse=reuse,
         workspace_root=str(Path(next(iter(sources.values()))).resolve().parent) if sources else None,
@@ -259,6 +259,9 @@ def prepare_task_environment(
         on_preparation_job=on_preparation_job, cancel_requested=cancel_requested,
     )
     if checkout_session:
+        from vaws_coordinator.backend import PreparedNativeView
+        if isinstance(prepared, PreparedNativeView):
+            return pool._bind_prepared(runtime_id, spec, user, checkout_session, checkout_request, prepared.attestation)
         return pool._register_checkout(runtime_id, spec, user, checkout_session, checkout_request)
     return pool.register(runtime_id, spec)
 
