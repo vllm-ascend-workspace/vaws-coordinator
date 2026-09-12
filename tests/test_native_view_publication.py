@@ -250,6 +250,7 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
     monkeypatch.setattr(backend, '_prepare_native_view', lambda *a, **k: seen.append('publish') or published)
     monkeypatch.setattr(backend, 'bash', lambda *a, **k: pytest.fail('hot preparation has no extra shell probe'))
     monkeypatch.setattr(backend, '_write_ready_profile', lambda *a, **k: pytest.fail('hot preparation must not recapture'))
+    monkeypatch.setattr(backend, '_shared_native', lambda *a, **k: pytest.fail('hot donor needs no shared cache lookup'))
     progress = []
     result = backend.prepare_task_root(spec, sources={'vllm': '/local/vllm', 'vllm-ascend': '/local/ascend'},
         environment={}, source_snapshot=snapshot, reuse={'kind': 'native', 'runtime': {'attestation': {}}},

@@ -1,7 +1,7 @@
 """Task-facing operations exposed identically to every MCP host.
 
-These four names (`vaws.session`, `vaws.run`, `vaws.execution`, `vaws.finish`)
-are coordinator semantics. Clients pass command and experiment needs; this
+Task lifecycle and optional coordination messages are coordinator semantics.
+Clients pass command and experiment needs; this
 package owns placement, environment, and recovery.
 """
 
@@ -18,10 +18,11 @@ from vaws_coordinator.state_paths import coordinator_state_dir
 LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws-remote-dev")]
 
 TOOL_DESCRIPTIONS = {
-    "vaws.session": "Inspect this native session's VAWS task or replace source defaults for future submissions. Local only: no machine is required. Active executions retain their submitted inputs.",
+    "vaws.session": "Inspect this native session's VAWS task or replace source defaults for future submissions. No machine is required. Tasks with known managed hosts also receive cached coordination messages without waiting for remote polling. Active executions retain their submitted inputs.",
     "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Omitted sources uses explicit task defaults or this native attachment's automatic cwd binding; sources={} runs without source dependencies. Devices default to zero. Explicit resources.allow_external_busy=true shares one named physical device with external processes while retaining managed lease and process ownership. The coordinator places, prepares, launches and supervises the execution.",
     "vaws.execution": "Use action=status (default), tail, stop or target with an execution_id or task-scoped service name belonging to this VAWS task. Status reads current progress; stop releases that execution's devices and ports. The container and execution root remain.",
     "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
+    "vaws.message": "Send coordination text to a reference returned by run/status (coordination_peers[].reference), or reply using notifications[].reply_reference. Sender, host and thread are filled internally. Messages never execute commands or transfer resource ownership; normal run/status calls receive replies automatically.",
 }
 
 
@@ -69,6 +70,8 @@ TOOL_SCHEMAS = {
     }, ("command",)),
     "vaws.execution": task_schema({"execution_id": {"type": "string"}, "service": {"type": "string", "description": "Task-scoped service name, mutually exclusive with execution_id"}, "action": {"type": "string", "enum": ["status", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name for per-role target or tail"}}),
     "vaws.finish": task_schema({"force": {"type": "boolean"}}),
+    "vaws.message": task_schema({"recipient": {"type": "object", "description": "Use an existing coordination reference or reply_reference unchanged."},
+                                   "text": {"type": "string", "minLength": 1, "maxLength": 4000}}, ("recipient", "text")),
 }
 TOOL_SCHEMAS["vaws.execution"]["oneOf"] = [
     {"required": ["execution_id"], "not": {"required": ["service"]}},
@@ -106,6 +109,9 @@ def vaws_call(name, args, *, allow_native_context=True):
             status = value["state"]
         elif name == "vaws.finish":
             value = client.finish(args.get("force", False))
+            status = value["state"]
+        elif name == "vaws.message":
+            value = client.message(args.get("recipient"), args.get("text"))
             status = value["state"]
         else:
             raise ValueError("unknown VAWS operation")

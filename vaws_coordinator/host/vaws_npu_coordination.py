@@ -620,6 +620,23 @@ class NpuCoordinator:
                     task_id TEXT,
                     data TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS message_peers (
+                    user TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    seen_at REAL NOT NULL,
+                    PRIMARY KEY(user, session_id)
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    sender TEXT NOT NULL,
+                    sender_session TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    recipient_session TEXT NOT NULL,
+                    data TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_messages_recipient
+                    ON messages(recipient, recipient_session, cursor);
                 """
             )
             task_columns = {
@@ -765,6 +782,91 @@ class NpuCoordinator:
     def _check_token(self, row: sqlite3.Row, token: int) -> None:
         if row["fence_token"] is None or int(row["fence_token"]) != int(token):
             raise CoordinationError(f"stale or invalid fencing token for task {row['task_id']}")
+
+    @staticmethod
+    def _message_actor(request: dict[str, Any]) -> tuple[str, str]:
+        user = request.get("user")
+        if not isinstance(user, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", user):
+            raise CoordinationError("invalid message user")
+        return user, require_safe_id(request.get("session_id"), label="message session")
+
+    def message(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Store plain coordination text. This never changes a task or lease.
+
+        Identity is supplied by the cooperating client, as with the host queue;
+        shared root access is not an adversarial authentication boundary.
+        """
+        user, session_id = self._message_actor(request)
+        text = request.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+            raise CoordinationError("message must contain 1..4000 characters")
+        message_id = require_safe_id(request.get("message_id"), label="message id")
+        with self._transaction() as db:
+            previous = db.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+            if previous is not None:
+                value = json.loads(previous["data"])
+                expected = (user, session_id, text, request.get("reply_to"),
+                            request.get("recipient"), request.get("recipient_session"))
+                original = (value["sender"], value["sender_session"], value["text"], value.get("reply_to"),
+                            value.get("requested_recipient"), value.get("requested_session"))
+                if expected != original:
+                    raise CoordinationError("message id was already used for different content")
+                return {"status": "sent", "message": {"cursor": previous["cursor"], **value}}
+            reply_to = request.get("reply_to")
+            if reply_to:
+                original = db.execute("SELECT * FROM messages WHERE message_id=?", (reply_to,)).fetchone()
+                if original is None or (original["recipient"], original["recipient_session"]) != (user, session_id):
+                    raise CoordinationError("reply does not belong to this task")
+                recipient, recipient_session = original["sender"], original["sender_session"]
+                thread_id = json.loads(original["data"])["thread_id"]
+            else:
+                recipient, recipient_session = self._message_actor({
+                    "user": request.get("recipient"), "session_id": request.get("recipient_session")})
+                if db.execute("SELECT 1 FROM message_peers WHERE user=? AND session_id=?",
+                              (recipient, recipient_session)).fetchone() is None:
+                    raise CoordinationError("recipient has not used this host; use a current coordination reference")
+                thread_id = message_id
+            value = {"message_id": message_id, "thread_id": thread_id,
+                     "kind": "coordination-reply" if reply_to else "coordination-message",
+                     "sender": user, "sender_session": session_id,
+                     "recipient": recipient, "recipient_session": recipient_session,
+                     "requested_recipient": request.get("recipient"),
+                     "requested_session": request.get("recipient_session"),
+                     "reply_to": reply_to, "text": text, "at": utc_now_iso(self.clock())}
+            cursor = db.execute("INSERT INTO messages(message_id,sender,sender_session,recipient,recipient_session,data) "
+                                "VALUES(?,?,?,?,?,?)", (message_id, user, session_id, recipient,
+                                                       recipient_session, json.dumps(value))).lastrowid
+            return {"status": "sent", "message": {"cursor": cursor, **value}}
+
+    def message_events(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Register this task's return address and read its persistent inbox.
+
+        Cursor belongs to this mailbox epoch. Peer timestamps are observations,
+        never evidence that a process ended or that devices can be reclaimed.
+        """
+        user, session_id = self._message_actor(request)
+        after = request.get("after", 0)
+        limit = request.get("limit", 2)
+        if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 20:
+            raise CoordinationError("invalid message cursor or limit")
+        with self._transaction() as db:
+            epoch = db.execute("SELECT value FROM meta WHERE key='coordination_epoch'").fetchone()[0]
+            if request.get("mailbox_epoch") != epoch:
+                after = 0
+            db.execute("INSERT INTO message_peers(user,session_id,seen_at) VALUES(?,?,?) "
+                       "ON CONFLICT(user,session_id) DO UPDATE SET seen_at=excluded.seen_at",
+                       (user, session_id, self.clock()))
+            rows = db.execute("SELECT cursor,data FROM messages WHERE recipient=? AND recipient_session=? "
+                              "AND cursor>? ORDER BY cursor LIMIT ?", (user, session_id, after, limit)).fetchall()
+            peers = []
+            if request.get("include_peers"):
+                peers = [dict(row) for row in db.execute(
+                    "SELECT user,session_id,seen_at FROM message_peers WHERE NOT (user=? AND session_id=?) "
+                    "ORDER BY seen_at DESC LIMIT 5", (user, session_id))]
+            return {"status": "ok", "mailbox_epoch": epoch,
+                    "cursor": rows[-1]["cursor"] if rows else after,
+                    "events": [{"cursor": row["cursor"], **json.loads(row["data"])} for row in rows],
+                    "peers": peers}
 
     def submit(self, request: dict[str, Any]) -> dict[str, Any]:
         now = self.clock()
@@ -1864,6 +1966,12 @@ def handle_request(
         clock=clock,
         expected_epoch=request.get("coordination_epoch"),
     )
+    if action in {"message", "reply"}:
+        if action == "reply" and not request.get("reply_to"):
+            raise CoordinationError("reply_to is required")
+        return coordinator.message(request)
+    if action == "message-events":
+        return coordinator.message_events(request)
     if action == "submit":
         return coordinator.submit(request)
     if action == "submit-acquire":

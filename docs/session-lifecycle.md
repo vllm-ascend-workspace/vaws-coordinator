@@ -63,7 +63,8 @@ maintenance and explicit deletion are separate from task completion.
 
 ## Operations
 
-**Set defaults.** Native identity is associated lazily. Hook-discovered source
+**Set defaults.** Native session hooks automatically associate the local task;
+Agents do not call a session-creation tool. Hook-discovered source
 defaults belong to that native attachment, using its actual cwd. Resume or
 handoff refreshes that attachment's cwd and automatic sources while preserving
 the native task identity. Sibling attachments do not overwrite one another.
@@ -77,6 +78,12 @@ must be able to read the paths and Git metadata; a native client's independent
 repository copy is not automatically associated as a linked worktree. These
 hooks observe the client-selected workspace. They do not create a worktree or
 change the parent client's cwd before its first tool call.
+
+Supported pre-tool hooks inject the attachment context into VAWS MCP calls,
+including `vaws_message`. Cursor's `sessionStart` runs asynchronously, so its
+first VAWS `preToolUse` can attach the same stable conversation ID idempotently
+before supplying `updated_input`. Other tool calls do not trigger this fallback.
+See the [Cursor hook contract](https://cursor.com/docs/hooks#pretooluse).
 
 `source_defaults` reports the effective map and its provenance. Saved task
 maps from older versions without provenance are reported as unknown; the

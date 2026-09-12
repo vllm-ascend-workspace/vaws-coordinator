@@ -4,12 +4,13 @@ import pytest
 
 from vaws_coordinator.agent_session import AgentSessions, load_context
 from vaws_coordinator.task_client import TaskClient
+from test_execution_inputs import repo
 
 
 @pytest.fixture
 def native_env(tmp_path, monkeypatch):
     for name in ("VAWS_CONTEXT_FILE", "VAWS_PARENT_CONTEXT", "VAWS_ATTACH_CONTEXT",
-                 "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+                 "CODEX_THREAD_ID", "CODEX_SESSION_ID", "GROK_SESSION_ID", "KIMI_SESSION_ID", "KIMI_AGENT_ID", "CURSOR_CONVERSATION_ID"):
         monkeypatch.delenv(name, raising=False)
     state = tmp_path / "sessions"
     monkeypatch.setenv("VAWS_AGENT_SESSIONS_DIR", str(state))
@@ -56,6 +57,139 @@ def test_mcp_does_not_adopt_the_server_process_native_identity(native_env):
     assert not native_env.exists()
 
 
+@pytest.mark.parametrize("client,key", [("grok", "GROK_SESSION_ID"), ("kimi", "KIMI_SESSION_ID")])
+def test_native_shell_uses_existing_attachment_after_cd(native_env, monkeypatch, tmp_path, client, key):
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv(key, "actual-native")
+    store = AgentSessions(native_env)
+    expected = store.attach(client, "actual-native", str(tmp_path / "original"))
+    monkeypatch.chdir(tmp_path)
+    assert load_context()["context_file"] == expected["context_file"]
+    assert load_context()["attachment"]["cwd"] == str(tmp_path / "original")
+    monkeypatch.setenv(key, "unknown-native")
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        load_context()
+    assert len(store.sessions()) == 1
+
+
+def test_kimi_native_child_does_not_fall_back_to_parent(native_env, monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv("KIMI_SESSION_ID", "native-kimi")
+    monkeypatch.setenv("KIMI_AGENT_ID", "child")
+    store = AgentSessions(native_env)
+    parent = store.attach("kimi", "native-kimi", str(tmp_path))
+    monkeypatch.setenv("KIMI_AGENT_ID", "main")
+    assert load_context()["context_file"] == parent["context_file"]
+    monkeypatch.setenv("KIMI_AGENT_ID", "child")
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        load_context()
+    child = store.attach("kimi", "native-kimi", str(tmp_path), parent_context=parent["context_file"], agent_id="child")
+    assert load_context()["context_file"] == child["context_file"]
+
+
+def test_kimi_mcp_call_metadata_is_per_call_and_visible_as_text(native_env, monkeypatch, tmp_path):
+    import json
+    from vaws_coordinator.task_server import call_tool
+    store = AgentSessions(native_env)
+    first = store.attach("kimi", "first", str(tmp_path))
+    second = store.attach("kimi", "second", str(tmp_path))
+    for native, expected in (("first", first), ("second", second), ("first", first)):
+        reply = call_tool("vaws_session", {"full": True}, {"kimi_code/session_id": native, "kimi_code/agent_id": "main"})
+        assert not reply["isError"]
+        assert reply["structuredContent"]["data"]["session"]["id"] == expected["session"]["id"]
+        assert json.loads(reply["content"][0]["text"]) == reply["structuredContent"]
+    with pytest.raises(ValueError, match="differs from this native Kimi caller"):
+        call_tool("vaws_session", {"context_file": first["context_file"]}, {"kimi_code/session_id": "second"})
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        call_tool("vaws_session", {}, {"kimi_code/session_id": "first", "kimi_code/agent_id": "unknown-child"})
+
+
+def codex_call_metadata(native):
+    # Native Desktop capture: x-codex-turn-metadata is an object, not JSON text.
+    # Identity and unrelated values are synthetic; no user paths are retained.
+    return {"callId": "call-fixture", "threadId": native, "itemId": "item-fixture", "progressToken": 1,
+            "x-codex-turn-metadata": {
+                "session_id": native, "thread_id": native, "workspace_kind": "local", "turn_id": "turn-fixture",
+                "turn_started_at_unix_ms": 1, "thread_source": "user", "turn_trigger": "user",
+                "sandbox": "workspace-write", "sandbox_mode": "workspace-write", "auto_review_enabled": False,
+                "node_repl_auto_review_required": False, "node_repl_disabled": False, "workspaces": {},
+                "model": "fixture", "codex_version": "0.154.0-alpha.6.2", "reasoning_effort": "medium"}}
+
+
+def test_codex_native_call_metadata_routes_each_call_to_existing_attachment(native_env, monkeypatch, tmp_path):
+    import json
+    from vaws_coordinator.task_server import handle
+    store = AgentSessions(native_env)
+    first = store.attach("codex", "first", str(tmp_path / "first"))
+    second = store.attach("codex", "second", str(tmp_path / "second"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "unrelated-server-thread")
+    monkeypatch.setenv("CODEX_SESSION_ID", "unrelated-server-session")
+    monkeypatch.setattr(store, "attach", Mock(side_effect=AssertionError("call must not attach")))
+    monkeypatch.setattr("vaws_coordinator.task_server.AgentSessions", lambda: store)
+    for native, expected in (("first", first), ("second", second), ("first", first)):
+        arguments = {"full": True}
+        response = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "vaws_session", "arguments": arguments, "_meta": codex_call_metadata(native)}})
+        reply = response["result"]
+        assert not reply["isError"]
+        assert reply["structuredContent"]["data"]["session"]["id"] == expected["session"]["id"]
+        assert reply["structuredContent"]["data"]["attachment"]["cwd"] == expected["attachment"]["cwd"]
+        assert json.loads(reply["content"][0]["text"]) == reply["structuredContent"]
+        assert arguments == {"full": True}
+    assert len(store.sessions()) == 2
+    store.attach.assert_not_called()
+
+
+def test_codex_native_metadata_preserves_matching_context_and_rejects_conflict(native_env, tmp_path):
+    from vaws_coordinator.task_server import call_tool
+    store = AgentSessions(native_env)
+    first = store.attach("codex", "first", str(tmp_path))
+    second = store.attach("codex", "second", str(tmp_path))
+    assert not call_tool("vaws_session", {"context_file": first["context_file"]}, codex_call_metadata("first"))["isError"]
+    with pytest.raises(ValueError, match="differs from this native Codex caller"):
+        call_tool("vaws_session", {"context_file": second["context_file"]}, codex_call_metadata("first"))
+
+
+@pytest.mark.parametrize("turn", [None, "{\"thread_id\":\"native-first\"}", {},
+                                    {"session_id": "native-first"}, {"thread_id": ""}, {"thread_id": 42}])
+def test_codex_invalid_metadata_never_falls_back_to_process_identity(native_env, turn):
+    from vaws_coordinator.task_server import call_tool
+    with pytest.raises(ValueError, match="invalid native Codex call identity"):
+        call_tool("vaws_session", {}, {"threadId": "native-first", "x-codex-turn-metadata": turn})
+    assert not native_env.exists()
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"threadId": "native-first"}, {"session_id": "native-first"}])
+def test_codex_missing_call_metadata_has_no_alias_or_process_fallback(native_env, metadata):
+    from vaws_coordinator.task_server import call_tool
+    assert call_tool("vaws_session", {}, metadata)["isError"]
+    assert not native_env.exists()
+
+
+def test_codex_unknown_metadata_does_not_create_or_reassign_attachment(native_env, tmp_path):
+    from vaws_coordinator.task_server import call_tool
+    store = AgentSessions(native_env)
+    known = store.attach("codex", "known", str(tmp_path))
+    metadata = codex_call_metadata("unknown")
+    metadata["threadId"] = metadata["x-codex-turn-metadata"]["session_id"] = "known"
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        call_tool("vaws_session", {"context_file": known["context_file"]}, metadata)
+    assert len(store.sessions()) == 1
+    assert store.native_context("codex", "known")["context_file"] == known["context_file"]
+
+
+def test_kimi_nested_agent_hooks_keep_exact_parent(native_env, tmp_path):
+    from vaws_coordinator.hooks.vaws_session import handle
+    store = AgentSessions(native_env)
+    base = {"session_id": "native-kimi", "cwd": str(tmp_path)}
+    handle("kimi", {**base, "hook_event_name": "SessionStart", "agent_id": "main"}, store)
+    handle("kimi", {**base, "hook_event_name": "SubagentStart", "agent_id": "child", "parent_agent_id": "main"}, store)
+    handle("kimi", {**base, "hook_event_name": "SubagentStart", "agent_id": "grandchild", "parent_agent_id": "child"}, store)
+    child = store.native_context("kimi", "native-kimi", "child")
+    grandchild = store.native_context("kimi", "native-kimi", "grandchild")
+    assert grandchild["attachment"]["parent_id"] == child["attachment"]["id"]
+
+
 def test_native_status_preserves_a_finished_task(native_env):
     context = load_context()
     store = AgentSessions(native_env)
@@ -73,6 +207,70 @@ def test_explicit_parent_preserves_association(native_env, monkeypatch):
     child = load_context()
     assert child["session"]["id"] == parent["session"]["id"]
     assert child["attachment"]["parent_id"] == parent["attachment"]["id"]
+
+
+def test_first_native_cli_binds_sources_once_and_shell_cd_keeps_them(native_env, tmp_path, monkeypatch):
+    project = repo(tmp_path / "project")
+    other = repo(tmp_path / "other")
+    monkeypatch.chdir(project)
+    first = load_context()
+    assert first["source_defaults"]["origin"] == "native-cwd"
+    assert first["source_defaults"]["sources"]["project"]["path"] == str(project.resolve())
+    assert first["session"]["sources"] == {}
+    monkeypatch.chdir(other)
+    later = load_context()
+    assert later["context_file"] == first["context_file"]
+    assert later["attachment"]["cwd"] == str(project.resolve())
+    assert later["source_defaults"] == first["source_defaults"]
+
+
+@pytest.mark.parametrize("association_env", ["VAWS_PARENT_CONTEXT", "VAWS_ATTACH_CONTEXT"])
+def test_first_native_association_preserves_explicit_task_sources(native_env, tmp_path, monkeypatch, association_env):
+    project = repo(tmp_path / "project")
+    child_root = repo(tmp_path / "child")
+    monkeypatch.chdir(project)
+    parent = load_context()
+    store = AgentSessions(native_env)
+    explicit = store.bind_sources(parent, {"chosen": str(project)})
+    monkeypatch.setenv("CODEX_THREAD_ID", "native-child")
+    monkeypatch.setenv(association_env, parent["context_file"])
+    monkeypatch.chdir(child_root)
+    child = load_context()
+    assert child["session"]["id"] == parent["session"]["id"]
+    assert child["attachment"]["sources"]["child"]["path"] == str(child_root.resolve())
+    assert child["source_defaults"] == explicit["source_defaults"]
+    store.bind_sources(parent, {})
+    monkeypatch.chdir(project)
+    resumed = load_context()
+    assert resumed["attachment"]["cwd"] == str(child_root.resolve())
+    assert resumed["source_defaults"] == {"origin": "explicit", "sources": {}}
+
+
+def test_native_cli_without_git_still_attaches_locally(native_env, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    context = load_context()
+    assert context["source_defaults"]["sources"] == {}
+    assert "source reference not yet bound" in capsys.readouterr().err
+
+
+def test_cursor_shell_first_call_and_hook_share_exact_native_context(native_env, tmp_path, monkeypatch):
+    from vaws_coordinator.hooks.vaws_session import handle
+    project = repo(tmp_path / "project")
+    native = "4c009c90-471a-4be5-b9b9-963f0ab6fb4b"
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv("CURSOR_CONVERSATION_ID", native)
+    monkeypatch.chdir(project)
+    first = load_context()
+    store = AgentSessions(native_env)
+    handle("cursor", {"hook_event_name": "sessionStart", "conversation_id": native, "cwd": str(project)}, store)
+    monkeypatch.chdir(tmp_path)
+    assert load_context()["context_file"] == first["context_file"]
+    assert load_context()["source_defaults"]["sources"]["project"]["path"] == str(project)
+    assert len(store.sessions()) == 1
+    monkeypatch.setenv("CURSOR_CONVERSATION_ID", "escaped_2Fid")
+    with pytest.raises(ValueError):
+        load_context()
+    assert len(store.sessions()) == 1
 
 
 def test_existing_user_container_needs_no_image_selection():

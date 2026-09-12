@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -206,6 +207,38 @@ class AgentSessions:
                              "task context file explicitly (context_file argument or VAWS_CONTEXT_FILE)")
         return self.context(matches[0]["id"])
 
+    def bind_user(self, context: dict, user: str, *, github_identity: dict | None = None,
+                  explicit: bool = False) -> dict:
+        """Bind task attribution once; resumed or associated attachments inherit it."""
+        with self.transaction() as db:
+            session = self.get(db, "session", context["session"]["id"])
+            existing = session.get("user")
+            if not existing:
+                # Older tasks stored attribution on executions only. Preserve
+                # that proven history rather than relabeling accepted work.
+                prior = {row["user"] for row in self.rows(db, "execution")
+                         if row["session_id"] == session["id"] and row.get("user")}
+                if len(prior) > 1:
+                    raise ValueError("VAWS task has inconsistent historical user attribution")
+                existing = next(iter(prior), None)
+            if existing and explicit and existing != user:
+                raise ValueError(f"VAWS task is already bound to user {existing!r}; it cannot resume as {user!r}")
+            if not session.get("user"):
+                session.update(user=existing or user, user_bound_at=time.time())
+                if github_identity is not None and (not existing or existing == user):
+                    session["github_identity"] = dict(github_identity)
+                self.put(db, "session", session)
+        return self.context(context["attachment"]["id"])
+
+    def bind_configured_user(self, context: dict, *, identity_file=None) -> dict:
+        if context["session"].get("user"):
+            return context
+        from vaws_coordinator.user_identity import load_github_identity
+        identity = load_github_identity(identity_file)
+        if identity is None:
+            return context
+        return self.bind_user(context, identity["login"], github_identity=identity)
+
     def bind_sources(self, context: dict, sources: dict[str, str]) -> dict:
         references = {}
         for name, path in sources.items():
@@ -333,13 +366,31 @@ class AgentSessions:
 def load_context(context_file: str = "", *, allow_native_context: bool = True) -> dict:
     filename = context_file or os.environ.get("VAWS_CONTEXT_FILE", "")
     if not filename:
-        # Codex exposes a native thread id to local commands even when the
+        callers = [(client, os.environ.get(key, "").strip()) for client, key in
+                   (("codex", "CODEX_THREAD_ID"), ("cursor", "CURSOR_CONVERSATION_ID"),
+                    ("grok", "GROK_SESSION_ID"), ("kimi", "KIMI_SESSION_ID"))]
+        callers = [(client, native) for client, native in callers if native]
+        if len(callers) > 1:
+            raise ValueError("conflicting native client identities; pass context_file explicitly")
+        if callers and callers[0][0] in {"grok", "kimi"} and allow_native_context:
+            client, native = callers[0]
+            agent = os.environ.get("KIMI_AGENT_ID", "").strip() if client == "kimi" else ""
+            if client == "kimi" and agent == "main":
+                agent = ""
+            # These clients attach before tools run. A later shell cd does not
+            # create a task or change its sources; an unknown child stays unknown.
+            return AgentSessions().native_context(client, native, agent)
+        # Codex and Cursor expose native ids to local commands even when the
         # session hook cannot export VAWS_CONTEXT_FILE to their environment.
         # Resolve only that identity; cwd is attachment metadata, never a key.
-        native = os.environ.get("CODEX_THREAD_ID", "").strip()
-        session = os.environ.get("CODEX_SESSION_ID", "").strip()
+        client, native = callers[0] if callers else ("codex", "")
+        session = os.environ.get("CODEX_SESSION_ID", "").strip() if client == "codex" else ""
         if not native or not allow_native_context:
             raise ValueError("VAWS context is required; use the native session hook or explicit task association")
+        if client == "cursor" and str(uuid.UUID(native)) != native:
+            # Cursor encodes/truncates arbitrary ids before shell export.
+            # Its native UUID is lossless; never guess an encoded identity.
+            raise ValueError("unsupported native Cursor shell identity; pass context_file explicitly")
         if session and session != native:
             raise ValueError("conflicting native Codex identities; pass context_file explicitly")
         parent = os.environ.get("VAWS_PARENT_CONTEXT", "")
@@ -349,12 +400,24 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
             store = AgentSessions(Path(inherited["state_dir"]))
         else:
             store = AgentSessions()
+        try:
+            existing = store.native_context(client, native)
+        except ValueError:
+            context = store.attach(client, native, str(Path.cwd()),
+                                   parent_context=parent, association=association)
             try:
-                return store.native_context("codex", native)
-            except ValueError:
-                pass
-        return store.attach("codex", native, str(Path.cwd()),
-                            parent_context=parent, association=association)
+                return store.bind_native_sources(context)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                # A local task remains usable before its directory has a Git
+                # commit. Match the normal session hook's source boundary.
+                print(f"VAWS: source reference not yet bound: {type(exc).__name__}", file=sys.stderr)
+                return context
+        if parent or association:
+            # Preserve association validation without treating a later shell
+            # cd as a native worktree handoff or replacing its source defaults.
+            return store.attach(client, native, existing["attachment"]["cwd"],
+                                parent_context=parent, association=association)
+        return existing
     path = Path(client_path(filename)).expanduser().resolve(strict=True)
     reference = json.loads(path.read_text())
     if reference.get("schema_version") != "vaws.agent-context.v1":

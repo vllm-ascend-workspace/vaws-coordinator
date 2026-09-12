@@ -11,21 +11,33 @@ from vaws_coordinator.agent_session import AgentSessions, load_context
 from vaws_coordinator.placement import normalize_environment, normalize_resources, role_plan, validate_user_env
 from vaws_coordinator.ready_runtime import safe_id
 from vaws_coordinator.state_paths import coordinator_state_dir
+from vaws_coordinator.user_identity import load_github_identity
 
 DONE = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
 
 
-def coordinator_user(explicit: str | None = None) -> str:
+def _user_identity(explicit: str | None = None, *, identity_file=None) -> tuple[str, dict | None]:
     if explicit:
-        return safe_id(explicit)
-    return safe_id(getpass.getuser())
+        return safe_id(explicit), None
+    identity = load_github_identity(identity_file)
+    return (safe_id(identity["login"]), identity) if identity else (safe_id(getpass.getuser()), None)
+
+
+def coordinator_user(explicit: str | None = None, *, identity_file=None) -> str:
+    return _user_identity(explicit, identity_file=identity_file)[0]
 
 
 class TaskClient:
-    def __init__(self, context_file="", *, pool=None, user=None, service=None, allow_native_context=True):
+    def __init__(self, context_file="", *, pool=None, user=None, service=None, allow_native_context=True,
+                 identity_file=None):
         self.context = load_context(context_file, allow_native_context=allow_native_context)
         self.store = AgentSessions(Path(self.context["state_dir"]))
-        self.user = coordinator_user(user)
+        if self.context["session"].get("user") and not user:
+            selected, identity = self.context["session"]["user"], None
+        else:
+            selected, identity = _user_identity(user, identity_file=identity_file)
+        self.context = self.store.bind_user(self.context, selected, github_identity=identity, explicit=bool(user))
+        self.user = safe_id(self.context["session"]["user"])
         self._pool = pool
         self._service = service
 
@@ -53,7 +65,36 @@ class TaskClient:
         context = self.store.context(self.context["attachment"]["id"])
         with self.store.transaction() as db:
             attachments = [row for row in self.store.rows(db, "attachment") if row["session_id"] == context["session"]["id"]]
-        return {**context, "attachments": attachments, "executions": self.store.executions(context["session"]["id"])}
+        return self._with_notifications({**context, "attachments": attachments,
+                                         "executions": self.store.executions(context["session"]["id"])})
+
+    def _with_notifications(self, value):
+        session_id = self.context["session"]["id"]
+        rows = self.store.executions(session_id)
+        has_host = any((binding or {}).get("host_endpoint") for row in rows
+                       for binding in [row.get("binding"), *(role.get("binding") for role in row.get("roles") or [])])
+        if not has_host:
+            with self.store.transaction() as db:
+                has_host = any(row.get("session_id") == session_id and row.get("user") == self.user
+                               for row in self.store.rows(db, "mailbox"))
+        if not has_host:
+            return value  # A local session does not start a daemon for mail.
+        try:
+            return {**value, **self.coordinator.notifications(str(self.store.state_dir), self.user, session_id)}
+        except Exception as exc:
+            return {**value, "notification_status": {"state": "unavailable", "error": str(exc)[:300]}}
+
+    def message(self, recipient, text):
+        """Send text to an existing coordination or reply reference.
+
+        Sender identity, host routing, thread and retry bookkeeping are internal.
+        This action cannot stop an execution or transfer resource ownership.
+        """
+        return self.coordinator.message(str(self.store.state_dir), self.user,
+                                        self.context["session"]["id"], recipient, text)
+
+    def reply(self, reply_reference, text):
+        return self.message(reply_reference, text)
 
     def sources(self, sources):
         self.context = self.store.bind_sources(self.context, sources)
@@ -92,8 +133,8 @@ class TaskClient:
             "timeout_seconds": timeout_seconds, "service": service,
             "preflight": preflight,
         }
-        return self.coordinator.admit(str(self.store.state_dir), self.user,
-                                      self.context["session"]["id"], spec, restart=restart)
+        return self._with_notifications(self.coordinator.admit(str(self.store.state_dir), self.user,
+                                      self.context["session"]["id"], spec, restart=restart))
 
     def _require_execution_id(self, execution_id):
         if not isinstance(execution_id, str) or len(execution_id) != 64 or any(
@@ -143,9 +184,10 @@ class TaskClient:
                 reply = self.coordinator.advance(str(self.store.state_dir), self.user, execution_id,
                                                  action="target", force=force, role=role)
             return reply
-        return self.coordinator.advance(str(self.store.state_dir), self.user, execution_id,
+        reply = self.coordinator.advance(str(self.store.state_dir), self.user, execution_id,
                                         action=action, force=force, role=role,
                                         **({"refresh": False} if action == "status" and not refresh else {}))
+        return self._with_notifications(reply) if action == "status" else reply
 
     def finish(self, force=False):
         local = self.store.close_if_unmanaged(self.context["session"]["id"], user=self.user, force=force)
@@ -168,8 +210,12 @@ class TaskClient:
             raise ValueError("poll_interval must be finite and positive")
         self._require_execution_id(execution_id)
         deadline = time.monotonic() + timeout_seconds
+        notifications = []
         while True:
             reply = self.observe(execution_id, refresh=False)
+            notifications.extend(reply.get("notifications", []))
+            if notifications:
+                reply["notifications"] = list(notifications)
             terminal = reply.get("state") in DONE
             if until == "running" and (terminal or reply.get("state") == "running"):
                 return reply

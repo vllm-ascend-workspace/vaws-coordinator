@@ -1,4 +1,4 @@
-"""Stdio MCP server for the four task-facing tools.
+"""Stdio MCP server for task lifecycle and optional coordination messages.
 
 `vaws_session`, `vaws_run`, `vaws_execution` and `vaws_finish` are coordinator
 semantics. This process is their home. It is local-first: `vaws_session` and
@@ -18,15 +18,18 @@ import sys
 from typing import Any, BinaryIO
 
 from vaws_coordinator.host_queue import SCHEMA_VERSION
+from vaws_coordinator.agent_session import AgentSessions
 from vaws_coordinator.ops import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, vaws_call, LOADED_RUNTIMES
 
 SERVICE_NAME = "vaws-coordinator-task"
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 ALIASES = {name.replace(".", "_"): name for name in TOOL_SCHEMAS}
 INSTRUCTIONS = (
-    "VAWS task tools. Pass the context_file supplied by the native session "
-    "hook; never guess a task from cwd or history. vaws_session and "
-    "vaws_finish are local. vaws_run uses this process's local runtime pool."
+    "VAWS task tools. Native hooks automatically attach the task; no session-creation call is needed. "
+    "Supported tool hooks supply context_file; otherwise use the native hook's context. "
+    "Never guess a task from cwd or history. Sessions with no managed "
+    "hosts stay local. Normal run/status calls receive coordination messages "
+    "opportunistically; use vaws_message only for a substantive request or reply."
 )
 
 
@@ -80,16 +83,43 @@ def canonical_name(name: str) -> str:
     return ALIASES.get(name, name)
 
 
-def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+def call_tool(name: str, arguments: dict[str, Any] | None, metadata: dict | None = None) -> dict[str, Any]:
     canonical = canonical_name(name)
     if canonical not in TOOL_SCHEMAS:
         raise ProtocolError(-32602, f"unknown task tool: {name}")
     # A persistent MCP server's environment can outlive the native caller.
     # It must use the caller's context, never the thread that launched it.
-    payload = vaws_call(canonical, arguments or {}, allow_native_context=False)
+    arguments = dict(arguments or {})
+    if metadata and "kimi_code/session_id" in metadata:
+        native = metadata["kimi_code/session_id"]
+        agent = metadata.get("kimi_code/agent_id", "")
+        if not isinstance(native, str) or not native.strip() or not isinstance(agent, str):
+            raise ValueError("invalid native Kimi call identity")
+        if agent == "main":
+            agent = ""
+        context = AgentSessions().native_context("kimi", native, agent)
+        supplied = arguments.get("context_file")
+        if supplied and supplied != context["context_file"]:
+            raise ValueError("context_file differs from this native Kimi caller")
+        arguments["context_file"] = context["context_file"]
+    elif metadata and "x-codex-turn-metadata" in metadata:
+        # Native Codex tools/call supplies this object per invocation, including
+        # calls inside functions.exec which do not pass through PreToolUse.
+        turn = metadata["x-codex-turn-metadata"]
+        native = turn.get("thread_id") if isinstance(turn, dict) else None
+        if not isinstance(native, str) or not native.strip():
+            raise ValueError("invalid native Codex call identity")
+        context = AgentSessions().native_context("codex", native)
+        supplied = arguments.get("context_file")
+        if supplied and supplied != context["context_file"]:
+            raise ValueError("context_file differs from this native Codex caller")
+        arguments["context_file"] = context["context_file"]
+    payload = vaws_call(canonical, arguments, allow_native_context=False)
     result = payload["result"]
     return {
-        "content": [{"type": "text", "text": payload["text"]}],
+        # Some native clients expose text only, including Grok 1.0.25.
+        # Keep the same compact/full facts visible through both MCP channels.
+        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
         "structuredContent": result,
         "isError": result.get("outcome") not in {"success", "cancelled"},
     }
@@ -118,7 +148,10 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
                 raise ValueError("tools/call requires a string name")
             if not isinstance(arguments, dict):
                 raise ValueError("tools/call arguments must be an object")
-            return _result(request_id, call_tool(name, arguments))
+            metadata = params.get("_meta")
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError("tools/call _meta must be an object")
+            return _result(request_id, call_tool(name, arguments, metadata))
         return _error(request_id, -32601, f"method not found: {method}")
     except ProtocolError as exc:
         return _error(request_id, exc.code, str(exc))
