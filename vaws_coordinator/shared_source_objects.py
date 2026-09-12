@@ -18,6 +18,8 @@ def copy_fixed_objects(source, destination, row):
     def git(path, *args, check=True):
         result = subprocess.run(['git', '-C', str(path), *args], capture_output=True,
                                 text=True, timeout=60)
+        if result.returncode < 0:
+            raise subprocess.SubprocessError('fixed object copy interrupted: ' + result.stderr.strip())
         if check and result.returncode:
             raise RuntimeError('fixed object copy failed: ' + result.stderr.strip())
         return result
@@ -62,17 +64,28 @@ def export_existing_objects(request, run=None):
     import json
     import re
     import subprocess
+    import sys
     if run is None:
         run = subprocess.run
-    listed = run(['docker', 'ps', '--filter', 'label=com.vaws.managed=true', '--format', '{{.ID}}'],
-                 capture_output=True, text=True, check=True, timeout=15)
-    identifiers = listed.stdout.split()
-    if not identifiers:
-        return {'status': 'miss', 'copied': []}
-    containers = json.loads(run(['docker', 'inspect', *identifiers], capture_output=True,
-                                text=True, check=True, timeout=15).stdout)
+    try:
+        listed = run(['docker', 'ps', '--filter', 'label=com.vaws.managed=true', '--format', '{{.ID}}'],
+                     capture_output=True, text=True, check=True, timeout=15)
+        identifiers = listed.stdout.split()
+        if not identifiers:
+            return {'status': 'miss', 'copied': []}
+        containers = json.loads(run(['docker', 'inspect', *identifiers], capture_output=True,
+                                    text=True, check=True, timeout=15).stdout)
+    except subprocess.TimeoutExpired as exc:
+        return {'status': 'uncertain', 'reason': str(exc)}
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode < 0 or exc.returncode >= 128:
+            return {'status': 'uncertain', 'reason': str(exc)}
+        return {'status': 'miss', 'copied': [], 'reason': str(exc)}
+    except (OSError, ValueError) as exc:
+        return {'status': 'miss', 'copied': [], 'reason': str(exc)}
     pending = list(request['records'])
     copied = []
+    diagnostics = []
     for info in containers:
         identifier = info.get('Id', '')
         labels = (info.get('Config') or {}).get('Labels') or {}
@@ -85,14 +98,26 @@ def export_existing_objects(request, run=None):
         if not any(m.get('Type') == 'bind' and m.get('Source') == '/tmp'
                    and m.get('Destination') == '/tmp' and m.get('RW') for m in info.get('Mounts', [])):
             continue
-        # Completed misses may examine another donor; errors/unknown outcomes
-        # stop the operation, rather than replaying a possibly completed copy.
-        reply = run(['docker', 'exec', '-i', identifier, 'python3', '-c', request['export_source']],
-                    input=json.dumps({'records': pending, 'legacy_cache': request['legacy_cache']}),
-                    capture_output=True, text=True, timeout=300)
+        try:
+            reply = run(['docker', 'exec', '-i', identifier, 'python3', '-c', request['export_source']],
+                        input=json.dumps({'records': pending, 'legacy_cache': request['legacy_cache']}),
+                        capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired as exc:
+            return {'status': 'uncertain', 'reason': str(exc)}
+        except OSError as exc:
+            print(f'fixed object donor unavailable: {exc}', file=sys.stderr, flush=True)
+            diagnostics.append(str(exc))
+            continue
+        if reply.returncode < 0 or reply.returncode >= 128:
+            return {'status': 'uncertain', 'reason': 'donor export interrupted: ' + reply.stderr[-2000:]}
         if reply.returncode:
-            raise RuntimeError('fixed object donor export failed: ' + reply.stderr[-2000:])
+            print('fixed object donor unavailable: ' + reply.stderr[-2000:], file=sys.stderr, flush=True)
+            diagnostics.append(reply.stderr[-2000:])
+            continue
         result = json.loads(reply.stdout)
+        if result.get('status') in {'uncertain', 'cancelled'}:
+            return result
+        diagnostics.extend(result.get('diagnostics', []))
         found = result['copied']
         if not isinstance(found, list) or any(commit not in {r['commit'] for r in pending} for commit in found):
             raise ValueError('fixed object donor returned unexpected commits')
@@ -100,19 +125,29 @@ def export_existing_objects(request, run=None):
         pending = [row for row in pending if row['commit'] not in found]
         if not pending:
             break
-    return {'status': 'copied' if copied else 'miss', 'copied': copied}
+    return {'status': 'copied' if copied else 'miss', 'copied': copied,
+            **({'diagnostics': diagnostics[-3:]} if diagnostics else {})}
 
 
 def export_container_objects(request):
     """Read only requested legacy mirror names; copy exact closures to /tmp."""
     from pathlib import Path
+    import subprocess
+    import sys
     copied = []
+    diagnostics = []
     base = Path(request['legacy_cache']) / 'workspaces'
     for row in request['records']:
         # Workspace identities differ by user, but only this requested repo
         # name is considered. No source file or mutable ref is inspected.
         for mirror in base.glob('*/mirrors/nested/' + row['repo_id'] + '.git'):
-            if copy_fixed_objects(mirror, row['shared_mirror'], row):
-                copied.append(row['commit'])
-                break
-    return {'copied': copied}
+            try:
+                if copy_fixed_objects(mirror, row['shared_mirror'], row):
+                    copied.append(row['commit'])
+                    break
+            except subprocess.SubprocessError as exc:
+                return {'status': 'uncertain', 'reason': str(exc)}
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f'fixed object candidate unavailable: {exc}', file=sys.stderr, flush=True)
+                diagnostics.append(str(exc)[-2000:])
+    return {'copied': copied, **({'diagnostics': diagnostics[-3:]} if diagnostics else {})}

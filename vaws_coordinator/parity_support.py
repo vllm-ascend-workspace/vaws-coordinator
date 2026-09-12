@@ -413,6 +413,7 @@ def _materialize_fixed(request):
     import os
     from pathlib import Path
     import subprocess
+    import sys
     import tempfile
 
     def git(path, *args, check=True):
@@ -480,8 +481,14 @@ def _materialize_fixed(request):
                     raise ValueError('fixed source refs rejected: ' + updated.stderr)
         tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}', check=False)
         shared = row.get('shared_mirror')
-        if tree.returncode and shared and copy_fixed_objects(shared, mirror, row):
-            tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}')
+        if tree.returncode and shared:
+            try:
+                if copy_fixed_objects(shared, mirror, row):
+                    tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}')
+            except (OSError, ValueError, RuntimeError) as exc:
+                # These are completed local errors, not subprocess timeouts or
+                # cancellation. The exact private input is still missing.
+                print(f'shared source candidate unavailable: {exc}', file=sys.stderr, flush=True)
         if tree.returncode:
             carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
             missing.append({'index': index, 'carrier': carrier.stdout.strip() if not carrier.returncode else None})
@@ -496,7 +503,12 @@ def _materialize_fixed(request):
         if shared:
             # Publish immutable objects only. The shared mirror never replaces
             # this owner's refs/objects or becomes a live alternate dependency.
-            copy_fixed_objects(mirror, shared, row)
+            try:
+                copy_fixed_objects(mirror, shared, row)
+            except (OSError, ValueError, RuntimeError) as exc:
+                # Cache publication cannot gate a valid private snapshot.
+                # Its checkout and complete source validation still run below.
+                print(f'shared source publication unavailable: {exc}', file=sys.stderr, flush=True)
             # A shared hit also provides this owner's first negotiation base.
             # Create only; concurrent work may already have advanced its ref.
             # Neither this mutable hint nor any shared ref selects a checkout.

@@ -162,6 +162,85 @@ def test_uncertain_legacy_export_does_not_fall_back_to_upload(peer, tmp_path, mo
     assert not (peer.root / '.vaws-runtime/source-materialization.json').exists()
 
 
+@pytest.mark.parametrize('failure', [PermissionError('read only'), OSError('no space'),
+                                     ValueError('corrupt shared cache')])
+def test_private_snapshot_does_not_require_shared_publication(peer, tmp_path, monkeypatch, capsys, failure):
+    from vaws_coordinator import parity_support
+    record = make_record(peer.source, 'project')
+    peer.run([record])
+    def fail(*args):
+        raise failure
+    monkeypatch.setattr(parity_support, 'copy_fixed_objects', fail)
+    runtime = tmp_path / 'private-valid'
+    result = parity_support._materialize_fixed({
+        'root': str(runtime), 'source_id': snapshot([record])['id'],
+        'carrier_ref': 'refs/parity/test/transport-carrier',
+        'records': [{**asdict(record), 'mirror': parity.mirror_path_for(str(peer.cache), 'test', record),
+                     'shared_mirror': str(tmp_path / 'shared.git')}],
+    })
+    assert result['status'] == 'materialized'
+    assert (runtime / 'project/model.py').read_text() == 'value = 1\n'
+    assert 'shared source publication unavailable' in capsys.readouterr().err
+
+
+def test_bad_shared_candidate_falls_back_to_verified_git_upload(peer, tmp_path):
+    record = make_record(peer.source, 'project')
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    broken = shared / 'project.git'
+    git(shared, 'clone', '--bare', '--local', str(peer.source), str(broken))
+    blob = git(peer.source, 'rev-parse', 'HEAD:model.py')
+    (broken / 'objects' / blob[:2] / blob[2:]).unlink()
+    result = peer.run([record], owner='cold', shared_cache=str(shared))
+    assert result['status'] == 'materialized' and len(peer.transfers) == 1
+    assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
+
+
+def test_private_snapshot_does_not_swallow_shared_copy_timeout(peer, tmp_path, monkeypatch):
+    from vaws_coordinator import parity_support
+    record = make_record(peer.source, 'project')
+    peer.run([record])
+    def timeout(*args):
+        raise subprocess.TimeoutExpired('git fetch', 60)
+    monkeypatch.setattr(parity_support, 'copy_fixed_objects', timeout)
+    runtime = tmp_path / 'unknown-copy'
+    with pytest.raises(subprocess.TimeoutExpired):
+        parity_support._materialize_fixed({
+            'root': str(runtime), 'source_id': snapshot([record])['id'],
+            'carrier_ref': 'refs/parity/test/transport-carrier',
+            'records': [{**asdict(record), 'mirror': parity.mirror_path_for(str(peer.cache), 'test', record),
+                         'shared_mirror': str(tmp_path / 'shared.git')}],
+        })
+    assert not (runtime / '.vaws-runtime/source-materialization.json').exists()
+
+
+def test_invalid_legacy_mirror_does_not_hide_valid_donor(peer, tmp_path, monkeypatch):
+    from vaws_coordinator import shared_source_objects as shared
+    record = make_record(peer.source, 'project')
+    parent = tmp_path / 'legacy/workspaces'
+    broken = parent / 'first/mirrors/nested/project.git'
+    valid = parent / 'second/mirrors/nested/project.git'
+    for mirror in (broken, valid):
+        mirror.parent.mkdir(parents=True)
+        git(mirror.parent, 'clone', '--bare', '--local', str(peer.source), str(mirror))
+    blob = git(peer.source, 'rev-parse', 'HEAD:model.py')
+    (broken / 'objects' / blob[:2] / blob[2:]).unlink()
+    original = shared.copy_fixed_objects
+    tried = []
+    def copy(source, *args):
+        tried.append(source)
+        return original(source, *args)
+    monkeypatch.setattr(shared, 'copy_fixed_objects', copy)
+    # Force candidate order; filesystem directory enumeration is unspecified.
+    original_glob = Path.glob
+    monkeypatch.setattr(Path, 'glob', lambda path, pattern: iter([broken, valid])
+                        if path == parent else original_glob(path, pattern))
+    result = shared.export_container_objects({'legacy_cache': str(tmp_path / 'legacy'),
+        'records': [{**asdict(record), 'shared_mirror': str(tmp_path / 'shared.git')}]})
+    assert result['copied'] == [record.commit] and tried == [broken, valid]
+    assert result['diagnostics']
+
+
 def test_cold_two_operations_warm_one_without_recapture(peer):
     record = make_record(peer.source, 'project')
     result = peer.run([record])

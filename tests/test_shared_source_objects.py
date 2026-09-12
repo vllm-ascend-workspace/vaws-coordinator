@@ -55,8 +55,8 @@ def test_unqualified_container_is_not_read(damage):
     assert export_existing_objects(request(), run) == {'status': 'miss', 'copied': []}
 
 
-@pytest.mark.parametrize('outcome', ['failed', 'timeout'])
-def test_export_failure_is_not_replayed_on_another_donor(outcome):
+@pytest.mark.parametrize('outcome', ['timeout', 'signal'])
+def test_unknown_export_is_not_replayed_on_another_donor(outcome):
     calls = []
     def run(args, **kwargs):
         if args[1] == 'ps':
@@ -66,10 +66,35 @@ def test_export_failure_is_not_replayed_on_another_donor(outcome):
         calls.append(args)
         if outcome == 'timeout':
             raise subprocess.TimeoutExpired(args, kwargs['timeout'])
-        return SimpleNamespace(returncode=1, stdout='', stderr='copy incomplete')
-    with pytest.raises((RuntimeError, subprocess.TimeoutExpired)):
-        export_existing_objects(request(), run)
+        return SimpleNamespace(returncode=137, stdout='', stderr='copy interrupted')
+    assert export_existing_objects(request(), run)['status'] == 'uncertain'
     assert len(calls) == 1
+
+
+def test_known_unavailable_donor_uses_another_candidate():
+    calls = []
+    def run(args, **kwargs):
+        if args[1] == 'ps':
+            return SimpleNamespace(stdout='aaaa\nbbbb\n')
+        if args[1] == 'inspect':
+            return SimpleNamespace(stdout=json.dumps([container(), container('e')]))
+        calls.append(args[3])
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout='', stderr='container disappeared')
+        return SimpleNamespace(returncode=0, stdout=json.dumps({'copied': ['c' * 40]}), stderr='')
+    result = export_existing_objects(request(), run)
+    assert result['status'] == 'copied' and result['copied'] == ['c' * 40]
+    assert calls == ['a' * 64, 'e' * 64] and result['diagnostics']
+
+
+def test_container_timeout_is_an_unknown_host_reply():
+    def run(args, **kwargs):
+        if args[1] == 'ps':
+            return SimpleNamespace(stdout='aaaa\n')
+        if args[1] == 'inspect':
+            return SimpleNamespace(stdout=json.dumps([container()]))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({'status': 'uncertain', 'reason': 'git timeout'}))
+    assert export_existing_objects(request(), run)['status'] == 'uncertain'
 
 
 @pytest.mark.parametrize('reply, error', [

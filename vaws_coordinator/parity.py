@@ -218,6 +218,9 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
         # A new Python edit must not rediscover every container on the host.
         if cold:
             exported = _export_existing_source_objects(host_endpoint, cold, cache)
+            if log_path and (exported.get('diagnostics') or exported.get('reason')):
+                with Path(log_path).open('a', encoding='utf-8') as stream:
+                    stream.write('shared source discovery: ' + json.dumps(exported, sort_keys=True) + '\n')
             if on_progress:
                 on_progress({'phase': 'shared-source-objects', **exported})
             if exported['status'] == 'copied':
