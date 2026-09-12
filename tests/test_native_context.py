@@ -4,6 +4,7 @@ import pytest
 
 from vaws_coordinator.agent_session import AgentSessions, load_context
 from vaws_coordinator.task_client import TaskClient
+from test_execution_inputs import repo
 
 
 @pytest.fixture
@@ -73,6 +74,50 @@ def test_explicit_parent_preserves_association(native_env, monkeypatch):
     child = load_context()
     assert child["session"]["id"] == parent["session"]["id"]
     assert child["attachment"]["parent_id"] == parent["attachment"]["id"]
+
+
+def test_first_native_cli_binds_sources_once_and_shell_cd_keeps_them(native_env, tmp_path, monkeypatch):
+    project = repo(tmp_path / "project")
+    other = repo(tmp_path / "other")
+    monkeypatch.chdir(project)
+    first = load_context()
+    assert first["source_defaults"]["origin"] == "native-cwd"
+    assert first["source_defaults"]["sources"]["project"]["path"] == str(project.resolve())
+    assert first["session"]["sources"] == {}
+    monkeypatch.chdir(other)
+    later = load_context()
+    assert later["context_file"] == first["context_file"]
+    assert later["attachment"]["cwd"] == str(project.resolve())
+    assert later["source_defaults"] == first["source_defaults"]
+
+
+@pytest.mark.parametrize("association_env", ["VAWS_PARENT_CONTEXT", "VAWS_ATTACH_CONTEXT"])
+def test_first_native_association_preserves_explicit_task_sources(native_env, tmp_path, monkeypatch, association_env):
+    project = repo(tmp_path / "project")
+    child_root = repo(tmp_path / "child")
+    monkeypatch.chdir(project)
+    parent = load_context()
+    store = AgentSessions(native_env)
+    explicit = store.bind_sources(parent, {"chosen": str(project)})
+    monkeypatch.setenv("CODEX_THREAD_ID", "native-child")
+    monkeypatch.setenv(association_env, parent["context_file"])
+    monkeypatch.chdir(child_root)
+    child = load_context()
+    assert child["session"]["id"] == parent["session"]["id"]
+    assert child["attachment"]["sources"]["child"]["path"] == str(child_root.resolve())
+    assert child["source_defaults"] == explicit["source_defaults"]
+    store.bind_sources(parent, {})
+    monkeypatch.chdir(project)
+    resumed = load_context()
+    assert resumed["attachment"]["cwd"] == str(child_root.resolve())
+    assert resumed["source_defaults"] == {"origin": "explicit", "sources": {}}
+
+
+def test_native_cli_without_git_still_attaches_locally(native_env, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    context = load_context()
+    assert context["source_defaults"]["sources"] == {}
+    assert "source reference not yet bound" in capsys.readouterr().err
 
 
 def test_existing_user_container_needs_no_image_selection():

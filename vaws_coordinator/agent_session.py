@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -360,12 +361,24 @@ def load_context(context_file: str = "", *, allow_native_context: bool = True) -
             store = AgentSessions(Path(inherited["state_dir"]))
         else:
             store = AgentSessions()
+        try:
+            existing = store.native_context("codex", native)
+        except ValueError:
+            context = store.attach("codex", native, str(Path.cwd()),
+                                   parent_context=parent, association=association)
             try:
-                return store.native_context("codex", native)
-            except ValueError:
-                pass
-        return store.attach("codex", native, str(Path.cwd()),
-                            parent_context=parent, association=association)
+                return store.bind_native_sources(context)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                # A local task remains usable before its directory has a Git
+                # commit. Match the normal session hook's source boundary.
+                print(f"VAWS: source reference not yet bound: {type(exc).__name__}", file=sys.stderr)
+                return context
+        if parent or association:
+            # Preserve association validation without treating a later shell
+            # cd as a native worktree handoff or replacing its source defaults.
+            return store.attach("codex", native, existing["attachment"]["cwd"],
+                                parent_context=parent, association=association)
+        return existing
     path = Path(client_path(filename)).expanduser().resolve(strict=True)
     reference = json.loads(path.read_text())
     if reference.get("schema_version") != "vaws.agent-context.v1":
