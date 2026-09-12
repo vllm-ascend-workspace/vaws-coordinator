@@ -77,7 +77,7 @@ class IsolatedPrepareScriptTests(unittest.TestCase):
             python = task / ".venv/bin/python"
             image_python = getattr(sys, "_base_executable", sys.executable)
             preamble = ("export PYTHON=" + shlex.quote(image_python),)
-            with mock.patch("vaws_coordinator.parity.DEFAULT_ENV_PREAMBLE", preamble):
+            with mock.patch("vaws_coordinator.parity.PYTHON_METADATA_PREAMBLE", preamble):
                 script = create_venv_script(str(task), str(python))
             result = subprocess.run(["bash", "-c", script], text=True,
                                     capture_output=True, timeout=30,
