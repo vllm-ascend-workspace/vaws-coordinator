@@ -335,6 +335,10 @@ RPC connection. The complete command, including all encoded packs, is capped
 below the remote worker's argument limit; cold or larger transfers retain Git
 SSH. Pack contents, prerequisite commit and resulting tree are verified before
 atomically publishing snapshot refs or materializing the execution view.
+Container provisioning checks SSH and Python package metadata without allocating
+an NPU. Native import validation belongs to runtime preparation; device execution
+belongs to a resource-backed run. The explicit standalone smoke command retains
+its device test.
 Each execution retains independent working files, a stable per-root lock, and
 final HEAD and dirty-state checks across parent repositories and submodules.
 Uncertain jobs are observed, never replayed. Runtime compatibility, native

@@ -117,7 +117,7 @@ def provision_user_container(
     container_target = host_ops.SshTarget(host=host, user="root", port=chosen_port)
     smoke = host_ops.run_remote_script(
         container_target,
-        host_ops.render_smoke_script(),
+        host_ops.render_smoke_script(device_test=False),
         args=[""],
         timeout_seconds=host_ops.DEFAULT_SMOKE_TIMEOUT_SECONDS,
         stream_progress=False,

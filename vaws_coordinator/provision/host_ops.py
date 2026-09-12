@@ -2512,7 +2512,7 @@ emit_json "$payload"
     )
 
 
-def render_smoke_script() -> str:
+def render_smoke_script(*, device_test: bool = True) -> str:
     template = r"""#!/usr/bin/env bash
 set -euo pipefail
 requested_python="${1:-}"
@@ -2609,6 +2609,18 @@ result = {
     "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
     "sourced_scripts": [line for line in sourced_text.splitlines() if line],
 }
+if not __DEVICE_TEST__:
+    # Provisioning has no device grant. Verify the interpreter's package
+    # metadata only; native imports and business execution have later owners.
+    import importlib.metadata
+    try:
+        result.update(success=True, device_test=False,
+                      torch_version=importlib.metadata.version('torch'),
+                      torch_npu_version=importlib.metadata.version('torch-npu'))
+    except importlib.metadata.PackageNotFoundError as exc:
+        result.update(success=False, device_test=False, error=str(exc))
+    print("__SENTINEL__" + json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0 if result["success"] else 3)
 try:
     progress("smoke", "importing torch and torch_npu")
     import torch
@@ -2642,7 +2654,7 @@ print("__SENTINEL__" + json.dumps(result, ensure_ascii=False))
 raise SystemExit(0 if result["success"] else 3)
 PY
 """
-    return template.replace("__SENTINEL__", SENTINEL).replace(
+    return template.replace("__DEVICE_TEST__", repr(device_test)).replace("__SENTINEL__", SENTINEL).replace(
         "__PROGRESS__", PROGRESS_SENTINEL
     )
 
