@@ -354,7 +354,8 @@ class RuntimePool(ManagedExecution):
 
     def request_run(self, owner: str, binding_id: str, request_id: str, snapshots: dict[str, str],
                     expected_build_key: str, devices: list[int], npu_count: int,
-                    priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None):
+                    priority: int = 0, queue_seconds: int = 1800, service_port: int | None = None,
+                    allow_external_busy: bool = False):
         try:
             safe_id(request_id)
         except ValueError as exc:
@@ -367,6 +368,8 @@ class RuntimePool(ManagedExecution):
             raise ExecutionRequestError("queue_seconds must be between 1 and 86400")
         if service_port is not None and (type(service_port) is not int or service_port < 0):
             raise ExecutionRequestError("service_port must be 0 or a positive declared runtime service port")
+        if type(allow_external_busy) is not bool or (allow_external_busy and (len(devices) != 1 or npu_count)):
+            raise ExecutionRequestError("allow_external_busy requires a boolean and exactly one explicit physical device")
         if not isinstance(snapshots, dict) or any(not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit) for commit in snapshots.values()):
             raise ExecutionRequestError("snapshots must map source paths to fixed Git commits")
         for name in snapshots:
@@ -376,6 +379,8 @@ class RuntimePool(ManagedExecution):
         intent = {"snapshots": snapshots, "build_key": expected_build_key, "devices": devices,
                   "npu_count": npu_count, "priority": priority, "queue_seconds": queue_seconds,
                   "service_port": service_port}
+        if allow_external_busy:
+            intent["allow_external_busy"] = True
         with self._entity_lock("binding", binding_id):
             with self.lock, self.transaction() as db:
                 binding = self.owned(db, "binding", binding_id, owner)
@@ -432,7 +437,8 @@ class RuntimePool(ManagedExecution):
             "resources": {"state": run["state"], "task_id": run["task_id"], "epoch": run["epoch"],
                           "released": run["state"] in TERMINAL,
                           "devices": run.get("task", {}).get("granted_devices", []),
-                          "service_port": run.get("service_port")},
+                          "service_port": run.get("service_port"),
+                          **({"allow_external_busy": True} if run["intent"].get("allow_external_busy") else {})},
             "process": None,
         }
         if job:
@@ -512,6 +518,8 @@ class RuntimePool(ManagedExecution):
                               "priority": intent["priority"], "latest_start": run["deadline"],
                               "estimated_duration_seconds": 1800}
                     submit.update({"devices": intent["devices"]} if intent["devices"] else {"npu_count": intent["npu_count"]})
+                    if intent.get("allow_external_busy"):
+                        submit["allow_external_busy"] = True
                     if intent.get("service_port") is not None:
                         submit["service_port"] = intent["service_port"]
                         submit["service_ports"] = runtime.get("service_ports", [])

@@ -39,7 +39,8 @@ def task_preamble(binding):
 class ManagedExecution:
     def managed_start(self, owner, binding_id, request_id, snapshots, expected_build_key,
                       devices, npu_count, command, env, timeout_seconds=1800,
-                      priority=0, queue_seconds=1800, service_port=None, hold_go=False):
+                      priority=0, queue_seconds=1800, service_port=None, hold_go=False,
+                      allow_external_busy=False):
         if not isinstance(command, str) or not command.strip() or len(command) > 200000:
             raise ValueError("a bounded nonempty shell command is required")
         if not isinstance(env, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
@@ -53,10 +54,16 @@ class ManagedExecution:
             raise ValueError("queue_seconds must be 1..86400")
         if service_port is not None and (type(service_port) is not int or service_port < 0):
             raise ValueError("service_port must be None, 0, or a positive declared runtime service port")
+        if type(allow_external_busy) is not bool or (allow_external_busy and (
+                not isinstance(devices, list) or len(devices) != 1 or npu_count
+                or any(type(device) is not int or device < 0 for device in devices))):
+            raise ValueError("allow_external_busy requires a boolean and exactly one explicit physical device")
         key = digest([owner, binding_id, request_id])
         request = {"binding_id": binding_id, "request_id": request_id, "snapshots": snapshots,
                    "expected_build_key": expected_build_key, "devices": devices, "npu_count": npu_count,
                    "priority": priority, "queue_seconds": queue_seconds, "service_port": service_port}
+        if allow_external_busy:
+            request["allow_external_busy"] = True
         specification = {"command": command, "env": env, "timeout_seconds": timeout_seconds,
                          "requested_service_port": service_port}
         with self.lock, self.transaction() as db:

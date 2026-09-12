@@ -12,9 +12,9 @@ from typing import Any
 SUPPORTED_RECIPES = {"rc", "main", "stable", "local-latest"}
 RESERVED_ENV = {"ASCEND_RT_VISIBLE_DEVICES", "VAWS_SERVICE_PORT", "VAWS_PYTHON", "VAWS_EXECUTION_OBSERVATION"}
 ENVIRONMENT_KEYS = {"recipe", "image", "python_abi", "cann", "soc", "machine_type"}
-RESOURCE_KEYS = {"devices", "npu_count", "service_port"}
+RESOURCE_KEYS = {"devices", "npu_count", "service_port", "allow_external_busy"}
 TOPOLOGY_KEYS = {"host", "roles", "distinct_hosts"}
-ROLE_KEYS = {"name", "command", "preflight", "devices", "npu_count", "service_port", "host", "env"}
+ROLE_KEYS = {"name", "command", "preflight", "devices", "npu_count", "service_port", "allow_external_busy", "host", "env"}
 
 
 def checked_mapping(value, label, supported):
@@ -73,6 +73,11 @@ def normalize_resources(resources: dict[str, Any] | None) -> dict[str, Any]:
         resources.pop("npu_count")
     if "service_port" in resources and (type(resources["service_port"]) is not int or not 0 <= resources["service_port"] < 65536):
         raise ValueError("service_port must be an integer from 0 to 65535")
+    if "allow_external_busy" in resources:
+        if type(resources["allow_external_busy"]) is not bool:
+            raise ValueError("allow_external_busy must be a boolean")
+        if resources["allow_external_busy"] and len(resources.get("devices", [])) != 1:
+            raise ValueError("allow_external_busy requires exactly one explicit physical device")
     return resources
 
 
@@ -88,7 +93,7 @@ def role_plan(topology: dict[str, Any] | None, resources: dict[str, Any], comman
         item = {"name": "default", "command": command}
         if "host" in topology:
             item["host"] = topology["host"]
-        item.update({k: resources[k] for k in ("devices", "npu_count", "service_port") if k in resources})
+        item.update({k: resources[k] for k in RESOURCE_KEYS if k in resources})
         return [item]
     if not isinstance(topology["roles"], list) or not topology["roles"]:
         raise ValueError("topology.roles must be a nonempty array of role objects")
@@ -113,6 +118,10 @@ def role_plan(topology: dict[str, Any] | None, resources: dict[str, Any], comman
             item.update(normalize_resources({"npu_count": role.get("npu_count", resources.get("npu_count", 0))}))
         else:
             item.update(normalize_resources({"devices": resources["devices"]}))
+        if "allow_external_busy" in role or "allow_external_busy" in resources:
+            requested = {key: item[key] for key in ("devices", "npu_count") if key in item}
+            requested["allow_external_busy"] = role.get("allow_external_busy", resources.get("allow_external_busy"))
+            item.update(normalize_resources(requested))
         if role.get("service_port") is not None:
             item["service_port"] = normalize_resources({"service_port": role["service_port"]})["service_port"]
         elif resources.get("service_port") is not None and len(roles) == 0:

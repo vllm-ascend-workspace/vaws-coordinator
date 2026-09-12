@@ -3,8 +3,9 @@
 
 The coordinator is deliberately advisory.  It gives independent VAWS agents a
 shared queue and lease ledger on one host, but it does not prevent an operator
-or a non-participating process from using an NPU.  Observed hardware occupancy
-always wins over declarations.
+or a non-participating process from using an NPU. Observed occupancy blocks
+admission unless a request explicitly allows external use of one named device.
+Managed leases, holds, owned processes and service ports remain protected.
 
 The module is stdlib-only because the agent-facing wrapper sends this source to
 the bare-metal host and executes it there.  State defaults to
@@ -27,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_STATE_DIR = "/tmp/vaws-npu-coordinator/v1"
 HOST_STATE_DIR_ENV = "VAWS_NPU_COORDINATOR_STATE_DIR"
 DEFAULT_CONTAINER_SSH_PORT_RANGE = "46000:46999"
@@ -109,6 +110,12 @@ def unguarded_cpu_process(row: sqlite3.Row) -> bool:
     """Legacy pid-only CPU activations have no reliable completion evidence."""
     return (int(row['requested_count']) == 0 and not row['process_guard']
             and (row['state'] == 'active' or (row['state'] == 'orphaned_busy' and row['pid'] is not None)))
+
+
+def unguarded_shared_process(row: sqlite3.Row) -> bool:
+    """External occupancy cannot prove that an activated shared job drained."""
+    return (bool(row['allow_external_busy']) and not row['process_guard']
+            and (row['state'] == 'active' or (row['state'] == 'orphaned_busy' and row['started_at'] is not None)))
 
 
 def utc_now_iso(epoch: float | None = None) -> str:
@@ -521,6 +528,7 @@ class NpuCoordinator:
                     container_name TEXT,
                     requested_count INTEGER NOT NULL,
                     requested_devices TEXT,
+                    allow_external_busy INTEGER NOT NULL DEFAULT 0,
                     not_before REAL NOT NULL,
                     latest_start REAL NOT NULL,
                     estimated_duration_seconds INTEGER NOT NULL,
@@ -591,6 +599,7 @@ class NpuCoordinator:
                     if "duplicate column" not in str(exc).lower():
                         raise
             for column, decl in (
+                ("allow_external_busy", "INTEGER NOT NULL DEFAULT 0"),
                 ("requested_service_port", "INTEGER"),
                 ("service_port_choices", "TEXT"),
                 ("granted_service_port", "INTEGER"),
@@ -681,6 +690,7 @@ class NpuCoordinator:
         payload["requested_devices"] = _load_devices(payload.get("requested_devices")) or None
         payload["granted_devices"] = _load_devices(payload.get("granted_devices"))
         payload["preemptible"] = bool(payload.get("preemptible"))
+        payload["allow_external_busy"] = bool(payload.get("allow_external_busy"))
         payload["process_guarded"] = bool(payload.pop("process_guard", None))
         for key in (
             "not_before",
@@ -737,6 +747,11 @@ class NpuCoordinator:
                 raise CoordinationError("npu_count must be a nonnegative integer")
         else:
             count = len(devices)
+        allow_external_busy = request.get("allow_external_busy", False)
+        if type(allow_external_busy) is not bool:
+            raise CoordinationError("allow_external_busy must be a boolean")
+        if allow_external_busy and (devices is None or len(devices) != 1):
+            raise CoordinationError("allow_external_busy requires exactly one explicit physical device")
         requested_service_port = request.get("service_port")
         if requested_service_port is not None:
             requested_service_port = int(requested_service_port)
@@ -775,6 +790,7 @@ class NpuCoordinator:
                     "container_name": container_name,
                     "requested_count": count,
                     "requested_devices": _json_devices(devices),
+                    "allow_external_busy": int(allow_external_busy),
                     "requested_service_port": requested_service_port,
                     "service_port_choices": json.dumps(service_port_choices, separators=(",", ":")) if service_port_choices else None,
                 }
@@ -795,8 +811,9 @@ class NpuCoordinator:
                     task_id, agent_id, agent_alias, session_id, container_name,
                     requested_count, requested_devices, not_before, latest_start,
                     estimated_duration_seconds, preemptible, priority, state,
-                    submitted_at, updated_at, message, requested_service_port, service_port_choices
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                    submitted_at, updated_at, message, requested_service_port, service_port_choices,
+                    allow_external_busy
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -816,9 +833,11 @@ class NpuCoordinator:
                     request.get("message"),
                     requested_service_port,
                     json.dumps(service_port_choices, separators=(",", ":")) if service_port_choices else None,
+                    int(allow_external_busy),
                 ),
             )
-            self._event(connection, "task-submitted", task_id=task_id, data={"count": count}, now=now)
+            self._event(connection, "task-submitted", task_id=task_id,
+                        data={"count": count, "allow_external_busy": allow_external_busy}, now=now)
             row = self._task_row(connection, task_id)
         return {"status": "queued", "reused": False, "task": self._serialize_task(row)}
 
@@ -947,7 +966,8 @@ class NpuCoordinator:
                 busy is None
                 or visible is None
                 or not devices.issubset(visible)
-                or bool(devices & busy)
+                or (bool(devices & busy) and not row["allow_external_busy"])
+                or process_guard_busy(row["process_guard"])
             )
             next_state = "orphaned_busy" if still_busy else "expired"
             message = (
@@ -983,8 +1003,9 @@ class NpuCoordinator:
                 busy is None
                 or visible is None
                 or not devices.issubset(visible)
-                or bool(devices & busy)
+                or (bool(devices & busy) and not row["allow_external_busy"])
                 or unguarded_cpu_process(row)
+                or unguarded_shared_process(row)
                 or process_guard_busy(row["process_guard"])
             )
             next_state = "orphaned_busy" if still_busy else "released"
@@ -1007,11 +1028,13 @@ class NpuCoordinator:
                 # listener is gone. Age and occupancy alone are not enough.
                 if self._task_service_ports(connection, row["task_id"]):
                     continue
-                if (devices.issubset(visible) and not devices.intersection(busy)
-                        and not unguarded_cpu_process(row) and not process_guard_busy(row["process_guard"])):
+                if (devices.issubset(visible) and (not devices.intersection(busy) or row["allow_external_busy"])
+                        and not unguarded_cpu_process(row) and not unguarded_shared_process(row)
+                        and not process_guard_busy(row["process_guard"])):
                     connection.execute(
                         "UPDATE tasks SET state='released', process_guard=NULL, updated_at=?, message=? WHERE task_id=?",
-                        (now, "orphaned task hardware is now free", row["task_id"]),
+                        (now, "orphaned shared task has no pending owned process" if row["allow_external_busy"]
+                         else "orphaned task hardware is now free", row["task_id"]),
                     )
                     changes.append({"task_id": row["task_id"], "from": "orphaned_busy", "to": "released"})
                     self._event(connection, "orphaned-task-released", task_id=row["task_id"], now=now)
@@ -1089,13 +1112,14 @@ class NpuCoordinator:
         exclude_task: str | None,
         start_at: float,
         end_at: float,
+        allow_external_busy: bool = False,
     ) -> list[int]:
         busy = self._busy_set(observed) or set()
         reserved = self._reserved_devices(connection, exclude_task=exclude_task)
         available: list[int] = []
         for device in observed.get("devices", []):
             device = int(device)
-            if device in busy or device in reserved:
+            if (device in busy and not allow_external_busy) or device in reserved:
                 continue
             if self._hold_conflicts(connection, device=device, start_at=start_at, end_at=end_at):
                 continue
@@ -1341,6 +1365,7 @@ class NpuCoordinator:
                 exclude_task=task_id,
                 start_at=now,
                 end_at=estimated_end,
+                allow_external_busy=bool(row["allow_external_busy"]),
             ) if int(row["requested_count"]) else set()
             requested = _load_devices(row["requested_devices"])
             selected, missing = self._select_granted_devices(
@@ -1443,7 +1468,14 @@ class NpuCoordinator:
             if row["state"] != "granted":
                 raise CoordinationError(f"task {task_id} is {row['state']}, expected granted")
             devices = _load_devices(row["granted_devices"])
-            conflicts = sorted((set(devices) & busy) | (set(devices) - visible))
+            if row["allow_external_busy"]:
+                available = self._available_devices(
+                    connection, observed, exclude_task=task_id, start_at=now,
+                    end_at=now + int(row["estimated_duration_seconds"]), allow_external_busy=True,
+                )
+                conflicts = sorted(set(devices) - set(available))
+            else:
+                conflicts = sorted((set(devices) & busy) | (set(devices) - visible))
             if conflicts:
                 next_state = "queued" if float(row["latest_start"]) > now else "expired"
                 connection.execute(
@@ -1520,6 +1552,8 @@ class NpuCoordinator:
                 raise CoordinationError(f"task {task_id} is {row['state']}, expected starting")
             if int(row['requested_count']) == 0 and process_guard is None:
                 raise CoordinationError('CPU task activation requires a valid process_guard; a PID alone cannot prove process completion')
+            if row['allow_external_busy'] and (process_guard is None or process_guard.get('retain_until_release') is not True):
+                raise CoordinationError('shared NPU activation requires a managed process_guard retained until confirmed completion')
             if row["activation_deadline"] is not None and float(row["activation_deadline"]) <= now:
                 raise CoordinationError(f"activation deadline elapsed for task {task_id}")
             expected_end = now + int(row["estimated_duration_seconds"])
@@ -1582,12 +1616,13 @@ class NpuCoordinator:
             self._check_token(row, token)
             devices = set(_load_devices(row["granted_devices"]))
             conflicts = (
-                sorted((devices & busy) | (devices - visible))
+                sorted((set() if row["allow_external_busy"] else devices & busy) | (devices - visible))
                 if busy is not None and visible is not None
                 else sorted(devices)
             )
             busy_ports = self._service_ports_busy(connection, task_id, listening)
             if ((devices and (busy is None or visible is None or conflicts)) or busy_ports or unguarded_cpu_process(row)
+                    or unguarded_shared_process(row)
                     or process_guard_busy(row["process_guard"], completion_confirmed=completion_confirmed)):
                 connection.execute(
                     "UPDATE tasks SET state='orphaned_busy', updated_at=?, message=? WHERE task_id=?",
@@ -1607,7 +1642,8 @@ class NpuCoordinator:
             self._clear_service_ports(connection, task_id)
             connection.execute(
                 "UPDATE tasks SET state='released', process_guard=NULL, updated_at=?, message=? WHERE task_id=?",
-                (now, "requested resources are free; cooperative lease released", task_id),
+                (now, "owned process and ports are clear; shared lease released" if row["allow_external_busy"]
+                 else "requested resources are free; cooperative lease released", task_id),
             )
             self._event(connection, "task-released", task_id=task_id, now=now)
             row = self._task_row(connection, task_id)
@@ -1636,11 +1672,12 @@ class NpuCoordinator:
                         busy is None
                         or visible is None
                         or not devices.issubset(visible)
-                        or bool(devices & busy)
+                        or (bool(devices & busy) and not row["allow_external_busy"])
                     )
                 )
                 or bool(busy_ports)
                 or unguarded_cpu_process(row)
+                or unguarded_shared_process(row)
                 or process_guard_busy(row["process_guard"])
             )
             next_state = "orphaned_busy" if still_busy else "cancelled"

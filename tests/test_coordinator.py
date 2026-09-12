@@ -599,6 +599,25 @@ class PoolTests(unittest.TestCase):
         self.assertTrue(manifest["resources"]["released"])
         self.assertEqual(manifest["process"]["result"]["exit_code"], 0)
 
+    def test_explicit_shared_job_finishes_while_external_worker_remains_busy(self):
+        binding = self.bind("alice", self.root / "a")
+        self.backend.busy = [0]
+        job = self.pool.managed_start("alice", binding["id"], "shared",
+                                      {"vllm": "a" * 40, "vllm-ascend": "b" * 40},
+                                      "native-a", [0], 0, "exec python task.py", {}, 60,
+                                      allow_external_busy=True)
+        self.assertEqual((job["state"], job["lease_state"]), ("running", "active"))
+        self.assertEqual(job["launch_observation"]["npu_devices"], [0])
+        self.assertTrue(job["launch_observation"]["allow_external_busy"])
+        self.backend.jobs[job["job_id"]].update(state="succeeded", quiet=True, result={"state": "succeeded", "exit_code": 0})
+        result = self.pool.managed_control("alice", job["id"])
+        self.assertEqual((result["state"], result["lease_state"]), ("succeeded", "released"))
+        self.assertEqual(self.backend.busy, [0])
+        self.assertNotIn(("job", "stop"), self.backend.calls)
+        record = json.loads((self.root / "manager/runs" / (job["id"] + ".json")).read_text())
+        self.assertTrue(record["resources"]["released"])
+        self.assertTrue(record["resources"]["allow_external_busy"])
+
     def test_orphaned_busy_recovers_via_heartbeat_without_stopping_live_family(self):
         binding = self.bind("alice", self.root / "a")
         job = self.managed("alice", binding)
@@ -1071,6 +1090,28 @@ class TaskClientTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_explicit_shared_device_reaches_host_and_stop_preserves_external_and_peer_work(self):
+        self.backend.busy = [0]
+        shared = self.client.run("serve-shared", sources={}, topology={"host": "192.0.2.1"},
+                                 resources={"devices": [0], "allow_external_busy": True, "service_port": 0})
+        self.assertEqual(shared["state"], "running", shared)
+        self.assertEqual(shared["target"]["environment"]["ASCEND_RT_VISIBLE_DEVICES"], "0")
+        self.assertTrue(shared["target"]["allow_external_busy"])
+        self.assertTrue(shared["target"]["launch_observation"]["allow_external_busy"])
+        self.assertTrue(shared["assignment"]["roles"][0]["allow_external_busy"])
+        with self.pool.transaction() as db:
+            run = self.pool.rows(db, "run")[0]
+        self.assertTrue(run["intent"]["allow_external_busy"])
+        self.assertEqual(run["task"]["requested_count"], 1)
+        peer = self.client.run("serve-peer", sources={}, resources={"devices": [1]})
+        self.assertEqual(peer["state"], "running", peer)
+        stopped = self.client.observe(shared["execution_id"], "stop")
+        self.assertEqual(stopped["state"], "cancelled")
+        self.assertTrue(stopped["resources_released"])
+        self.assertEqual(self.backend.busy, [0])
+        self.assertEqual(self.client.observe(peer["execution_id"])["state"], "running")
+        self.assertEqual(self.backend.calls.count(("job", "stop")), 1)
 
     def test_completed_preparation_failure_is_terminal_without_repeating_work(self):
         from vaws_coordinator.parity_support import RemoteCommandError

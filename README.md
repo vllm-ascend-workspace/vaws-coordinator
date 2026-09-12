@@ -58,6 +58,18 @@ execution has its own work directory, while compatible prepared artifacts can
 be reused. Independent host preparations run concurrently, bounded to four
 workers and one active preparation per host.
 
+To share one explicitly selected physical NPU with existing external workers,
+pass `resources={"devices": [0], "allow_external_busy": True}` to `client.run`
+or `vaws_run`. Use `topology={"host": "selected-host"}` to bind the host too.
+The option is fixed at admission and requires exactly one explicit device;
+omitting it keeps the normal occupancy checks. It permits observed external
+process/HBM use, without estimating or reserving free memory. Other coordinator
+leases and holds still conflict, and unknown or missing hardware is not usable.
+The managed supervisor must retain its own process guard until completion.
+Stop/finish only terminates this execution's family and releases its lease once
+that family has drained and its ports are clear; existing workers remain running.
+The assignment, launch observation and execution target expose the sharing flag.
+
 `run(..., service="model")` ensures identical fixed sources and configuration.
 Changed inputs report the differing fields; `restart=True` replaces the service
 only after the old execution has stopped and released resources. Connecting

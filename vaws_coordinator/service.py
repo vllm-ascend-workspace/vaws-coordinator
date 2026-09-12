@@ -529,6 +529,7 @@ class CoordinatorService:
                                   "binding": binding, "npu_count": role.get("npu_count"),
                                   "devices": role.get("devices") or [],
                                   "service_port": role.get("service_port"),
+                                  **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
                                   "env": dict(role.get("env") or {})})
                 prepared_snapshots = placed.get("snapshots") or {}
                 if runtime_id in prepared_snapshots:
@@ -598,6 +599,7 @@ class CoordinatorService:
                 role.get("devices") or [], role.get("npu_count") or 0,
                 role["command"], merged_env, spec.get("timeout_seconds"),
                 service_port=role.get("service_port"), hold_go=hold_go,
+                **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
             )
             with self._lock_for("progress", row["id"]):
                 role["managed_job"] = job["id"]
@@ -1006,6 +1008,7 @@ class CoordinatorService:
                     "root": role["binding"]["endpoint"]["cwd"],
                     "rank": index,
                     "devices": devices,
+                    **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
                     "service_port": job.get("service_port"),
                     "state": job["state"],
                 })
@@ -1049,6 +1052,7 @@ class CoordinatorService:
             "state": job.get("state") or row.get("phase"),
             "runtime_id": role.get("runtime_id"),
             "service_port": job.get("service_port") if job.get("service_port") is not None else role.get("service_port"),
+            **({"allow_external_busy": True} if role.get("allow_external_busy") else {}),
             "host": endpoint.get("host"),
             "root": endpoint.get("cwd") or endpoint.get("root"),
             "endpoint": endpoint or None,
@@ -1179,6 +1183,7 @@ class CoordinatorService:
             "launch_env": binding.get("launch_env") or {},
             "launch_preamble": binding.get("launch_preamble") or "",
             "launch_observation": launch_observation,
+            **({"allow_external_busy": True} if (job or {}).get("request", {}).get("allow_external_busy") else {}),
             "environment": environment, "service_port": service_port,
             "state": state, "live": state in LIVE,
             "assignment": row.get("assignment"),
