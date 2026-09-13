@@ -68,6 +68,8 @@ Agents do not call a session-creation tool. Hook-discovered source
 defaults belong to that native attachment, using its actual cwd. Resume or
 handoff refreshes that attachment's cwd and automatic sources while preserving
 the native task identity. Sibling attachments do not overwrite one another.
+Claude also refreshes on the next pre-tool event with a native cwd, so entering
+a worktree during one prompt does not leave later calls bound to its old cwd.
 Explicit task source defaults override automatic sources, including an explicit
 empty map. Changing either default affects future submissions only.
 
@@ -80,7 +82,12 @@ hooks observe the client-selected workspace. They do not create a worktree or
 change the parent client's cwd before its first tool call.
 
 Supported pre-tool hooks inject the attachment context into VAWS MCP calls,
-including `vaws_message`. Cursor's `sessionStart` runs asynchronously, so its
+including `vaws_message` and provider-qualified `vaws-knowledge` / `remote-dev`
+companion tools. Cursor's native MCP dispatcher resolves bare `MCP:knowledge_*`
+and `MCP:remote_*` names through its configured providers; other clients require
+the provider-qualified name. Client wiring owns workspace/component preparation and
+consumption of this context; the hook reports its current source defaults.
+Cursor's `sessionStart` runs asynchronously, so its
 first VAWS `preToolUse` can attach the same stable conversation ID idempotently
 before supplying `updated_input`. Other tool calls do not trigger this fallback.
 See the [Cursor hook contract](https://cursor.com/docs/hooks#pretooluse).
@@ -116,8 +123,9 @@ requires `restart=True` and confirmed old-process cleanup. An execution/service
 reference connects to the original execution without rereading local sources.
 
 **Stop or finish.** Stop only this execution's managed process family, including
-children. Confirm it is terminal, its assigned devices are observable and free,
-and its service ports are no longer listening before releasing its resources.
+children. Confirm it is terminal and its service ports are no longer listening
+before releasing its resources. Strict leases also require their assigned
+devices to be observable and free.
 An execution admitted with `resources.allow_external_busy=true` on one explicit
 physical device may leave external NPU users running. It releases only its own
 lease after managed descendant completion and port checks; external occupancy

@@ -273,8 +273,11 @@ def test_cursor_shell_first_call_and_hook_share_exact_native_context(native_env,
     assert len(store.sessions()) == 1
 
 
-def test_existing_user_container_needs_no_image_selection():
+def test_existing_user_container_needs_no_image_selection(monkeypatch):
+    from vaws_coordinator import provision
     from vaws_coordinator.service import CoordinatorService
+    verify = Mock(side_effect=AssertionError("implicit image must keep the existing hot path"))
+    monkeypatch.setattr(provision, "provision_user_container", verify)
     service = object.__new__(CoordinatorService)
     service.backend = Mock()
     record = {"host": {"ip": "192.0.2.10", "machine_type": "A3"},
@@ -290,3 +293,94 @@ def test_existing_user_container_needs_no_image_selection():
     record["container"] = {}
     assert service._ensure_user_container("alice", {}, {}, set()) is None
     service.backend.host.assert_not_called()
+    verify.assert_not_called()
+
+
+@pytest.mark.parametrize("image", ["registry.example/ascend:v1.2.3", "registry.example/ascend@sha256:" + "a" * 64])
+def test_first_run_can_provision_an_explicit_fixed_image(image, monkeypatch):
+    from vaws_coordinator import provision
+    from vaws_coordinator.service import CoordinatorService
+    service = object.__new__(CoordinatorService)
+    service.backend = Mock()
+    record = {"host": {"ip": "192.0.2.10", "machine_type": "A3"},
+              "container": {"name": "vaws-donor", "ssh_port": 2201}, "user": "donor"}
+    service._configured_machines = lambda: [record]
+    create = Mock(return_value={"ssh_port": 2202})
+    monkeypatch.setattr(provision, "provision_user_container", create)
+    donor = service._ensure_user_container("recipient", {"image": image}, {"host": "192.0.2.10"}, set())
+    assert donor["recipe"] == image
+    assert donor["container_name"] == "vaws-recipient"
+    assert donor["ssh_port"] == 2202
+    assert create.call_args.kwargs["image"] == image
+    assert create.call_args.kwargs["user"] == "recipient"
+    assert record["container"]["name"] == "vaws-donor"
+
+
+@pytest.mark.parametrize("image", ["typo", "registry.example/ascend", "registry.example/ascend:latest", "auto"])
+def test_first_run_does_not_provision_implicit_or_unsupported_images(image, monkeypatch):
+    from vaws_coordinator import provision
+    from vaws_coordinator.service import CoordinatorService
+    service = object.__new__(CoordinatorService)
+    service.backend = Mock()
+    service._configured_machines = lambda: [{"host": {"ip": "192.0.2.10"}}]
+    create = Mock()
+    monkeypatch.setattr(provision, "provision_user_container", create)
+    assert service._ensure_user_container("recipient", {"image": image}, {}, set()) is None
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize("selector", ["image", "recipe"])
+@pytest.mark.parametrize("image", ["registry.example/ascend:v1.2.3", "registry.example/ascend@sha256:" + "a" * 64])
+def test_existing_user_container_verifies_explicit_image_before_returning_donor(selector, image, monkeypatch):
+    from vaws_coordinator import provision
+    from vaws_coordinator.service import CoordinatorService
+    service = object.__new__(CoordinatorService)
+    service.backend = Mock()
+    record = {"host": {"ip": "192.0.2.10", "machine_type": "A3"},
+              "container": {"name": "vaws-alice", "ssh_port": 2201}, "user": "alice"}
+    service._configured_machines = lambda: [record]
+    verify = Mock(return_value={"ssh_port": 2201})
+    monkeypatch.setattr(provision, "provision_user_container", verify)
+    donor = service._ensure_user_container("alice", {selector: image}, {}, set())
+    assert donor["recipe"] == image and donor["ssh_port"] == 2201
+    verify.assert_called_once()
+    assert verify.call_args.kwargs["image"] == image
+    assert verify.call_args.kwargs["ssh_port"] == 2201
+    assert verify.call_args.kwargs["user"] == "alice"
+    # The provision owner reserves its validated container's port itself.
+    service.backend.host.assert_not_called()
+
+
+def test_existing_container_image_mismatch_cannot_be_relabelled_as_requested_image(monkeypatch):
+    from vaws_coordinator import provision
+    from vaws_coordinator.provision import existing_container
+    from vaws_coordinator.provision.host_ops import MachineManagementError, RemoteResult, SshTarget
+    from vaws_coordinator.service import CoordinatorService
+    service = object.__new__(CoordinatorService)
+    service.backend = Mock()
+    service.backend.host.return_value = {"port": 2201}
+    record = {"host": {"ip": "192.0.2.10"},
+              "container": {"name": "vaws-alice", "ssh_port": 2201}, "user": "alice",
+              "image": {"requested": "registry.example/ascend:old"}}
+    service._configured_machines = lambda: [record]
+    monkeypatch.setattr(existing_container, 'observe_existing', lambda *a, **k: {'status': 'unknown'})
+    target = SshTarget(host="192.0.2.10", user="root", port=22)
+    remote = Mock(side_effect=[
+        RemoteResult(target, 0, "", "", {"success": True, "suggested_port": 2299}),
+        RemoteResult(target, 21, "", "", {"success": False,
+                     "error": "existing container image does not match the requested selector"}),
+    ])
+    monkeypatch.setattr(provision.host_ops, "run_remote_script", remote)
+    monkeypatch.setattr(provision.host_ops, "find_public_key", lambda _: "unused-fixture-key")
+    monkeypatch.setattr(provision.host_ops, "load_public_key", lambda _: "ssh-ed25519 test")
+    with pytest.raises(MachineManagementError, match="existing container image does not match"):
+        service._ensure_user_container("alice", {"image": "registry.example/ascend:new"}, {}, set())
+    assert record["image"]["requested"] == "registry.example/ascend:old"
+    assert record["container"] == {"name": "vaws-alice", "ssh_port": 2201}
+    # Exercise the real provision owner: mismatch fails before smoke/upsert,
+    # and the bootstrap is explicitly forbidden to replace an existing image.
+    assert remote.call_count == 2
+    bootstrap = remote.call_args_list[1]
+    assert bootstrap.kwargs["args"][0:2] == ["vaws-alice", "2201"]
+    assert bootstrap.kwargs["args"][6] == "false"
+    service.backend.machines.upsert_machine.assert_not_called()

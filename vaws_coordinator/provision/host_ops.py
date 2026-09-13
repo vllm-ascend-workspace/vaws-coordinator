@@ -939,6 +939,7 @@ def run_remote_script(
     batch_mode: bool = True,
     timeout_seconds: int | None = None,
     stream_progress: bool = True,
+    reuse_connection: bool = False,
 ) -> RemoteResult:
     if not batch_mode:
         raise MachineManagementError(
@@ -963,13 +964,28 @@ def run_remote_script(
                 emit_progress_event(event, target=target)
 
     try:
-        completed = run_stream(
-            endpoint,
-            remote_script,
-            timeout_ms=timeout_ms,
-            merge_stderr=False,
-            on_output=on_output,
-        )
+        if reuse_connection:
+            # Bounded package-owned probes use the same connection as managed
+            # preparation. Long bootstrap/install commands retain streaming.
+            from remote_dev.core.ssh_transport import run_rpc_script
+            endpoint = resolve_endpoint({'host': target.host, 'port': int(target.port),
+                                         'user': target.user, 'root': '/', 'cwd': '/'})
+            completed = run_rpc_script(endpoint, remote_script, timeout_ms=timeout_ms)
+            if completed.cancelled:
+                raise MachineManagementError('provision probe cancelled; no fallback command was sent')
+            if completed.returncode is None and not completed.timed_out:
+                raise MachineManagementError('provision probe outcome is unknown; no fallback command was sent')
+            for channel in ('stdout', 'stderr'):
+                for line in (getattr(completed, channel) or '').splitlines(keepends=True):
+                    on_output(channel, line)
+        else:
+            completed = run_stream(
+                endpoint,
+                remote_script,
+                timeout_ms=timeout_ms,
+                merge_stderr=False,
+                on_output=on_output,
+            )
     except FileNotFoundError as exc:
         raise MachineManagementError("required local command not found: ssh") from exc
 
@@ -2512,7 +2528,7 @@ emit_json "$payload"
     )
 
 
-def render_smoke_script() -> str:
+def render_smoke_script(*, device_test: bool = True) -> str:
     template = r"""#!/usr/bin/env bash
 set -euo pipefail
 requested_python="${1:-}"
@@ -2609,6 +2625,18 @@ result = {
     "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
     "sourced_scripts": [line for line in sourced_text.splitlines() if line],
 }
+if not __DEVICE_TEST__:
+    # Provisioning has no device grant. Verify the interpreter's package
+    # metadata only; native imports and business execution have later owners.
+    import importlib.metadata
+    try:
+        result.update(success=True, device_test=False,
+                      torch_version=importlib.metadata.version('torch'),
+                      torch_npu_version=importlib.metadata.version('torch-npu'))
+    except importlib.metadata.PackageNotFoundError as exc:
+        result.update(success=False, device_test=False, error=str(exc))
+    print("__SENTINEL__" + json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0 if result["success"] else 3)
 try:
     progress("smoke", "importing torch and torch_npu")
     import torch
@@ -2642,7 +2670,7 @@ print("__SENTINEL__" + json.dumps(result, ensure_ascii=False))
 raise SystemExit(0 if result["success"] else 3)
 PY
 """
-    return template.replace("__SENTINEL__", SENTINEL).replace(
+    return template.replace("__DEVICE_TEST__", repr(device_test)).replace("__SENTINEL__", SENTINEL).replace(
         "__PROGRESS__", PROGRESS_SENTINEL
     )
 

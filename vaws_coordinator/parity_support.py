@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from vaws_coordinator.shared_source_objects import copy_fixed_objects
+
 WORKSPACE_ID_PATTERN = re.compile(r'[^A-Za-z0-9._-]+')
 STATE_SUBDIR = Path('.vaws-local/remote-code-parity')
 DEFAULT_DENYLIST = (
@@ -403,6 +405,7 @@ def _materialize_fixed(request):
     transfer requests. Only initialization and one root's checkout are locked;
     both locks are released by the OS when this process dies.
     """
+    import base64
     import contextlib
     import fcntl
     import hashlib
@@ -410,6 +413,7 @@ def _materialize_fixed(request):
     import os
     from pathlib import Path
     import subprocess
+    import sys
     import tempfile
 
     def git(path, *args, check=True):
@@ -452,9 +456,70 @@ def _materialize_fixed(request):
                 git(mirror.parent, 'init', '--bare', str(mirror))
             if git(mirror, 'rev-parse', '--is-bare-repository').stdout.strip() != 'true':
                 raise ValueError(f'expected a bare mirror: {mirror}')
+            pack = request.get('inline_packs', {}).get(str(index))
+            if pack is not None:
+                data = base64.b64decode(pack['data'], validate=True)
+                if (len(data) > 65536 or len(data) != pack['bytes']
+                        or hashlib.sha256(data).hexdigest() != pack['sha256']):
+                    raise ValueError('fixed source pack size or digest differs')
+                if git(mirror, 'cat-file', '-e', pack['previous'] + '^{commit}', check=False).returncode:
+                    raise ValueError('fixed source pack prerequisite disappeared')
+                received = subprocess.run(['git', '-C', str(mirror), 'index-pack', '--stdin'],
+                                          input=data, capture_output=True)
+                if received.returncode:
+                    raise ValueError('fixed source pack rejected: ' + received.stderr.decode(errors='replace'))
+                if git(mirror, 'rev-parse', row['commit'] + '^{tree}').stdout.strip() != row['tree']:
+                    raise ValueError('fixed source pack has the wrong tree')
+                git(mirror, 'cat-file', '-e', pack['carrier'] + '^{commit}')
+                # Match atomic Git push semantics. Every accepted snapshot has
+                # its own immutable pin even if concurrent carriers advance.
+                refs = ('start\nupdate refs/vaws/snapshots/' + row['commit'] + ' ' + row['commit']
+                        + '\nupdate ' + request['carrier_ref'] + ' ' + pack['carrier'] + '\nprepare\ncommit\n')
+                updated = subprocess.run(['git', '-C', str(mirror), 'update-ref', '--stdin'],
+                                         input=refs, text=True, capture_output=True)
+                if updated.returncode:
+                    raise ValueError('fixed source refs rejected: ' + updated.stderr)
         tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}', check=False)
+        shared = row.get('shared_mirror')
+        if tree.returncode and shared:
+            try:
+                if copy_fixed_objects(shared, mirror, row):
+                    tree = git(mirror, 'rev-parse', '--verify', row['commit'] + '^{tree}')
+            except (OSError, ValueError, RuntimeError) as exc:
+                # These are completed local errors, not subprocess timeouts or
+                # cancellation. The exact private input is still missing.
+                print(f'shared source candidate unavailable: {exc}', file=sys.stderr, flush=True)
         if tree.returncode:
             carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
+            local_bases = row.get('local_bases', [])
+            if (shared and local_bases and
+                    (carrier.returncode or carrier.stdout.strip() not in local_bases)):
+                try:
+                    # Only a snapshot available on both sides is useful for
+                    # bounded delta packing. Cache recency cannot prove local
+                    # membership, especially for independent tree snapshots.
+                    hints = (git(shared, 'for-each-ref', '--format=%(objectname) %(refname)',
+                                 *['refs/vaws/snapshots/' + oid for oid in local_bases])
+                            if Path(shared).is_dir() else None)
+                    available = set()
+                    for line in hints.stdout.splitlines() if hints else []:
+                        parts = line.split()
+                        if len(parts) == 2 and parts[1] == 'refs/vaws/snapshots/' + parts[0]:
+                            available.add(parts[0])
+                    for oid in local_bases:
+                        if oid not in available:
+                            continue
+                        try:
+                            base = {'commit': oid, 'tree': git(shared, 'rev-parse', oid + '^{tree}').stdout.strip()}
+                            if copy_fixed_objects(shared, mirror, base):
+                                previous = carrier.stdout.strip() if not carrier.returncode else '0' * len(oid)
+                                git(mirror, 'update-ref', request['carrier_ref'], oid, previous, check=False)
+                                carrier = git(mirror, 'rev-parse', '--verify', request['carrier_ref'], check=False)
+                                break
+                        except (OSError, ValueError, RuntimeError) as exc:
+                            print(f'shared source negotiation base unavailable: {exc}', file=sys.stderr, flush=True)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f'shared source negotiation base unavailable: {exc}', file=sys.stderr, flush=True)
             missing.append({'index': index, 'carrier': carrier.stdout.strip() if not carrier.returncode else None})
             continue
         if tree.stdout.strip() != row['tree']:
@@ -464,6 +529,20 @@ def _materialize_fixed(request):
         pinned = git(mirror, 'rev-parse', '--verify', fixed_ref, check=False)
         if pinned.returncode or pinned.stdout.strip() != row['commit']:
             git(mirror, 'update-ref', fixed_ref, row['commit'])
+        if shared:
+            # Publish immutable objects only. The shared mirror never replaces
+            # this owner's refs/objects or becomes a live alternate dependency.
+            try:
+                copy_fixed_objects(mirror, shared, row)
+            except (OSError, ValueError, RuntimeError) as exc:
+                # Cache publication cannot gate a valid private snapshot.
+                # Its checkout and complete source validation still run below.
+                print(f'shared source publication unavailable: {exc}', file=sys.stderr, flush=True)
+            # A shared hit also provides this owner's first negotiation base.
+            # Create only; concurrent work may already have advanced its ref.
+            # Neither this mutable hint nor any shared ref selects a checkout.
+            git(mirror, 'update-ref', request['carrier_ref'], row['commit'],
+                '0' * len(row['commit']), check=False)
     if missing:
         return {'status': 'missing', 'missing': missing}
 

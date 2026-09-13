@@ -1,6 +1,6 @@
 """Real local Git peers run the exact remote program without SSH or devices."""
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -62,13 +62,301 @@ def peer(tmp_path, monkeypatch):
     monkeypatch.setattr(parity, 'git', transfer)
     monkeypatch.setattr(parity, 'git_remote_url', lambda endpoint, mirror: mirror)
     monkeypatch.setattr(parity, 'git_ssh_environment', lambda endpoint: os.environ.copy())
-    def run(records=None, root='runtime'):
-        return parity.materialize_fixed_sources(workspace_id='test',
+    def run(records=None, root='runtime', *, owner='test', shared_cache=None, host=None):
+        return parity.materialize_fixed_sources(workspace_id=owner,
             endpoint={'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': str(tmp_path / root)},
             source_snapshot=snapshot(records or [make_record(source, 'project')]),
-            container_cache_root=str(tmp_path / 'cache'))
+            container_cache_root=str(tmp_path / 'cache'), shared_cache_root=shared_cache,
+            host_endpoint=host)
     return SimpleNamespace(source=source, commands=commands, transfers=transfers, run=run, stream=stream,
                            cache=tmp_path / 'cache', root=tmp_path / 'runtime')
+
+
+def test_shared_hit_copies_only_exact_objects_to_private_owner(peer, tmp_path):
+    record = make_record(peer.source, 'project')
+    shared = str(tmp_path / 'shared')
+    peer.run([record], shared_cache=shared)
+    original_mirror = parity.mirror_path_for(str(peer.cache), 'test', record)
+    original_refs = git(original_mirror, 'show-ref')
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run([record], root='other-root', owner='other-owner', shared_cache=shared)
+    assert len(peer.commands) == 1 and not peer.transfers
+    private = Path(parity.mirror_path_for(str(peer.cache), 'other-owner', record))
+    assert git(original_mirror, 'show-ref') == original_refs
+    assert set(git(private, 'for-each-ref', '--format=%(refname)').splitlines()) == {
+        'refs/vaws/snapshots/' + record.commit, 'refs/parity/other-owner/transport-carrier'}
+    assert git(Path(shared) / 'project.git', 'for-each-ref', '--format=%(refname)') == 'refs/vaws/snapshots/' + record.commit
+    assert not (private / 'objects/info/alternates').exists()
+    # Clearing a shared cache cannot change an already admitted private tree.
+    import shutil
+    shutil.rmtree(shared)
+    assert git(private, 'cat-file', '-p', record.commit + ':model.py') == 'value = 1'
+    assert git(peer.root.parent / 'other-root/project', 'show', 'HEAD:model.py') == 'value = 1'
+
+
+def test_cold_owner_automatically_exports_legacy_exact_objects(peer, tmp_path, monkeypatch):
+    from vaws_coordinator.shared_source_objects import export_container_objects
+    record = make_record(peer.source, 'project')
+    peer.run([record])  # Historical private mirror, no prior shared publication.
+    shared = str(tmp_path / 'shared')
+    calls = []
+    def export(host, rows, cache):
+        calls.append(rows)
+        result = export_container_objects({'records': rows, 'legacy_cache': cache})
+        return {'status': 'copied', **result}
+    monkeypatch.setattr(parity, '_export_existing_source_objects', export)
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run([record], root='cold-owner', owner='cold', shared_cache=shared, host={'host': 'fixture'})
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert len(calls) == 1 and [r['commit'] for r in calls[0]] == [record.commit]
+    # Its next Python edit uses the imported exact snapshot as a delta base,
+    # with no repeated host discovery and no full Git upload.
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'next Python edit')
+    peer.commands.clear()
+    peer.run([make_record(peer.source, 'project')], root='cold-edit', owner='cold',
+             shared_cache=shared, host={'host': 'fixture'})
+    assert len(calls) == 1 and len(peer.commands) == 2 and not peer.transfers
+
+
+def test_cold_owner_small_edit_uses_shared_fixed_base_without_full_push(peer, tmp_path, monkeypatch):
+    first = make_record(peer.source, 'project')
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'new recipient edit')
+    second = make_record(peer.source, 'project')
+    def unexpected_discovery(*args):
+        pytest.fail('shared fixed base should avoid host discovery')
+    monkeypatch.setattr(parity, '_export_existing_source_objects', unexpected_discovery)
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([second], root='new-owner-edit', owner='other', shared_cache=shared,
+                      host={'host': 'fixture'})
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert result['commits'] == {'project': second.commit}
+    assert (peer.root.parent / 'new-owner-edit/project/model.py').read_text() == 'value = 2\n'
+    assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
+    private = parity.mirror_path_for(str(peer.cache), 'other', second)
+    assert git(private, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+
+
+@pytest.mark.parametrize('foreign_snapshot', [False, True])
+def test_disconnected_snapshots_pack_only_the_cpp_edit_for_a_new_owner(peer, tmp_path, monkeypatch,
+                                                                     foreign_snapshot):
+    import random
+    # Unchanged data must exceed the inline limit. A tiny repository can send
+    # its entire tree and accidentally make the delta test appear successful.
+    (peer.source / 'unchanged.bin').write_bytes(random.Random(17).randbytes(256 * 1024))
+    cpp = peer.source / 'operator.cpp'
+    cpp.write_text('int Operator(int input) { return input + 1; }\n')
+    git(peer.source, 'add', '.')
+    git(peer.source, 'commit', '-qm', 'baseline input')
+    def fixed_record():
+        record = make_record(peer.source, 'project')
+        commit = subprocess.check_output(['git', '-C', str(peer.source), 'commit-tree', record.tree,
+            '-m', 'fixed tree snapshot'], text=True,
+            env={**os.environ, 'GIT_AUTHOR_DATE': '1970-01-01T00:00:00Z',
+                 'GIT_COMMITTER_DATE': '1970-01-01T00:00:00Z'}).strip()
+        assert 'parent ' not in git(peer.source, 'cat-file', '-p', commit)
+        return replace(record, commit=commit, ref='refs/inputs/' + commit)
+    first = fixed_record()
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    donor = parity.mirror_path_for(str(peer.cache), 'test', first)
+    donor_refs = git(donor, 'show-ref')
+    if foreign_snapshot:
+        from vaws_coordinator.shared_source_objects import copy_fixed_objects
+        foreign = tmp_path / 'independent-source'
+        git(tmp_path, 'clone', '--local', str(peer.source), str(foreign))
+        (foreign / 'marker.py').write_text("marker = 'another source copy'\n")
+        git(foreign, 'add', '.')
+        foreign_tree = git(foreign, 'write-tree')
+        unknown = subprocess.check_output(['git', '-C', str(foreign), 'commit-tree', foreign_tree,
+            '-m', 'independent parentless marker'], text=True,
+            env={**os.environ, 'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.invalid',
+                 'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.invalid',
+                 'GIT_AUTHOR_DATE': '1970-01-01T00:00:01Z',
+                 'GIT_COMMITTER_DATE': '1970-01-01T00:00:01Z'}).strip()
+        copy_fixed_objects(foreign, Path(shared) / 'project.git', {'commit': unknown, 'tree': foreign_tree})
+        assert 'parent ' not in git(foreign, 'cat-file', '-p', unknown)
+        assert parity.git(peer.source, ['cat-file', '-e', unknown], check=False).returncode
+        assert git(Path(shared) / 'project.git', 'for-each-ref', '--count=1', '--sort=-creatordate',
+                   '--format=%(objectname)', 'refs/vaws/snapshots/') == unknown
+        # Keep the older fixed input ref, without a local transport association
+        # for this recipient. A different source copy must not hide that base.
+        git(peer.source, 'update-ref', 'refs/vaws/inputs/old-source/project', first.commit)
+        for ref in git(peer.source, 'for-each-ref', '--format=%(refname)', 'refs/parity-transport').splitlines():
+            git(peer.source, 'update-ref', '-d', ref)
+    cpp.write_text('int Operator(int recipient_op) { return recipient_op + 1; }\n')
+    git(peer.source, 'commit', '-am', 'one operator variable edit')
+    second = fixed_record()
+    assert first.commit in parity._local_snapshot_bases(second)
+    assert parity._fixed_inline_pack(peer.source, second.commit, second.commit, first.commit) is None
+    packs = []
+    original = parity._fixed_inline_pack
+    def capture(*args, **kwargs):
+        pack = original(*args, **kwargs)
+        packs.append(pack)
+        return pack
+    monkeypatch.setattr(parity, '_fixed_inline_pack', capture)
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([second], root='new-owner', owner='recipient', shared_cache=shared)
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert len(packs) == 1 and packs[0]['bytes'] < 16 * 1024
+    carrier = packs[0]['carrier']
+    assert git(peer.source, 'rev-parse', carrier + '^') == first.commit
+    assert git(peer.source, 'rev-parse', carrier + '^{tree}') == second.tree
+    assert carrier != second.commit
+    assert result['commits'] == {'project': second.commit}
+    assert git(peer.root.parent / 'new-owner/project', 'rev-parse', 'HEAD') == second.commit
+    assert git(donor, 'show-ref') == donor_refs
+
+
+def test_unknown_local_shared_base_keeps_normal_git_fallback(peer, tmp_path):
+    first = make_record(peer.source, 'project')
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    # A different local history cannot construct an inline pack excluding the
+    # shared SHA, even though its private remote now has that negotiation base.
+    unrelated = tmp_path / 'unrelated'
+    unrelated.mkdir()
+    git(unrelated, 'init', '-q')
+    git(unrelated, 'config', 'user.name', 'Test')
+    git(unrelated, 'config', 'user.email', 'test@example.invalid')
+    (unrelated / 'model.py').write_text('different admitted input\n')
+    git(unrelated, 'add', '.')
+    git(unrelated, 'commit', '-qm', 'unrelated source')
+    record = make_record(unrelated, 'project')
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([record], root='unrelated-owner', owner='other', shared_cache=shared)
+    assert len(peer.commands) == 2 and len(peer.transfers) == 1
+    assert result['commits'] == {'project': record.commit}
+    assert (peer.root.parent / 'unrelated-owner/project/model.py').read_text() == 'different admitted input\n'
+
+
+def test_shared_publications_are_serialized_and_keep_both_snapshots(peer, tmp_path):
+    from vaws_coordinator.shared_source_objects import copy_fixed_objects
+    first = make_record(peer.source, 'project')
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    second = make_record(peer.source, 'project')
+    shared = tmp_path / 'shared.git'
+    with ThreadPoolExecutor(2) as executor:
+        results = list(executor.map(lambda record: copy_fixed_objects(peer.source, shared, asdict(record)),
+                                    [first, second]))
+    assert results == [True, True]
+    assert set(git(shared, 'for-each-ref', '--format=%(objectname)').splitlines()) == {first.commit, second.commit}
+    assert not (shared / 'objects/info/alternates').exists()
+
+
+def test_shared_wrong_tree_and_missing_blob_never_publish_success(peer, tmp_path):
+    from vaws_coordinator.shared_source_objects import copy_fixed_objects
+    record = make_record(peer.source, 'project')
+    shared = tmp_path / 'shared.git'
+    with pytest.raises(ValueError, match='wrong tree'):
+        copy_fixed_objects(peer.source, shared, {**asdict(record), 'tree': '0' * 40})
+    assert not shared.exists()
+    assert not copy_fixed_objects(tmp_path / 'absent', shared, asdict(record))
+    blob = git(peer.source, 'rev-parse', 'HEAD:model.py')
+    (peer.source / '.git/objects' / blob[:2] / blob[2:]).unlink()
+    with pytest.raises(RuntimeError, match='fixed object copy failed'):
+        copy_fixed_objects(peer.source, shared, asdict(record))
+    assert not git(shared, 'for-each-ref', '--format=%(refname)')
+
+
+def test_uncertain_legacy_export_does_not_fall_back_to_upload(peer, tmp_path, monkeypatch):
+    from vaws_coordinator.preparation_process import PreparationUncertain
+    def unknown(*args):
+        raise PreparationUncertain('lost export reply')
+    monkeypatch.setattr(parity, '_export_existing_source_objects', unknown)
+    with pytest.raises(PreparationUncertain, match='lost export reply'):
+        peer.run(shared_cache=str(tmp_path / 'shared'), host={'host': 'fixture'})
+    assert len(peer.commands) == 1 and not peer.transfers
+    assert not (peer.root / '.vaws-runtime/source-materialization.json').exists()
+
+
+@pytest.mark.parametrize('failure', [PermissionError('read only'), OSError('no space'),
+                                     ValueError('corrupt shared cache')])
+def test_private_snapshot_does_not_require_shared_publication(peer, tmp_path, monkeypatch, capsys, failure):
+    from vaws_coordinator import parity_support
+    record = make_record(peer.source, 'project')
+    peer.run([record])
+    def fail(*args):
+        raise failure
+    monkeypatch.setattr(parity_support, 'copy_fixed_objects', fail)
+    runtime = tmp_path / 'private-valid'
+    result = parity_support._materialize_fixed({
+        'root': str(runtime), 'source_id': snapshot([record])['id'],
+        'carrier_ref': 'refs/parity/test/transport-carrier',
+        'records': [{**asdict(record), 'mirror': parity.mirror_path_for(str(peer.cache), 'test', record),
+                     'shared_mirror': str(tmp_path / 'shared.git')}],
+    })
+    assert result['status'] == 'materialized'
+    assert (runtime / 'project/model.py').read_text() == 'value = 1\n'
+    assert 'shared source publication unavailable' in capsys.readouterr().err
+
+
+def test_bad_shared_candidate_falls_back_to_verified_git_upload(peer, tmp_path):
+    record = make_record(peer.source, 'project')
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    broken = shared / 'project.git'
+    git(shared, 'clone', '--bare', '--local', str(peer.source), str(broken))
+    blob = git(peer.source, 'rev-parse', 'HEAD:model.py')
+    (broken / 'objects' / blob[:2] / blob[2:]).unlink()
+    result = peer.run([record], owner='cold', shared_cache=str(shared))
+    assert result['status'] == 'materialized' and len(peer.transfers) == 1
+    assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
+
+
+def test_private_snapshot_does_not_swallow_shared_copy_timeout(peer, tmp_path, monkeypatch):
+    from vaws_coordinator import parity_support
+    record = make_record(peer.source, 'project')
+    peer.run([record])
+    def timeout(*args):
+        raise subprocess.TimeoutExpired('git fetch', 60)
+    monkeypatch.setattr(parity_support, 'copy_fixed_objects', timeout)
+    runtime = tmp_path / 'unknown-copy'
+    with pytest.raises(subprocess.TimeoutExpired):
+        parity_support._materialize_fixed({
+            'root': str(runtime), 'source_id': snapshot([record])['id'],
+            'carrier_ref': 'refs/parity/test/transport-carrier',
+            'records': [{**asdict(record), 'mirror': parity.mirror_path_for(str(peer.cache), 'test', record),
+                         'shared_mirror': str(tmp_path / 'shared.git')}],
+        })
+    assert not (runtime / '.vaws-runtime/source-materialization.json').exists()
+
+
+def test_invalid_legacy_mirror_does_not_hide_valid_donor(peer, tmp_path, monkeypatch):
+    from vaws_coordinator import shared_source_objects as shared
+    record = make_record(peer.source, 'project')
+    parent = tmp_path / 'legacy/workspaces'
+    broken = parent / 'first/mirrors/nested/project.git'
+    valid = parent / 'second/mirrors/nested/project.git'
+    for mirror in (broken, valid):
+        mirror.parent.mkdir(parents=True)
+        git(mirror.parent, 'clone', '--bare', '--local', str(peer.source), str(mirror))
+    blob = git(peer.source, 'rev-parse', 'HEAD:model.py')
+    (broken / 'objects' / blob[:2] / blob[2:]).unlink()
+    original = shared.copy_fixed_objects
+    tried = []
+    def copy(source, *args):
+        tried.append(source)
+        return original(source, *args)
+    monkeypatch.setattr(shared, 'copy_fixed_objects', copy)
+    # Force candidate order; filesystem directory enumeration is unspecified.
+    original_glob = Path.glob
+    monkeypatch.setattr(Path, 'glob', lambda path, pattern: iter([broken, valid])
+                        if path == parent else original_glob(path, pattern))
+    result = shared.export_container_objects({'legacy_cache': str(tmp_path / 'legacy'),
+        'records': [{**asdict(record), 'shared_mirror': str(tmp_path / 'shared.git')}]})
+    assert result['copied'] == [record.commit] and tried == [broken, valid]
+    assert result['diagnostics']
 
 
 def test_cold_two_operations_warm_one_without_recapture(peer):
@@ -112,6 +400,9 @@ def test_concurrent_roots_ignore_mutable_mirror_refs(peer):
 
 
 def test_missing_reply_does_not_touch_root_and_transfer_failure_keeps_mirror(peer, monkeypatch):
+    # Keep exercising the large/cold Git transport fallback rather than the
+    # small edit path carried by the existing owned preparation operation.
+    monkeypatch.setattr(parity, '_fixed_inline_pack', lambda *args, **kwargs: None)
     first = make_record(peer.source, 'project')
     peer.run([first])
     receipt = peer.root / '.vaws-runtime/source-materialization.json'
@@ -131,6 +422,108 @@ def test_missing_reply_does_not_touch_root_and_transfer_failure_keeps_mirror(pee
     assert receipt.read_bytes() == before
     mirror = parity.mirror_path_for(str(peer.cache), 'test', first)
     assert git(mirror, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+
+
+def test_small_edit_uses_owned_rpc_pack_and_preserves_previous_root(peer):
+    first = make_record(peer.source, 'project')
+    peer.run([first])
+    before = (peer.root / '.vaws-runtime/source-materialization.json').read_bytes()
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    second = make_record(peer.source, 'project')
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([second], root='second')
+    assert result['commits'] == {'project': second.commit}
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert "'inline_packs':" in peer.commands[-1]
+    assert (peer.root.parent / 'second/project/model.py').read_text() == 'value = 2\n'
+    assert (peer.root / 'project/model.py').read_text() == 'value = 1\n'
+    assert (peer.root / '.vaws-runtime/source-materialization.json').read_bytes() == before
+    mirror = parity.mirror_path_for(str(peer.cache), 'test', first)
+    for row in (first, second):
+        assert git(mirror, 'rev-parse', 'refs/vaws/snapshots/' + row.commit) == row.commit
+
+
+@pytest.mark.parametrize('damage, message', [('digest', 'size or digest differs'),
+                                            ('base', 'prerequisite disappeared')])
+def test_invalid_inline_pack_never_materializes_or_changes_pins(peer, monkeypatch, damage, message):
+    first = make_record(peer.source, 'project')
+    peer.run([first])
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    second = make_record(peer.source, 'project')
+    original = parity._fixed_inline_pack
+    def corrupt(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert result is not None
+        result['sha256' if damage == 'digest' else 'previous'] = '0' * (64 if damage == 'digest' else 40)
+        return result
+    monkeypatch.setattr(parity, '_fixed_inline_pack', corrupt)
+    peer.commands.clear()
+    peer.transfers.clear()
+    with pytest.raises(RuntimeError, match=message):
+        peer.run([second], root='second')
+    assert len(peer.commands) == 2 and not peer.transfers
+    assert not (peer.root.parent / 'second/.vaws-runtime/source-materialization.json').exists()
+    assert not (peer.root.parent / 'second/project').exists()
+    mirror = parity.mirror_path_for(str(peer.cache), 'test', first)
+    assert git(mirror, 'rev-parse', 'refs/vaws/snapshots/' + first.commit) == first.commit
+    assert subprocess.run(['git', '-C', mirror, 'show-ref', '--verify',
+                           'refs/vaws/snapshots/' + second.commit], capture_output=True).returncode
+
+
+def test_unknown_inline_materialization_is_not_replayed(peer, monkeypatch):
+    peer.run()
+    (peer.source / 'model.py').write_text('value = 2\n')
+    git(peer.source, 'commit', '-am', 'second')
+    calls = []
+    def uncertain(endpoint, script, **kwargs):
+        calls.append(script)
+        if len(calls) == 2:
+            raise RuntimeError('owned process outcome is unknown')
+        return peer.stream(endpoint, script, **kwargs)
+    monkeypatch.setattr(parity, 'ssh_exec_stream', uncertain)
+    peer.transfers.clear()
+    with pytest.raises(RuntimeError, match='outcome is unknown'):
+        peer.run(root='second')
+    assert len(calls) == 2 and not peer.transfers
+
+
+@pytest.mark.parametrize('size', [100000, 300000])
+def test_large_edit_keeps_git_transport_fallback(peer, size):
+    peer.run()
+    (peer.source / 'large.bin').write_bytes(os.urandom(size))
+    git(peer.source, 'add', '.')
+    git(peer.source, 'commit', '-qm', 'large new blob')
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run(root='second')
+    assert len(peer.commands) == 2 and len(peer.transfers) == 1
+    assert (peer.root.parent / 'second/project/large.bin').read_bytes() == (peer.source / 'large.bin').read_bytes()
+
+
+def test_multiple_inline_packs_respect_total_command_argument_limit(peer):
+    other = peer.source.parent / 'other-source'
+    git(peer.source.parent, 'clone', '-q', str(peer.source), str(other))
+    git(other, 'config', 'user.name', 'Test')
+    git(other, 'config', 'user.email', 'test@example.invalid')
+    names = [(peer.source, 'project'), (other, 'other')]
+    peer.run([make_record(path, name) for path, name in names])
+    for path, _ in names:
+        (path / 'new.bin').write_bytes(os.urandom(50000))
+        git(path, 'add', '.')
+        git(path, 'commit', '-qm', 'medium edit')
+    peer.commands.clear()
+    peer.transfers.clear()
+    peer.run([make_record(path, name) for path, name in names], root='second')
+    assert len(peer.commands) == 2 and len(peer.transfers) == 1
+    assert len(peer.commands[-1].encode()) <= 96 * 1024
+    # Exercise the exact worker invocation: argv, not bash stdin.
+    result = subprocess.run(['bash', '-c', peer.commands[-1]], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    for path, name in names:
+        assert (peer.root.parent / 'second' / name / 'new.bin').read_bytes() == (path / 'new.bin').read_bytes()
 
 
 def test_retry_same_inputs_repairs_tracked_and_untracked_files(peer):

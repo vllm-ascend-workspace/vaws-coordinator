@@ -140,7 +140,7 @@ def test_provision_uses_configured_user_with_shared_root_transport(tmp_path, mon
     calls = Mock(side_effect=["probe", "bootstrap", "smoke"])
     monkeypatch.setattr(provision.host_ops, "run_remote_script", calls)
     monkeypatch.setattr(provision.host_ops, "assert_remote_success",
-                        Mock(side_effect=[{"suggested_port": 2222}, {}, {}]))
+                        Mock(side_effect=[{"free_port": 2222}, {}, {}]))
     monkeypatch.setattr(provision.host_ops, "find_public_key", lambda _: tmp_path / "key.pub")
     monkeypatch.setattr(provision.host_ops, "load_public_key", lambda _: "ssh-ed25519 test")
 
@@ -155,6 +155,9 @@ def test_provision_uses_configured_user_with_shared_root_transport(tmp_path, mon
     assert boot.args[0].user == "root"
     assert boot.kwargs["args"][0] == "vaws-alice"
     assert boot.kwargs["args"][5] == "alice"
+    assert boot.kwargs["args"][1] == '2222'
+    assert [call.kwargs.get('reuse_connection', False) for call in calls.call_args_list] == [True, False, True]
+    assert 'if not False:' in calls.call_args_list[2].args[1]
     assert calls.call_args_list[2].args[0].user == "root"
     assert directory.upsert_machine.call_args.args[0]["user"] == "alice"
 

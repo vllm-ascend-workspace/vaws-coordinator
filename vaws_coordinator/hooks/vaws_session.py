@@ -35,6 +35,19 @@ def task_tool(name: str) -> bool:
     return any(name == tool or name.endswith(("__" + tool, ":" + tool)) for tool in TASK_TOOLS)
 
 
+def context_tool(name: str, client: str = "") -> bool:
+    """Include companion calls only when the native name identifies their provider."""
+    if task_tool(name):
+        return True
+    # Cursor names the tool resolved by its MCP configuration without a
+    # provider prefix. The native dispatcher owns that name resolution.
+    if client == "cursor" and re.fullmatch(r"MCP:(?:knowledge_(?:query|explain|capture)|remote_[a-z_]+)", name):
+        return True
+    return bool(re.fullmatch(
+        r"(?:MCP:)?(?:mcp__)?(?:vaws[-_]knowledge__knowledge_(?:query|explain|capture)"
+        r"|remote[-_]dev__remote_[a-z_]+)", name))
+
+
 def task_call(client: str, payload: dict) -> tuple[str, object, str, object]:
     """Read native tool coordinates without opening a task or probing Git."""
     name = str(payload.get("tool_name") or payload.get("toolName") or "")
@@ -52,7 +65,7 @@ def task_call(client: str, payload: dict) -> tuple[str, object, str, object]:
 
 def needs_task_context(client: str, payload: dict) -> bool:
     name, _, _, arguments = task_call(client, payload)
-    return (client in {"claude", "codex", "grok", "cursor"} and task_tool(name)
+    return (client in {"claude", "codex", "grok", "cursor"} and context_tool(name, client)
             and isinstance(arguments, dict) and not arguments.get("context_file"))
 
 
@@ -121,7 +134,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     normalized = normalized_event(payload)
     cursor_pretool = client == "cursor" and normalized == "pretooluse"
     if normalized == "pretooluse" and not needs_task_context(client, payload):
-        # Even an older broad native matcher must leave ordinary tools alone.
+        # Ordinary tools need neither a registry read nor Git scope resolution.
         return {}
     native = str((payload.get("conversation_id") if client == "cursor" else "")
                  or payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "")
@@ -164,7 +177,11 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         if normalized == "sessionend":
             store.detach(context)
             return {}
-        if normalized in {"userpromptsubmit", "beforesubmitprompt"} and context["attachment"]["cwd"] != str(Path(cwd).resolve()):
+        refresh_cwd = normalized in {"userpromptsubmit", "beforesubmitprompt"} or (
+            client == "claude" and normalized == "pretooluse" and bool(payload.get("cwd")))
+        if refresh_cwd and context["attachment"]["cwd"] != str(Path(cwd).resolve()):
+            # EnterWorktree can move Claude during one prompt. Its next tool
+            # carries the new native cwd; do not wait for another user prompt.
             context = store.attach(client, native, str(cwd), agent_id=context["attachment"].get("agent_id") or "")
             context = bind_native_defaults(store, context)
 
@@ -176,12 +193,15 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     if client == "kimi" and normalized == "userpromptsubmit" and payload.get("agent_id"):
         # The SessionSetup extension supplies this native agent id alongside
         # MCP call metadata. Keep cwd/user binding above, without appending a
-        # redundant context instruction on every prompt. Official legacy Kimi
-        # omits agent_id and still needs the text fallback below.
+        # redundant context instruction on every prompt. Kimi clients without
+        # native per-call metadata still receive context through prompt text.
         return {}
+    defaults = context["source_defaults"]
+    paths = {name: source["path"] for name, source in defaults["sources"].items()}
     hint = ("VAWS task automatically attached to this native session. Context:\n" + context["context_file"] + "\n"
-            "No session-creation call is needed. Native hooks supply context_file to supported task tools; "
-            "otherwise use this context. Local editing needs no remote resources. "
+            f"Source defaults ({defaults['origin']}): {json.dumps(paths, ensure_ascii=False)}\n"
+            "Client startup owns workspace and component preparation. "
+            "Native hooks supply context_file to supported VAWS tools; otherwise use this context. "
             "For a child or authorized cross-tool handoff, pass this context explicitly.")
     if normalized == "pretooluse":
         # Grok exposes MCP calls through its native `use_tool` dispatcher. Its
@@ -190,7 +210,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         # dispatcher envelope so the context receipt reaches the MCP server;
         # never flatten or infer the nested call from cwd/history.
         name, arguments, nested_key, nested_arguments = task_call(client, payload)
-        if task_tool(name) and client in {"claude", "codex", "grok", "cursor"}:
+        if context_tool(name, client) and client in {"claude", "codex", "grok", "cursor"}:
             if not isinstance(nested_arguments, dict) or nested_arguments.get("context_file"):
                 return {}
             updated = {**nested_arguments, "context_file": context["context_file"]}

@@ -139,15 +139,65 @@ def test_prompt_handoff_refreshes_only_its_native_attachment(tmp_path):
     assert current["source_defaults"]["sources"] == {}
 
 
-def test_handoff_leaves_accepted_sources_and_service_identity_immutable(client, tmp_path):
+@pytest.mark.parametrize("explicit", [None, {}, {"chosen": "source"}])
+def test_claude_pretool_after_enter_worktree_refreshes_only_automatic_sources(tmp_path, explicit):
+    source = repo(tmp_path / "project")
+    changed = linked_worktree(source, tmp_path / "entered-worktree")
+    store = AgentSessions(tmp_path / "registry")
+    handle("claude", {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(source)}, store)
+    original = store.native_context("claude", "native")
+    sibling = store.attach("claude", "sibling", str(source), association=original["context_file"])
+    sibling = store.bind_native_sources(sibling)
+    if explicit is not None:
+        explicit = {name: str(source) for name in explicit}
+        store.bind_sources(original, explicit)
+    sibling = store.context(sibling["attachment"]["id"])
+    result = handle("claude", {"hook_event_name": "PreToolUse", "session_id": "native", "cwd": str(changed),
+                               "tool_name": "mcp__vaws_task__vaws_run", "tool_input": {"command": "echo ready"}}, store)
+    current = store.native_context("claude", "native")
+    assert current["context_file"] == original["context_file"]
+    assert current["session"]["id"] == original["session"]["id"]
+    assert current["attachment"]["cwd"] == str(changed.resolve())
+    expected = explicit if explicit is not None else {"project": str(changed.resolve())}
+    assert {name: row["path"] for name, row in current["source_defaults"]["sources"].items()} == expected
+    assert store.context(sibling["attachment"]["id"]) == sibling
+    assert result["hookSpecificOutput"]["updatedInput"]["context_file"] == original["context_file"]
+
+
+def test_claude_pretool_does_not_infer_cwd_or_unknown_identity(tmp_path, monkeypatch):
+    source = repo(tmp_path / "project")
+    changed = linked_worktree(source, tmp_path / "another-worktree")
+    store = AgentSessions(tmp_path / "registry")
+    handle("claude", {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(source)}, store)
+    monkeypatch.chdir(changed)
+    tool = {"hook_event_name": "PreToolUse", "session_id": "native", "tool_name": "mcp__vaws_task__vaws_session"}
+    handle("claude", tool, store)
+    assert store.native_context("claude", "native")["attachment"]["cwd"] == str(source.resolve())
+    with pytest.raises(ValueError, match="association is missing"):
+        handle("claude", {**tool, "session_id": "unknown", "cwd": str(changed)}, store)
+    assert len(store.sessions()) == 1
+
+
+@pytest.mark.parametrize("handoff", ["resume", "claude-pretool"])
+def test_handoff_leaves_accepted_sources_and_service_identity_immutable(client, tmp_path, handoff):
     source = repo(tmp_path / "project", "accepted-A")
     changed = linked_worktree(source, tmp_path / "changed")
-    native = client.context["attachment"]["native_session_id"]
-    original = start(client.store, native, source)
+    if handoff == "claude-pretool":
+        native = "claude-native"
+        handle("claude", {"hook_event_name": "SessionStart", "session_id": native, "cwd": str(source)}, client.store)
+        original = client.store.native_context("claude", native)
+        client = TaskClient(original["context_file"], service=client.coordinator, user="alice")
+    else:
+        native = client.context["attachment"]["native_session_id"]
+        original = start(client.store, native, source)
     first = client.run("serve", service="api")
     before = client.store.executions(original["session"]["id"])[0]
     (changed / "value.txt").write_text("accepted-B")
-    start(client.store, native, changed, source="resume")
+    if handoff == "claude-pretool":
+        handle("claude", {"hook_event_name": "PreToolUse", "session_id": native, "cwd": str(changed),
+                          "tool_name": "mcp__vaws_task__vaws_run", "tool_input": {}}, client.store)
+    else:
+        start(client.store, native, changed, source="resume")
     with pytest.raises(ValueError, match="different inputs: sources"):
         client.run("serve", service="api")
     second = client.run("echo new submission")

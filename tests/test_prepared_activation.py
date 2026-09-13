@@ -100,13 +100,13 @@ def test_prepared_activation_preserves_authority_and_uses_resolved_pid(authority
     assert result["task"]["pid"] == 810
     with coordinator._transaction() as connection:
         assert json.loads(coordinator._task_row(connection, "cpu-task")["process_guard"]) == guard
-    busy.assert_called_once_with(guard, completion_confirmed=True)
+    busy.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["fence", "epoch", "deadline", "guard_gone"])
 def test_prepared_activation_keeps_fence_epoch_deadline_and_guard_checks(authority, supervisor, failure):
     coordinator, request, clock, busy = authority
-    prepared, guard, _ = supervisor
+    prepared, guard, state = supervisor
     if failure == "fence":
         request["fence_token"] += 1
     elif failure == "epoch":
@@ -114,7 +114,7 @@ def test_prepared_activation_keeps_fence_epoch_deadline_and_guard_checks(authori
     elif failure == "deadline":
         clock[0] += 61
     else:
-        busy.return_value = False
+        state["marker"] = "b" * 32
     with pytest.raises(host.CoordinationError):
         host.handle_request({**request, "prepared_supervisor": prepared, "process_guard": guard},
                             clock=lambda: clock[0])
@@ -124,11 +124,25 @@ def test_prepared_activation_keeps_fence_epoch_deadline_and_guard_checks(authori
 
 
 def test_explicit_pid_activation_keeps_legacy_path(authority, monkeypatch):
-    _, request, clock, _ = authority
+    _, request, clock, busy = authority
     monkeypatch.setattr(host, "prepared_supervisor_host_pid", Mock(side_effect=AssertionError("unexpected resolver")))
     guard = {"marker": "a" * 32, "boot_id": "boot-one"}
     result = host.handle_request({**request, "pid": 123, "process_guard": guard}, clock=lambda: clock[0])
     assert result["task"]["pid"] == 123
+    busy.assert_called_once_with(guard, completion_confirmed=True)
+
+
+@pytest.mark.parametrize("guard_change", [{"extra": True}, {"retain_until_release": "true"}])
+def test_prepared_activation_still_validates_guard_shape(authority, supervisor, guard_change):
+    coordinator, request, clock, busy = authority
+    prepared, guard, _ = supervisor
+    guard.update(guard_change)
+    with pytest.raises(host.CoordinationError, match="invalid managed process guard"):
+        host.handle_request({**request, "prepared_supervisor": prepared, "process_guard": guard},
+                            clock=lambda: clock[0])
+    with coordinator._transaction() as connection:
+        assert coordinator._task_row(connection, "cpu-task")["state"] == "starting"
+    busy.assert_not_called()
 
 
 def test_backend_sends_one_fixed_code_rpc_without_pid_shell(monkeypatch):

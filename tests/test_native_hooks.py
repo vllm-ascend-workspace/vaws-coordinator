@@ -63,6 +63,8 @@ def test_cursor_concurrent_start_and_first_tools_create_one_task(tmp_path):
     {"tool_name": "Shell", "tool_input": {"command": "echo vaws_run"}},
     {"tool_name": "MCP:unrelated_vaws_run"},
     {"tool_name": "MCP:vaws_run_extra"},
+    {"tool_name": "mcp__unrelated__knowledge_query"},
+    {"tool_name": "mcp__unrelated__remote_read"},
     {"tool_input": []},
     {"tool_input": {"command": "echo ready", "context_file": "explicit-context"}},
 ])
@@ -115,19 +117,62 @@ def test_message_gets_native_context_without_changing_explicit_arguments(tmp_pat
     assert handle(client, {**payload, "tool_input": explicit}, store) == {}
 
 
-def test_grok_message_dispatcher_keeps_its_nested_envelope(tmp_path):
+@pytest.mark.parametrize("name", ["vaws-task__vaws_message", "vaws-knowledge__knowledge_capture", "remote-dev__remote_read"])
+def test_grok_dispatcher_keeps_its_nested_envelope(tmp_path, name):
     store = AgentSessions(tmp_path / "sessions")
     context = store.attach("grok", "native", str(tmp_path))
     arguments = {"recipient": {"reply_reference": "known-reference"}, "text": "ready"}
-    nested = {"tool_name": "vaws-task__vaws_message", "tool_input": arguments}
+    nested = {"tool_name": name, "tool_input": arguments}
     output = handle("grok", {"hookEventName": "pre_tool_use", "sessionId": "native", "cwd": str(tmp_path),
                              "toolName": "use_tool", "toolInput": nested}, store)
     assert output == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {
         **nested, "tool_input": {**arguments, "context_file": context["context_file"]}}}}
 
 
+@pytest.mark.parametrize("client,name", [
+    ("claude", "mcp__vaws-knowledge__knowledge_query"),
+    ("claude", "mcp__vaws-knowledge__knowledge_explain"),
+    ("codex", "mcp__vaws_knowledge__knowledge_capture"),
+    ("codex", "mcp__remote_dev__remote_read"),
+    ("cursor", "MCP:vaws-knowledge__knowledge_query"),
+    ("cursor", "MCP:remote-dev__remote_job_status"),
+    ("cursor", "MCP:knowledge_query"),
+    ("cursor", "MCP:remote_read"),
+])
+def test_owned_companion_tools_receive_the_same_native_context(tmp_path, client, name):
+    store = AgentSessions(tmp_path / "sessions")
+    context = store.attach(client, "native", str(tmp_path))
+    payload = {"hook_event_name": "preToolUse", "session_id": "native", "cwd": str(tmp_path),
+               "tool_name": name, "tool_input": {"query": "existing input"}}
+    output = handle(client, payload, store)
+    updated = output["updated_input"] if client == "cursor" else output["hookSpecificOutput"]["updatedInput"]
+    assert updated == {"query": "existing input", "context_file": context["context_file"]}
+    assert handle(client, {**payload, "tool_input": {**updated, "context_file": "explicit-context"}}, store) == {}
+
+
+@pytest.mark.parametrize("client", ["claude", "codex", "grok"])
+@pytest.mark.parametrize("name", ["MCP:knowledge_query", "MCP:remote_read"])
+def test_unqualified_companions_are_only_cursor_native_names(tmp_path, client, name):
+    store = AgentSessions(tmp_path / "sessions")
+    store.attach(client, "native", str(tmp_path))
+    assert handle(client, {"hook_event_name": "PreToolUse", "session_id": "native", "cwd": str(tmp_path),
+                           "tool_name": name, "tool_input": {}}, store) == {}
+
+
+def test_hook_hint_reports_current_explicit_workspace_without_claiming_preparation(tmp_path):
+    before, prepared = repo(tmp_path / "before"), repo(tmp_path / "prepared")
+    store = AgentSessions(tmp_path / "sessions")
+    context = store.attach("claude", "native", str(before))
+    store.bind_sources(context, {"project": str(prepared)})
+    output = handle("claude", {"hook_event_name": "SessionStart", "source": "compact", "session_id": "native", "cwd": str(before)}, store)
+    hint = output["hookSpecificOutput"]["additionalContext"]
+    assert context["context_file"] in hint
+    assert f'Source defaults (explicit): {json.dumps({"project": str(prepared)})}' in hint
+    assert "No session-creation call is needed" not in hint
+
+
 @pytest.mark.parametrize("agent", [None, "main", "agent-1"])
-def test_kimi_extension_prompt_updates_cwd_silently_while_legacy_keeps_context(tmp_path, monkeypatch, capsys, agent):
+def test_kimi_prompt_keeps_context_without_native_call_metadata(tmp_path, monkeypatch, capsys, agent):
     before, after = repo(tmp_path / "before"), repo(tmp_path / "after")
     store = AgentSessions(tmp_path / "sessions")
     handle("kimi", {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(before)}, store)
@@ -202,4 +247,4 @@ def test_unrelated_grok_dispatcher_never_opens_registry(monkeypatch):
     monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.AgentSessions",
                         Mock(side_effect=AssertionError("ordinary nested call must not open registry")))
     assert handle("grok", {"hookEventName": "pre_tool_use", "toolName": "use_tool",
-                           "toolInput": {"tool_name": "remote_dev__remote_read", "tool_input": {"path": "/work/code.py"}}}) == {}
+                           "toolInput": {"tool_name": "other_provider__remote_read", "tool_input": {"path": "/work/code.py"}}}) == {}

@@ -34,10 +34,10 @@ from vaws_coordinator.managed_execution import ExecutionRequestError, JOB_TERMIN
 from vaws_coordinator.parity import materialize_command
 from vaws_coordinator.parity_support import RemoteCommandError
 from vaws_coordinator.placement import (
-    SUPPORTED_RECIPES,
     can_prepare,
     distinct_hosts_required,
     host_key,
+    provisionable_recipe,
     role_plan,
     runtime_matches,
 )
@@ -247,14 +247,18 @@ class CoordinatorService(TaskMessages):
             with self._lifecycle_lock:
                 self._active_requests -= 1
 
+    def active_execution_refs(self):
+        return [{"execution_id": row["id"], "session_id": row["session_id"], "state": row["phase"]}
+                for directory in self._session_dirs for row in self.store(directory).all_executions()
+                if row.get("admitted") and row.get("phase") not in DONE]
+
     def restart_if_idle(self):
         with self._lifecycle_lock:
+            active = self.active_execution_refs()
             if self._active_requests or any(lock.locked() for lock in self._lock_registry.values()):
-                return {"status": "busy", "reason": "coordinator work is in progress"}
-            for directory in self._session_dirs:
-                if any(row.get("admitted") and row.get("phase") not in DONE
-                       for row in self.store(directory).all_executions()):
-                    return {"status": "busy", "reason": "nonterminal executions remain"}
+                return {"status": "busy", "reason": "coordinator work is in progress", "active_executions": active}
+            if active:
+                return {"status": "busy", "reason": "nonterminal executions remain", "active_executions": active}
             from vaws_coordinator.ready_runtime import TERMINAL
             with self.pool.transaction() as db:
                 if any(row.get("state") not in TERMINAL for row in self.pool.rows(db, "run")):
@@ -268,6 +272,11 @@ class CoordinatorService(TaskMessages):
             self.reconcile()
             return {"ok": True}
         if op == "admit":
+            selected = request.get("client_runtime") or []
+            if _runtime_identity(selected) != _runtime_identity(LOADED_RUNTIMES):
+                return {"ok": True, "value": _runtime_update(
+                    selected, [{"loaded": row} for row in LOADED_RUNTIMES],
+                    {"reason": "daemon code differs from the selected caller", "active_executions": self.active_execution_refs()})}
             value = self.admit(request["sessions_dir"], request["user"], request["session_id"],
                                request["spec"], restart=bool(request.get("restart")),
                                wait=not self._async_progress)
@@ -718,7 +727,8 @@ class CoordinatorService(TaskMessages):
         for role in roles:
             donor = self._donor_for_role(user, environment, role, used_hosts, need_distinct)
             if donor is None:
-                donor = self._ensure_user_container(user, environment, role, used_hosts, need_distinct)
+                donor = self._ensure_user_container(user, environment, role, used_hosts, need_distinct,
+                    on_progress=lambda event, role=role: self._save_container_progress(store, row, role['name'], event))
             if donor is None:
                 return {"status": "cache_miss", "reason": "no allowed host provides the requested environment",
                         "provisioning_started": False}
@@ -799,9 +809,9 @@ class CoordinatorService(TaskMessages):
         except Exception:
             return []
 
-    def _ensure_user_container(self, user, environment, role, used_hosts, require_distinct=False):
+    def _ensure_user_container(self, user, environment, role, used_hosts, require_distinct=False, *, on_progress=None):
         recipe = environment.get("recipe") or environment.get("image")
-        if recipe and recipe not in SUPPORTED_RECIPES:
+        if recipe and not provisionable_recipe(recipe):
             return None
         wanted_host = str(role["host"]) if role.get("host") else None
         for record in self._configured_machines():
@@ -822,7 +832,7 @@ class CoordinatorService(TaskMessages):
                 "port": int(host_info.get("port") or 22),
                 "user": host_info.get("user") or "root",
             }
-            if not ssh_port:
+            if not ssh_port or recipe:
                 if not recipe:
                     # An existing configured container needs no image choice.
                     # Creating a container still requires an explicit recipe.
@@ -843,9 +853,14 @@ class CoordinatorService(TaskMessages):
                 result = provision_user_container(
                     host=host_ip, image=recipe, user=user,
                     host_user=host_endpoint["user"], host_port=host_endpoint["port"],
+                    # A configured name/port does not prove the requested
+                    # image. The provision owner verifies existing containers
+                    # and rejects mismatches without replacing them.
+                    ssh_port=int(ssh_port) if ssh_port else None,
                     machine_type=machine_type or environment.get("machine_type"),
                     machines=getattr(self.backend, "machines", None),
                     reserve_port=reserve_port,
+                    **({'on_progress': on_progress} if on_progress is not None else {}),
                 )
                 ssh_port = result["ssh_port"]
             else:
@@ -870,6 +885,14 @@ class CoordinatorService(TaskMessages):
                 "service_ports": [],
             }
         return None
+
+    def _save_container_progress(self, store, row, role, event):
+        # Keep bounded phase facts in the existing execution log even after
+        # prepare-root replaces the current progress. No remote payloads/keys.
+        log = self.state_dir / 'runs' / row['id'] / role / 'prepare-container.log'
+        self._save_progress(store, row, role, {**event, 'log_ref': str(log)})
+        with log.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + '\n')
 
     def _save_progress(self, store, row, role, event):
         now = time.time()
@@ -1529,8 +1552,14 @@ class CoordinatorClient:
         return reply.get("value")
 
     def admit(self, sessions_dir, user, session_id, spec, restart=False):
+        # A long-lived Python client must also retry an earlier busy upgrade.
+        # Existing execution controls bypass this admission-only boundary.
+        owner = ensure_daemon(self.state_dir)
+        self.runtime = owner.runtime
+        if not _daemon_runtime_matches(self):
+            return _runtime_update(LOADED_RUNTIMES, self.runtime, owner.runtime_update)
         return self.call("admit", sessions_dir=str(sessions_dir), user=user,
-                         session_id=session_id, spec=spec, restart=restart)
+                         session_id=session_id, spec=spec, restart=restart, client_runtime=LOADED_RUNTIMES)
 
     def advance(self, sessions_dir, user, execution_id, action="status", force=False, role=None, refresh=True):
         payload = dict(sessions_dir=str(sessions_dir), user=user,
@@ -1556,24 +1585,20 @@ class CoordinatorClient:
                          recipient=recipient, text=text)
 
 
-_DAEMON_UPGRADE_RETRY_SECONDS = 60.0
-_daemon_upgrade_attempts: dict[str, tuple[int | None, float]] = {}
+def _runtime_identity(rows):
+    return {row["package"]: {key: row.get(key) for key in ("version", "commit", "python", "location")}
+            for row in rows if row.get("package")}
 
 
-def _daemon_upgrade_due(client: CoordinatorClient) -> bool:
-    """Only a newer loaded caller may request the existing idle restart."""
-    from packaging.version import InvalidVersion, Version
+def _daemon_runtime_matches(client: CoordinatorClient) -> bool:
+    return _runtime_identity(LOADED_RUNTIMES) == _runtime_identity(
+        [row.get("loaded") or {} for row in client.runtime or []])
 
-    current = next((row for row in LOADED_RUNTIMES if row.get("package") == "vaws-coordinator"), {})
-    loaded = next((row.get("loaded") or {} for row in client.runtime or []
-                   if (row.get("loaded") or {}).get("package") == "vaws-coordinator"), {})
-    try:
-        if Version(str(current.get("version"))) <= Version(str(loaded.get("version"))):
-            return False
-    except InvalidVersion:
-        return False
-    previous = _daemon_upgrade_attempts.get(str(client.state_dir))
-    return previous is None or previous[0] != loaded.get("pid") or time.monotonic() >= previous[1]
+
+def _runtime_update(selected, daemon, facts):
+    return {"state": "needs_runtime_update", "reason": facts.get("reason", "daemon update is pending"),
+            "runtime_update": {"selected": selected, "daemon": daemon},
+            **({"active_executions": facts["active_executions"]} if "active_executions" in facts else {})}
 
 
 def ensure_daemon(state_dir: Path) -> CoordinatorClient:
@@ -1582,7 +1607,7 @@ def ensure_daemon(state_dir: Path) -> CoordinatorClient:
     client = CoordinatorClient(state_dir)
     try:
         client.runtime = (client.call("ping") or {}).get("runtime")
-        if not _daemon_upgrade_due(client):
+        if _daemon_runtime_matches(client):
             return client
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
@@ -1612,20 +1637,15 @@ def _ensure_daemon_locked(state_dir: Path, client: CoordinatorClient) -> Coordin
     except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
         pass
     else:
-        if not _daemon_upgrade_due(client):
+        if _daemon_runtime_matches(client):
             return client
-        loaded = next((row.get("loaded") or {} for row in client.runtime or []
-                       if (row.get("loaded") or {}).get("package") == "vaws-coordinator"), {})
-        # Busy or unsupported older daemons stay usable. Reuse the ordinary
-        # ping and limit extra restart requests for this state/PID in-process.
-        _daemon_upgrade_attempts[str(state_dir)] = (
-            loaded.get("pid"), time.monotonic() + _DAEMON_UPGRADE_RETRY_SECONDS,
-        )
         try:
             reply = client.call("restart_if_idle")
-        except (RuntimeError, FileNotFoundError, ConnectionError, OSError):
+        except (RuntimeError, FileNotFoundError, ConnectionError, OSError) as exc:
+            client.runtime_update = {"reason": f"daemon idle restart unavailable: {exc}"}
             return client
         if not isinstance(reply, dict) or reply.get("status") != "stopping":
+            client.runtime_update = reply if isinstance(reply, dict) else {"reason": "daemon idle restart returned no status"}
             return client
         deadline = time.monotonic() + 5
         while socket_path(state_dir).exists() and time.monotonic() < deadline:

@@ -246,7 +246,8 @@ def test_generic_profile_executes_without_native_packages_and_detects_identity_t
     import vaws_coordinator.runtime_profile as module
     code = Path(module.__file__).read_text() + REMOTE_COMMAND_CAPTURE_SUFFIX
     request = {'root': str(tmp_path), 'image_digest': 'sha256:verified-image', 'source_id': 'fixed-source'}
-    result = subprocess.run([sys.executable, '-c', code, json.dumps(request)], text=True, capture_output=True)
+    result = subprocess.run([sys.executable, '-c', 'import sys; exec(sys.stdin.read())', json.dumps(request)],
+                            input=code, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     manifest = json.loads(result.stdout)
     assert manifest['profile']['kind'] == 'command'
