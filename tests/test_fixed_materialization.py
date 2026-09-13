@@ -239,6 +239,57 @@ def test_unknown_local_shared_base_keeps_normal_git_fallback(peer, tmp_path):
     assert (peer.root.parent / 'unrelated-owner/project/model.py').read_text() == 'different admitted input\n'
 
 
+@pytest.mark.parametrize('different_author', [False, True])
+def test_fresh_shared_clone_hint_preserves_queued_edit_and_uses_verified_base(
+        peer, tmp_path, monkeypatch, different_author):
+    import random
+    from test_clean_snapshot_base import capture, clone, configure
+
+    (peer.source / 'unchanged.bin').write_bytes(random.Random(31).randbytes(256 * 1024))
+    (peer.source / 'operator.cpp').write_bytes(b'int value() { return 1; }\n')
+    git(peer.source, 'add', '.')
+    git(peer.source, 'commit', '-qm', 'baseline source')
+    first = capture(peer.source)[-1]
+    shared = str(tmp_path / 'shared')
+    peer.run([first], shared_cache=shared)
+    donor = parity.mirror_path_for(str(peer.cache), 'test', first)
+    donor_refs = git(donor, 'show-ref')
+    fresh = clone(peer.source, tmp_path / 'fresh-source')
+    if different_author:
+        configure(fresh, 'Recipient')
+    (fresh / 'operator.cpp').write_bytes(b'int value() { return 2; }\n')
+    admitted = capture(fresh)[-1]
+    # The queue delay must not cause either hint generation or materialization
+    # to incorporate a later HEAD or a second dirty edit.
+    git(fresh, 'add', '.')
+    git(fresh, 'commit', '-qm', 'later HEAD')
+    (fresh / 'operator.cpp').write_bytes(b'int value() { return 3; }\n')
+    packs = []
+    original = parity._fixed_inline_pack
+    def record_pack(*args, **kwargs):
+        pack = original(*args, **kwargs)
+        packs.append(pack)
+        return pack
+    monkeypatch.setattr(parity, '_fixed_inline_pack', record_pack)
+    peer.commands.clear()
+    peer.transfers.clear()
+    result = peer.run([admitted], root='fresh-owned', owner='fresh', shared_cache=shared)
+    assert len(peer.commands) == 2
+    if different_author:
+        # Equal file trees alone do not establish the old commit's identity.
+        # No common immutable commit is found, so the existing Git path runs.
+        assert len(peer.transfers) == 1 and packs == [None]
+    else:
+        assert not peer.transfers and len(packs) == 1
+        assert packs[0]['previous'] == first.commit and packs[0]['bytes'] < 16 * 1024
+    assert result['commits'] == {'project': admitted.commit}
+    target = peer.root.parent / 'fresh-owned/project'
+    assert git(target, 'rev-parse', 'HEAD') == admitted.commit
+    assert (target / 'operator.cpp').read_bytes() == b'int value() { return 2; }\n'
+    assert (fresh / 'operator.cpp').read_bytes() == b'int value() { return 3; }\n'
+    assert git(donor, 'show-ref') == donor_refs
+
+
 def test_shared_publications_are_serialized_and_keep_both_snapshots(peer, tmp_path):
     from vaws_coordinator.shared_source_objects import copy_fixed_objects
     first = make_record(peer.source, 'project')
