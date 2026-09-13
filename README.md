@@ -61,6 +61,12 @@ Conflicting native identities require an explicit context. This does not bind
 sources, discover machines, or allocate devices; ordinary code review needs no
 task client.
 
+Native prompt hooks refresh a changed cwd and configured user silently on
+clients with task-tool context injection. SessionStart and subagent attachment
+still supply the initial context; Kimi clients without native per-call metadata
+receive context through their current prompt hook. Ordinary PreToolUse events
+return before Git scope checks or opening the task registry.
+
 `client.finish()` closes a task that has never admitted managed work directly
 in the local registry, without starting or importing the coordinator service
 or remote-dev. Local close and execution admission share one database write

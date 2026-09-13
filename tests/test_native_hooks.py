@@ -164,7 +164,7 @@ def test_hook_hint_reports_current_explicit_workspace_without_claiming_preparati
     store = AgentSessions(tmp_path / "sessions")
     context = store.attach("claude", "native", str(before))
     store.bind_sources(context, {"project": str(prepared)})
-    output = handle("claude", {"hook_event_name": "UserPromptSubmit", "session_id": "native", "cwd": str(before)}, store)
+    output = handle("claude", {"hook_event_name": "SessionStart", "source": "compact", "session_id": "native", "cwd": str(before)}, store)
     hint = output["hookSpecificOutput"]["additionalContext"]
     assert context["context_file"] in hint
     assert f'Source defaults (explicit): {json.dumps({"project": str(prepared)})}' in hint
@@ -172,7 +172,7 @@ def test_hook_hint_reports_current_explicit_workspace_without_claiming_preparati
 
 
 @pytest.mark.parametrize("agent", [None, "main", "agent-1"])
-def test_kimi_extension_prompt_updates_cwd_silently_while_legacy_keeps_context(tmp_path, monkeypatch, capsys, agent):
+def test_kimi_prompt_keeps_context_without_native_call_metadata(tmp_path, monkeypatch, capsys, agent):
     before, after = repo(tmp_path / "before"), repo(tmp_path / "after")
     store = AgentSessions(tmp_path / "sessions")
     handle("kimi", {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(before)}, store)
@@ -198,3 +198,53 @@ def test_kimi_extension_prompt_updates_cwd_silently_while_legacy_keeps_context(t
     assert current["session"]["id"] == original["session"]["id"]
     assert current["attachment"]["cwd"] == str(after)
     assert {source["path"] for source in current["source_defaults"]["sources"].values()} == {str(after)}
+
+
+@pytest.mark.parametrize("client", ["claude", "codex", "grok", "cursor"])
+@pytest.mark.parametrize("event", ["UserPromptSubmit", "beforeSubmitPrompt"])
+def test_prompt_refreshes_cwd_without_repeating_context(tmp_path, client, event):
+    before, after = repo(tmp_path / "before"), repo(tmp_path / "after")
+    store = AgentSessions(tmp_path / "sessions")
+    payload = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(before)}
+    assert handle(client, payload, store)
+    original = store.native_context(client, "native")
+    for cwd in (before, after, after):
+        assert handle(client, {**payload, "hook_event_name": event, "cwd": str(cwd)}, store) == {}
+    current = store.native_context(client, "native")
+    assert current["session"]["id"] == original["session"]["id"]
+    assert current["attachment"]["cwd"] == str(after)
+    assert {source["path"] for source in current["source_defaults"]["sources"].values()} == {str(after)}
+    tool = {**payload, "hook_event_name": "PreToolUse", "cwd": str(after),
+            "tool_name": "vaws_run", "tool_input": {"command": "echo ready"}}
+    updated = handle(client, tool, store)
+    arguments = updated["updated_input"] if client == "cursor" else updated["hookSpecificOutput"]["updatedInput"]
+    assert arguments["context_file"] == current["context_file"]
+
+
+@pytest.mark.parametrize("client", ["claude", "codex", "grok", "cursor"])
+@pytest.mark.parametrize("fields", [
+    {"tool_name": "Shell", "tool_input": {"command": "echo vaws_run"}},
+    {"tool_name": "mcp__other__vaws_run_extra"},
+    {"tool_name": "vaws_run", "tool_input": []},
+    {"tool_name": "vaws_run", "tool_input": {"context_file": "explicit-context"}},
+])
+def test_ordinary_pretool_needs_no_identity_registry_or_git_scope(tmp_path, monkeypatch, capsys, client, fields):
+    opening = Mock(side_effect=AssertionError("ordinary tool must not open registry"))
+    scope = Mock(side_effect=AssertionError("ordinary tool must not probe Git scope"))
+    monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.AgentSessions", opening)
+    monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.in_project_scope", scope)
+    payload = {"hook_event_name": "PreToolUse", "cwd": str(tmp_path), **fields}
+    assert handle(client, payload) == {}
+    monkeypatch.setattr("sys.argv", ["hook", "--client", client, "--project", str(tmp_path)])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert main() == 0
+    assert json.loads(capsys.readouterr().out) == {}
+    opening.assert_not_called()
+    scope.assert_not_called()
+
+
+def test_unrelated_grok_dispatcher_never_opens_registry(monkeypatch):
+    monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.AgentSessions",
+                        Mock(side_effect=AssertionError("ordinary nested call must not open registry")))
+    assert handle("grok", {"hookEventName": "pre_tool_use", "toolName": "use_tool",
+                           "toolInput": {"tool_name": "other_provider__remote_read", "tool_input": {"path": "/work/code.py"}}}) == {}

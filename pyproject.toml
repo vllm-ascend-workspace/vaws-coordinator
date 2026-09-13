@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vaws-coordinator"
-version = "0.4.1.dev1"
+version = "0.4.1.dev2"
 description = "Local VAWS coordinator: task stdio MCP and host NPU allocation"
 readme = "README.md"
 license = "MIT"
