@@ -324,17 +324,90 @@ def _fixed_inline_pack(repo, commit, carrier, previous, *, limit=65536):
             'sha256': hashlib.sha256(data).hexdigest(), 'data': base64.b64encode(data).decode('ascii')}
 
 
+def _clean_head_snapshot_base(record):
+    """Optional fixed-HEAD files plus admitted gitlinks, never a new source.
+
+    Shared clones can have this clean snapshot's objects without its retained
+    ref. Reproduce its parentless metadata from the admitted commit, not the
+    current author environment. Only Git objects and a temporary index change.
+    """
+    if not record.source_head:
+        return None
+    try:
+        if not all(isinstance(oid, str) and re.fullmatch(r'[0-9a-f]{40,64}', oid)
+                   for oid in (record.source_head, record.commit, record.tree)):
+            return None
+        deadline = time.monotonic() + 5
+
+        def objects(*args, data=None, env=None):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('optional clean snapshot hint exceeded its budget')
+            return subprocess.run(
+                ['git', '--no-replace-objects', '-C', record.source_path, *args],
+                input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=True, timeout=remaining, env=env,
+            ).stdout
+
+        raw = objects('cat-file', 'commit', record.commit)
+        header, message = raw.split(b'\n\n', 1)
+        lines = header.split(b'\n')
+        if (len(lines) != 3 or lines[0] != b'tree ' + record.tree.encode('ascii')
+                or not lines[1].startswith(b'author ') or not lines[2].startswith(b'committer ')
+                or message != (commit_message(record.relpath) + '\n').encode('utf-8')):
+            return None
+        # A changed .gitmodules or unmatched gitlink topology is not this
+        # bounded clean-HEAD candidate. Ordinary transfer remains available.
+        def entries(commit):
+            return dict(entry.split(b'\t', 1)[::-1]
+                        for entry in objects('ls-tree', '-r', '-z', commit).split(b'\0') if entry)
+
+        head_entries, fixed_entries = entries(record.source_head), entries(record.commit)
+        if head_entries.get(b'.gitmodules') != fixed_entries.get(b'.gitmodules'):
+            return None
+        head_links = {path.decode('utf-8') for path, entry in head_entries.items()
+                      if entry.startswith(b'160000 ')}
+        fixed_links = {path.decode('utf-8'): entry.split()[2].decode('ascii')
+                       for path, entry in fixed_entries.items() if entry.startswith(b'160000 ')}
+        children = {}
+        for child in record.submodules:
+            path = validate_relative_posix_path(child['path'], label='fixed submodule path')
+            if (path != child['path'] or path in children
+                    or not re.fullmatch(r'[0-9a-f]{40,64}', child['commit'])):
+                return None
+            children[path] = child['commit']
+        if head_links != children.keys() or fixed_links != children:
+            return None
+        with tempfile.TemporaryDirectory(prefix='vaws-base-index-') as directory:
+            env = {**os.environ, 'GIT_INDEX_FILE': str(Path(directory) / 'index'),
+                   'GIT_OPTIONAL_LOCKS': '0'}
+            objects('read-tree', record.source_head, env=env)
+            for path, commit in children.items():
+                objects('update-index', '--cacheinfo', f'160000,{commit},{path}', env=env)
+            tree = objects('write-tree', env=env).strip()
+        body = b'tree ' + tree + b'\n' + b'\n'.join(lines[1:]) + b'\n\n' + message
+        candidate = objects('hash-object', '-t', 'commit', '-w', '--stdin', data=body).decode().strip()
+        return candidate if candidate != record.commit else None
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+        # This is local optional discovery, not a remotely submitted operation.
+        # Missing/corrupt objects, unsupported shapes and timeouts leave the
+        # existing exact-object transfer and its uncertainty handling intact.
+        return None
+
+
 def _local_snapshot_bases(record, *, limit=64):
     """Bounded local membership hints, never source selection or authority.
 
     Retained input/transport refs include parentless snapshots that an ordinary
-    ancestor walk misses. Missing local history simply leaves the Git fallback.
+    ancestor walk misses. A cold clone may instead reproduce one clean base.
     """
+    if limit <= 0:
+        return []
     try:
         refs = git(Path(record.source_path), ['for-each-ref', '--count=256', '--sort=-refname',
             '--format=%(objectname) %(refname)', 'refs/vaws/inputs', 'refs/parity-transport', 'refs/parity'],
             check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return []
     if refs.returncode:
         return []
@@ -347,6 +420,10 @@ def _local_snapshot_bases(record, *, limit=64):
             result.append(parts[0])
             if len(result) == limit:
                 break
+    if not result and limit > 0 and getattr(record, 'changed_paths', None):
+        candidate = _clean_head_snapshot_base(record)
+        if candidate:
+            result.append(candidate)
     return result
 
 
