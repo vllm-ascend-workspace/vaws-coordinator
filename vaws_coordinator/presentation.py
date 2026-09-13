@@ -7,10 +7,19 @@ from pathlib import Path
 EXECUTION_KEYS = ("execution_id", "state", "service", "error", "error_ref", "reason", "progress",
                   "source_snapshot_id", "sources", "role_progress",
                   "observed_at", "cancel_requested", "service_port", "provisioning_started",
-                  "worktrees_preserved", "resources_released", "stdout", "stderr", "observation_freshness",
+                  "worktrees_preserved", "resources_released", "stdout", "stderr", "tail", "preparation_logs", "observation_freshness",
                   "runtime_update", "active_executions")
 ROLE_KEYS = ("name", "state", "runtime_id", "host", "root", "service_port", "error", "lease_state",
              "quiet", "descendants_drained", "stdout", "stderr", "status_observed_at")
+TEXT_KEYS = {"stdout", "stderr", "tail", "error", "reason", "summary", "warnings"}
+MAX_COMPACT_BYTES = 16000
+
+
+def _role_attention(role):
+    """When sampling roles, show failures and unfinished cleanup before quiet successes."""
+    return (bool(role.get("error")) or role.get("state") in {"failed", "timeout", "cancelled", "inconclusive", "uncertain"},
+            role.get("quiet") is False,
+            role.get("lease_state") not in {None, "released", "cancelled", "expired"})
 
 
 def execution_summary(value: dict, *, target=False) -> dict:
@@ -20,8 +29,9 @@ def execution_summary(value: dict, *, target=False) -> dict:
         result["state"] = value.get("phase")
     roles = value.get("roles") or []
     if roles:
+        selected = sorted(roles, key=_role_attention, reverse=True)[:8] if len(roles) > 8 else roles
         result["roles"] = [{key: role[key] for key in ROLE_KEYS if role.get(key) is not None}
-                           for role in roles[:8]]
+                           for role in selected]
         if len(roles) > 8:
             result["roles_total"] = len(roles)
     if target and value.get("target"):
@@ -88,26 +98,38 @@ def present(result: dict, directory: Path, *, full=False, target=False) -> dict:
             json.dump(result, stream, ensure_ascii=False, indent=2)
         result = {**result, "record_ref": str(path)}
     except OSError as exc:
-        return {**result, "warnings": [*result.get("warnings", []), f"Full record write failed: {exc}"]}
+        result = {**result, "warnings": [*result.get("warnings", []), f"Full record write failed: {exc}"]}
     if full:
         return result
     data = compact_data(result.get("data") or {}, target=target)
-    # Bound repeated log tails and arbitrary error text; exact bytes are in record_ref.
-    def bound(value):
-        if isinstance(value, str):
-            return value[-2000:] if len(value) > 2000 else value
+    # Shrink prose, never identifiers, state, release facts or usable references.
+    # Coordination messages and an explicit target remain exact; their consumers
+    # must not receive silently edited message text or executable shell payloads.
+    def bound(value, limit, key=""):
+        if isinstance(value, str) and key in TEXT_KEYS:
+            return value[-limit:] if len(value) > limit else value
         if isinstance(value, dict):
-            return {key: bound(item) for key, item in value.items()}
+            return {name: bound(item, limit, name) for name, item in value.items()}
         if isinstance(value, list):
-            return [bound(item) for item in value[:8]]
+            return [bound(item, limit, key) for item in value[:8]]
         return value
-    compact = {**result, "data": {**bound({k: v for k, v in data.items() if k not in {"target", "notifications", "message"}}),
-                                  **{key: data[key] for key in ("notifications", "message") if key in data},
-                                  **({"target": data["target"]} if "target" in data else {})}}
+    protected = {key: data[key] for key in ("target", "notifications", "message") if key in data}
+    projected = {key: value for key, value in data.items() if key not in protected}
+    compact = {**result, "data": {**projected, **protected}}
     if not target and "runtime" in compact:
         compact["runtime"] = compact_runtime(compact["runtime"])
-    if len(json.dumps(compact, ensure_ascii=False).encode()) > 16000:
-        compact["data"] = {key: data[key] for key in ("execution_id", "state", "service", "error_ref", "notifications", "message") if key in data}
-        compact["summary"] = str(result["summary"])[:1000]
+    for limit in (2000, 500, 100):
+        bounded = bound(projected, limit)
+        compact["data"] = {**bounded, **protected}
+        compact["summary"] = bound(result["summary"], limit, "summary")
+        if bounded != projected or compact["summary"] != result["summary"]:
+            compact["detail_omitted"] = True
+        if len(json.dumps(compact, ensure_ascii=False).encode()) <= MAX_COMPACT_BYTES:
+            break
+    if len(json.dumps(compact, ensure_ascii=False).encode()) > MAX_COMPACT_BYTES:
+        # Optional context can be retrieved from the full record. Keep all
+        # execution/role outcomes, cleanup facts, failure excerpts and log refs.
+        for key in ("target", "sources", "source_defaults", "coordination_contacts", "coordination_peers"):
+            compact["data"].pop(key, None)
         compact["detail_omitted"] = True
     return compact
