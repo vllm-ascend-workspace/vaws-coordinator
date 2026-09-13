@@ -27,6 +27,10 @@ def capture(repo):
 
 @pytest.fixture
 def source(tmp_path, monkeypatch):
+    # Exercise Windows CI's global checkout policy without changing user config.
+    global_config = tmp_path / 'gitconfig'
+    global_config.write_bytes(b'[core]\n\tautocrlf = true\n')
+    monkeypatch.setenv('GIT_CONFIG_GLOBAL', str(global_config))
     for key in list(os.environ):
         if key.startswith(('GIT_AUTHOR_', 'GIT_COMMITTER_')):
             monkeypatch.delenv(key)
@@ -41,10 +45,11 @@ def source(tmp_path, monkeypatch):
 
 
 def clone(source, path, child=None):
-    git(path.parent, 'clone', '--shared', '-q', str(source), str(path))
+    # Fix checkout semantics before clone writes .gitmodules or child sources.
+    git(path.parent, '-c', 'core.autocrlf=false', 'clone', '--shared', '-q', str(source), str(path))
     configure(path)
     if child:
-        git(path, 'clone', '--shared', '-q', str(source / child), str(path / child))
+        git(path, '-c', 'core.autocrlf=false', 'clone', '--shared', '-q', str(source / child), str(path / child))
         configure(path / child)
     return path
 
